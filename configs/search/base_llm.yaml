@@ -1,0 +1,2 @@
+search: {method: base_llm, group_size: 8, temperature: 1.0, response_length: 128}
+

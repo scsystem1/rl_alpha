@@ -1,0 +1,10 @@
+paths:
+  code_root: /home/sunyuxiang/rl_alpha/ours
+  raw_data_root: /data/sunyuxiang/rl_alpha
+  processed_root: /data/sunyuxiang/rl_alpha/processed
+  cache_root: /data/sunyuxiang/rl_alpha/cache
+  runs_root: /data/sunyuxiang/rl_alpha/runs
+  model_search_root: /data/shared/huggingface
+  alphagen_root: /home/sunyuxiang/rl_alpha/alphagen
+  quantevolver_root: /home/sunyuxiang/rl_alpha/QuantEvolver
+

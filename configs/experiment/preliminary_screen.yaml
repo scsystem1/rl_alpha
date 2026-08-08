@@ -1,0 +1,18 @@
+paths:
+  code_root: /home/sunyuxiang/rl_alpha/ours
+  raw_data_root: /data/sunyuxiang/rl_alpha
+  processed_root: /data/sunyuxiang/rl_alpha/processed
+  cache_root: /data/sunyuxiang/rl_alpha/cache
+  runs_root: /data/sunyuxiang/rl_alpha/runs
+  model_search_root: /data/shared/huggingface
+  alphagen_root: /home/sunyuxiang/rl_alpha/alphagen
+  quantevolver_root: /home/sunyuxiang/rl_alpha/QuantEvolver
+experiment:
+  methods: [random, gp, base_llm, grpo_llm]
+  rewards: [r0, r1, r2_lcb]
+  seeds: [0]
+  valid_unique_budget: 5000
+  proposal_group_size: 8
+  pool_capacity: 20
+  auto_start_expensive_jobs: false
+

@@ -1,0 +1,11 @@
+search:
+  method: gp
+  population_size: 128
+  tournament_size: 5
+  p_crossover: 0.50
+  p_subtree_mutation: 0.25
+  p_point_mutation: 0.15
+  p_reproduction: 0.10
+  elitism: 4
+  offspring_per_pool_batch: 8
+

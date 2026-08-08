@@ -1,0 +1,22 @@
+model:
+  repository: Qwen/Qwen3.5-2B
+  path: null
+  local_files_only: true
+  trust_remote_code: true
+  use_remove_padding: false
+  enable_gradient_checkpointing: true
+rollout:
+  name: vllm
+  n: 8
+  temperature: 1.0
+  response_length: 128
+  max_model_len: 4096
+actor:
+  use_dynamic_bsz: false
+  use_kl_loss: true
+  kl_loss_coef: 0.001
+  learning_rate: 1.0e-6
+  lora_rank: 16
+  lora_alpha: 32
+  lora_target_modules: all-linear
+

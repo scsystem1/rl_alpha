@@ -1,0 +1,9 @@
+evaluation:
+  ridge_lambda: 0.001
+  hac_lag: 20
+  rebalance_days: 5
+  holding_days: 20
+  sleeves: 4
+  one_way_cost_bps: [0, 10]
+  fully_neutral_max_weight: 0.02
+

@@ -1,0 +1,19 @@
+paths:
+  code_root: /home/sunyuxiang/rl_alpha/ours
+  raw_data_root: /data/sunyuxiang/rl_alpha
+  processed_root: /data/sunyuxiang/rl_alpha/processed
+  cache_root: /data/sunyuxiang/rl_alpha/cache
+  runs_root: /data/sunyuxiang/rl_alpha/runs
+  model_search_root: /data/shared/huggingface
+  alphagen_root: /home/sunyuxiang/rl_alpha/alphagen
+  quantevolver_root: /home/sunyuxiang/rl_alpha/QuantEvolver
+data:
+  warmup_start: 2008-01-02
+  train: [2010-01-01, 2018-12-31]
+  validation: [2019-01-01, 2021-12-31]
+  test: [2022-01-01, 2025-12-31]
+  horizon_trading_days: 20
+  execution: next_close
+  fundamental_lag_months: 6
+  fundamental_max_age_months: 18
+
