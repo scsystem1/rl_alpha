@@ -10,5 +10,4 @@ PAIR_ROLLING = frozenset({"Cov", "Corr"})
 CROSS_SECTIONAL = frozenset({"CSRank", "CSZScore"})
 OPERATORS = UNARY | BINARY | ROLLING | PAIR_ROLLING | CROSS_SECTIONAL
 ARITY = {**{name: 1 for name in UNARY | CROSS_SECTIONAL}, **{name: 2 for name in BINARY | ROLLING}, **{name: 3 for name in PAIR_ROLLING}}
-COMMUTATIVE = frozenset({"Add", "Mul", "Greater", "Less"})
-
+COMMUTATIVE = frozenset({"Add", "Mul"})

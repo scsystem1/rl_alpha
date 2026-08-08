@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import platform
 import subprocess
 import sys
@@ -33,14 +34,14 @@ def build_manifest(paths: Any, data_files: list[Path] | None = None) -> dict[str
     data_records = [file_fingerprint(path) for path in (data_files or [])]
     manifest = {
         "python": {"version": sys.version, "executable": sys.executable, "platform": platform.platform()},
-        "packages": package_versions(["numpy", "pandas", "pyarrow", "scipy", "statsmodels", "torch", "transformers", "vllm", "verl"]),
+        "packages": package_versions(["numpy", "pandas", "pyarrow", "scipy", "statsmodels", "torch", "transformers", "vllm", "verl", "ray", "peft", "cvxpy", "osqp"]),
         "repositories": {
-            "ours": git_info(paths.code_root.parent),
+            "ours": git_info(paths.code_root),
             "alphagen": git_info(paths.alphagen_root),
             "quantevolver": git_info(paths.quantevolver_root),
         },
         "data_files": data_records,
+        "cuda": {"visible_devices": os.getenv("CUDA_VISIBLE_DEVICES"), "physical_gpu": os.getenv("RLALPHA_PHYSICAL_GPU")},
     }
     manifest["manifest_hash"] = stable_hash(manifest)
     return manifest
-

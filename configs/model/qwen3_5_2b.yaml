@@ -1,6 +1,11 @@
 model:
   repository: Qwen/Qwen3.5-2B
-  path: null
+  revision: 15852e8c16360a2fea060d615a32b45270f8a8fc
+  path: /data/shared/huggingface/Qwen3.5-2B
+  fingerprint:
+    weights_sha256: aa33250c4fc64891ddfaba3a314fd9542ea371843c387178b425fbcc5ed680b1
+    config_sha256: ed1c1723241f23f7f4e23430759cbd7dcfb4103cbdfe052bfe7626b57c2615b4
+    tokenizer_sha256: 5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42
   local_files_only: true
   trust_remote_code: true
   use_remove_padding: false
@@ -19,4 +24,3 @@ actor:
   lora_rank: 16
   lora_alpha: 32
   lora_target_modules: all-linear
-

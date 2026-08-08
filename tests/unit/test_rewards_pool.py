@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import numpy as np
+import statsmodels.api as sm
+from statsmodels.stats.sandwich_covariance import cov_hac
 
 from rlalpha.factors.combiner import RidgeCombiner
+from rlalpha.factors.calculator import FactorCalculator, daily_corr
 from rlalpha.factors.pool import PoolManager
 from rlalpha.factors.records import PoolEntry, PoolScore
 from rlalpha.rewards.r0 import R0Objective
@@ -21,6 +24,22 @@ def test_ridge_combiner_matches_explicit_linear_system():
     assert np.isfinite(weights).all()
     score = R0Objective(label, mask).score_pool(signals)
     assert np.isclose(score.objective, np.nanmean(score.daily_ic))
+
+
+def test_pool_moment_scoring_matches_explicit_fixed_universe_combination():
+    rng = np.random.default_rng(19)
+    label = rng.normal(size=(40, 60))
+    mask = rng.random(label.shape) > 0.05
+    signals = [rng.normal(size=label.shape) for _ in range(4)]
+    signals[1][5:10, :7] = np.nan
+    objective = R0Objective(label, mask)
+    score = objective.score_pool(signals)
+    calculator = FactorCalculator(label, mask)
+    prepared = [calculator.standardize(signal) for signal in signals]
+    common = mask & np.isfinite(label)
+    combined = sum(weight * np.where(common & np.isfinite(signal), signal, 0.0) for signal, weight in zip(prepared, score.weights, strict=True))
+    expected = daily_corr(combined, label, common)
+    assert np.allclose(score.daily_ic, expected, equal_nan=True, atol=1e-12)
 
 
 class _SumObjective:
@@ -48,6 +67,13 @@ def test_newey_west_lcb_is_mean_minus_standard_error_not_std():
     assert np.isclose(reported, se)
     assert np.isclose(objective, mean - 1.645 * se)
     assert not np.isclose(objective, mean - 1.645 * values.std())
+
+
+def test_newey_west_matches_statsmodels_without_small_sample_correction():
+    values = np.array([0.01, 0.02, -0.01, 0.03, 0.00] * 20)
+    fit = sm.OLS(values, np.ones((len(values), 1))).fit()
+    reference = float(np.sqrt(cov_hac(fit, nlags=20, use_correction=False)[0, 0]))
+    assert np.isclose(newey_west_mean_se(values, lag=20), reference, atol=1e-14)
 
 
 def test_r2_uses_neutralized_daily_ic_lcb():

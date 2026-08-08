@@ -1,0 +1,12 @@
+# Reproducibility-critical GPU stack. The full environment is captured in
+# every run's environment/pip-freeze.txt.
+torch==2.11.0
+transformers==5.10.4
+vllm==0.26.0
+verl @ git+https://github.com/verl-project/verl.git@4a2cba76f7f605d2b9f56e640faaeaa71c2c7f71
+ray==2.56.1
+peft==0.20.0
+accelerate==1.14.0
+xgrammar==0.2.3
+cvxpy==1.9.2
+osqp==1.1.3

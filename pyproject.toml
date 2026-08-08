@@ -19,12 +19,13 @@ dependencies = [
   "statsmodels>=0.14",
   "filelock>=3.13",
   "zarr>=3",
+  "bottleneck==1.6.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-xdist>=3", "hypothesis>=6"]
 portfolio = ["cvxpy>=1.5", "osqp>=0.6"]
-llm = ["torch", "transformers", "accelerate", "peft", "ray", "vllm", "verl"]
+llm = ["torch", "transformers", "accelerate", "peft", "ray", "vllm", "verl", "xgrammar"]
 
 [project.scripts]
 rlalpha = "rlalpha.cli:app"
@@ -34,7 +35,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra -m 'not gpu and not slow and not real_data'"
 markers = [
   "gpu: requires a working CUDA GPU",
   "slow: long-running test",

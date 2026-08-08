@@ -26,6 +26,11 @@
 
 `pytest -q`: 25 passed. Coverage includes unit, leakage sentinel, and synthetic end-to-end tests. The typed grammar generated 10,000 bounded ASTs in the test suite.
 
-## Deferred / blocked
+## Subsequent milestones
 
-M5–M9 are not started automatically, per the build guide. The host currently reports an NVIDIA driver communication failure; Qwen3.5-2B is absent under `/data/shared/huggingface`; and Torch/Transformers/vLLM/Verl are not installed in `rlalpha`. These must be resolved before M6/M7 model and GRPO smoke tests. No 12-cell experiment has been launched.
+This document records the original M0-M4 checkpoint. M5-M9 have since been
+implemented; current commands and status live in `README.md`. Qwen3.5-2B,
+vLLM, Verl/GRPO, resumable matrix execution, transactional evaluation and the
+four required report tables are now part of the repository. Formal experiment
+completion must be judged from the matrix state and report artifacts, not this
+historical checkpoint.

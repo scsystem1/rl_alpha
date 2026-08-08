@@ -38,19 +38,22 @@ class PoolManager:
             if candidate.expr_hash in self.hashes:
                 outcomes.append(CandidateScore(candidate.expr_hash, baseline, 0.0, -0.5))
                 continue
+            replaced_hash = None
             if len(self.entries) < self.capacity:
                 score = self._score(self.entries + [candidate])
             else:
-                alternatives = [self._score(self.entries[:index] + [candidate] + self.entries[index + 1 :]) for index in range(len(self.entries))]
-                score = max(alternatives, key=lambda item: item.objective)
+                alternatives = [(self._score(self.entries[:index] + [candidate] + self.entries[index + 1 :]), index) for index in range(len(self.entries))]
+                score, replacement_index = max(alternatives, key=lambda item: item[0].objective)
+                replaced_hash = self.entries[replacement_index].expr_hash
             delta = score.objective - baseline.objective
-            outcomes.append(CandidateScore(candidate.expr_hash, score, delta, max(-1.0, min(1.0, 100.0 * delta))))
+            outcomes.append(CandidateScore(candidate.expr_hash, score, delta, max(-1.0, min(1.0, 100.0 * delta)), replaced_hash))
         return outcomes
 
-    def consider_group(self, candidates: list[PoolEntry]) -> Admission:
+    def consider_group(self, candidates: list[PoolEntry], precomputed: list[CandidateScore] | None = None) -> Admission:
         """Score against one frozen pool and admit at most one candidate."""
-        baseline = self._score(self.entries)
-        scored = self.score_candidates(candidates)
+        scored = self.score_candidates(candidates) if precomputed is None else precomputed
+        if len(scored) != len(candidates) or {item.candidate_hash for item in scored} != {item.expr_hash for item in candidates}:
+            raise ValueError("precomputed candidate scores do not match admission group")
         if not scored:
             return Admission(False, None, None, 0.0, self.version)
         best = max(scored, key=lambda item: item.delta_objective)
@@ -63,12 +66,12 @@ class PoolManager:
         if len(self.entries) < self.capacity:
             self.entries.append(candidate)
         else:
-            alternatives = [(self._score(self.entries[:index] + [candidate] + self.entries[index + 1 :]), index) for index in range(len(self.entries))]
-            _, index = max(alternatives, key=lambda item: item[0].objective)
+            index = next((index for index, entry in enumerate(self.entries) if entry.expr_hash == best.replaced_hash), None)
+            if index is None:
+                raise RuntimeError("precomputed replacement is absent from frozen pool")
             replaced = self.entries[index].expr_hash
             self.entries[index] = candidate
         self.version += 1
         admission = Admission(True, candidate.expr_hash, replaced, best.delta_objective, self.version)
         self.history.append(asdict(admission))
         return admission
-

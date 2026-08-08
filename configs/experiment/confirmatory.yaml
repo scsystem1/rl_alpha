@@ -8,12 +8,17 @@ paths:
   alphagen_root: /home/sunyuxiang/rl_alpha/alphagen
   quantevolver_root: /home/sunyuxiang/rl_alpha/QuantEvolver
 experiment:
-  methods: [random, gp, base_llm, grpo_llm]
-  rewards: [r0, r1, r2_lcb]
-  seeds: [0]
-  valid_unique_budget: 5000
+  cells:
+    - [random, r0]
+    - [gp, r0]
+    - [base_llm, r0]
+    - [grpo_llm, r0]
+    - [grpo_llm, r1]
+    - [grpo_llm, r2_lcb]
+  seeds: [0, 1, 2]
+  valid_unique_budget: 20000
   proposal_group_size: 8
   pool_capacity: 20
   max_cpu_jobs: 4
   cpu_threads_per_job: 8
-  auto_start_expensive_jobs: true
+  continue_seed_zero_from: preliminary_screen

@@ -18,6 +18,7 @@ class CandidateScore:
     pool_score: PoolScore
     delta_objective: float
     shaped_reward: float
+    replaced_hash: str | None = None
 
 
 @dataclass
@@ -26,4 +27,3 @@ class PoolEntry:
     expr_hash: str
     signal: object = field(repr=False)
     metadata: dict[str, object] = field(default_factory=dict)
-

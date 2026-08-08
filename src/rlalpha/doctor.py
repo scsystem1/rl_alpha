@@ -44,8 +44,16 @@ def run_doctor(paths: PathsConfig) -> dict[str, Any]:
                 if ("tokenizer.json" in names or "tokenizer_config.json" in names) and any(name.endswith(".safetensors") for name in names):
                     model_candidates.append(str(config.parent.resolve()))
     data_files = list(discovery.values())
+    manifest = build_manifest(paths, data_files)
+    required = {"torch": "2.11.0", "transformers": "5.10.4", "vllm": "0.26.0", "ray": "2.56.1", "peft": "0.20.0"}
+    dependency_ok = all((manifest["packages"].get(name) or "").startswith(version) for name, version in required.items()) and manifest["packages"].get("verl") is not None
+    model_unique = len(set(model_candidates)) == 1
+    solver_ok = {"OSQP", "CLARABEL"}.issubset(solvers)
+    data_ok = bool(discovery.get("daily") and discovery.get("membership"))
+    gpu_ok = bool(nvidia and nvidia.returncode == 0)
     return {
-        "ok": bool(discovery.get("daily") and discovery.get("membership")),
+        "ok": data_ok and dependency_ok and model_unique and solver_ok and gpu_ok,
+        "checks": {"data": data_ok, "dependencies": dependency_ok, "model": model_unique, "solvers": solver_ok, "gpu": gpu_ok},
         "paths": {
             "code_root": _path_check(paths.code_root),
             "raw_data_root": _path_check(paths.raw_data_root),
@@ -56,7 +64,7 @@ def run_doctor(paths: PathsConfig) -> dict[str, Any]:
         },
         "data_discovery": {key: str(value) for key, value in discovery.items()},
         "gpu": {"available": bool(nvidia and nvidia.returncode == 0), "message": (nvidia.stdout or nvidia.stderr).strip() if nvidia else "nvidia-smi not installed"},
-        "qwen3_5_2b": {"resolved": model_candidates[0] if len(model_candidates) == 1 else None, "candidates": sorted(set(model_candidates)), "unique": len(set(model_candidates)) == 1},
+        "qwen3_5_2b": {"resolved": model_candidates[0] if model_unique else None, "candidates": sorted(set(model_candidates)), "unique": model_unique, "revision": "15852e8c16360a2fea060d615a32b45270f8a8fc"},
         "solvers": solvers,
-        "manifest": build_manifest(paths, data_files),
+        "manifest": manifest,
     }
