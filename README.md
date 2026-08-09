@@ -32,7 +32,7 @@ pytest -m real_data
 CUDA_VISIBLE_DEVICES=4 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   RLALPHA_VLLM_MEMORY_UTILIZATION=0.18 \
   python scripts/smoke_model.py --n 500 --seed 2026 \
-  --output /data/sunyuxiang/rl_alpha/runs/acceptance/model/base_llm_500.json
+  --output /home/sunyuxiang/rl_alpha/ours/output/acceptance/model/base_llm_500.json
 
 CUDA_VISIBLE_DEVICES=2 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   python scripts/smoke_grpo.py --updates 2

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT=/home/sunyuxiang/rl_alpha/ours
-RUNS=/data/sunyuxiang/rl_alpha/runs
+RUNS=/home/sunyuxiang/rl_alpha/ours/output
 LOG="$RUNS/full_experiment_orchestrator.log"
 mkdir -p "$RUNS"
 exec > >(tee -a "$LOG") 2>&1
@@ -42,4 +42,4 @@ finalize_until_complete preliminary_screen configs/experiment/preliminary_screen
 run_matrix_until_complete confirmatory configs/experiment/confirmatory.yaml
 finalize_until_complete confirmatory configs/experiment/confirmatory.yaml
 
-python -c 'import json, pathlib, time; pathlib.Path("/data/sunyuxiang/rl_alpha/runs/full_experiment_complete.json").write_text(json.dumps({"status":"complete","finished_at":time.time()}, indent=2)+"\n")'
+python -c 'import json, pathlib, time; pathlib.Path("/home/sunyuxiang/rl_alpha/ours/output/full_experiment_complete.json").write_text(json.dumps({"status":"complete","finished_at":time.time()}, indent=2)+"\n")'

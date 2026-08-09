@@ -15,7 +15,7 @@ class PathsConfig(BaseModel):
     raw_data_root: Path = Path("/data/sunyuxiang/rl_alpha")
     processed_root: Path = Path("/data/sunyuxiang/rl_alpha/processed")
     cache_root: Path = Path("/data/sunyuxiang/rl_alpha/cache")
-    runs_root: Path = Path("/data/sunyuxiang/rl_alpha/runs")
+    runs_root: Path = Path("/home/sunyuxiang/rl_alpha/ours/output")
     model_search_root: Path = Path("/data/shared/huggingface")
     alphagen_root: Path = Path("/home/sunyuxiang/rl_alpha/alphagen")
     quantevolver_root: Path = Path("/home/sunyuxiang/rl_alpha/QuantEvolver")
@@ -62,4 +62,3 @@ def load_paths(config: str | Path | None = None) -> PathsConfig:
         if value := os.getenv(env):
             raw[key] = value
     return PathsConfig.model_validate(raw)
-

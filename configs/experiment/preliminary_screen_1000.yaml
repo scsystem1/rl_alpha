@@ -11,7 +11,7 @@ experiment:
   methods: [random, gp, base_llm, grpo_llm]
   rewards: [r0, r1, r2_lcb]
   seeds: [0]
-  valid_unique_budget: 5000
+  valid_unique_budget: 1000
   proposal_group_size: 8
   pool_capacity: 20
   max_cpu_jobs: 4
