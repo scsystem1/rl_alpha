@@ -17,6 +17,43 @@ class ExposureDay:
     diagnostics: dict[str, object]
 
 
+def _rolling_market_regression(
+    stock_return: pd.Series,
+    market_return: pd.Series,
+    *,
+    window: int = 252,
+    min_periods: int = 126,
+) -> tuple[pd.Series, pd.Series]:
+    """Rolling market beta and same-window regression residual volatility.
+
+    Each output date is estimated from one common-observation OLS window with
+    an intercept.  In particular, residual volatility is *not* the rolling
+    standard deviation of residuals formed with a different beta on each day.
+    The returned residual standard deviation uses ``ddof=1``, matching an
+    explicit standard deviation of the residual vector in the window.
+    """
+    stock = pd.to_numeric(stock_return, errors="coerce").astype(float)
+    market = pd.to_numeric(market_return, errors="coerce").astype(float)
+    common = stock.notna() & market.notna() & np.isfinite(stock) & np.isfinite(market)
+    x = market.where(common, 0.0)
+    y = stock.where(common, 0.0)
+    rolling = lambda values: values.rolling(window, min_periods=1).sum()
+    count = rolling(common.astype(float))
+    sx, sy = rolling(x), rolling(y)
+    sxx, syy, sxy = rolling(x * x), rolling(y * y), rolling(x * y)
+    with np.errstate(all="ignore"):
+        centered_xx = sxx - sx * sx / count
+        centered_yy = syy - sy * sy / count
+        centered_xy = sxy - sx * sy / count
+        beta = centered_xy / centered_xx
+        residual_ss = centered_yy - beta * centered_xy
+        residual_variance = residual_ss / (count - 1.0)
+    valid = (count >= min_periods) & (centered_xx > 1e-12) & (residual_variance >= -1e-12)
+    beta = beta.where(valid)
+    residual_volatility = np.sqrt(residual_variance.clip(lower=0.0)).where(valid)
+    return beta, residual_volatility
+
+
 def preprocess_exposures(styles: pd.DataFrame, sic: pd.Series) -> ExposureDay:
     n = len(styles)
     processed = np.zeros((n, len(STYLE_NAMES)), dtype=float)
@@ -47,6 +84,7 @@ def preprocess_exposures(styles: pd.DataFrame, sic: pd.Series) -> ExposureDay:
     matrix = np.column_stack([np.ones(n), dummies, processed])
     columns = ("intercept",) + tuple(f"industry_{name}" for name in industry_names) + STYLE_NAMES
     diagnostics["condition_number"] = float(np.linalg.cond(matrix)) if n else float("nan")
+    diagnostics["rank"] = int(np.linalg.matrix_rank(matrix)) if n else 0
     return ExposureDay(matrix, columns, diagnostics)
 
 
@@ -60,11 +98,7 @@ def compute_market_styles(daily: pd.DataFrame, market: pd.DataFrame) -> pd.DataF
         group = group.copy()
         returns = pd.to_numeric(group["DlyRet"], errors="coerce")
         market_returns = pd.to_numeric(group["vwretd"], errors="coerce")
-        covariance = returns.rolling(252, min_periods=126).cov(market_returns)
-        variance = market_returns.rolling(252, min_periods=126).var()
-        group["beta_252"] = covariance / variance.where(variance.abs() > 1e-12)
-        residual = returns - group["beta_252"] * market_returns
-        group["resid_vol_252"] = residual.rolling(252, min_periods=126).std()
+        group["beta_252"], group["resid_vol_252"] = _rolling_market_regression(returns, market_returns)
         log_growth = np.log1p(returns.where(returns > -1))
         group["reversal_1m"] = np.expm1(log_growth.rolling(21, min_periods=21).sum())
         group["momentum_12_1"] = np.expm1(log_growth.shift(21).rolling(232, min_periods=232).sum())
@@ -72,4 +106,3 @@ def compute_market_styles(daily: pd.DataFrame, market: pd.DataFrame) -> pd.DataF
         group["amihud_20"] = np.log(illiquidity.rolling(20, min_periods=15).mean())
         outputs.append(group)
     return pd.concat(outputs, ignore_index=True)
-

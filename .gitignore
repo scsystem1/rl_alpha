@@ -9,4 +9,7 @@ dist/
 build/
 runs/
 /output
+/artifacts/processed_v3/
+/artifacts/runs_v3/
+/artifacts/cache_v3/
 paths.yaml

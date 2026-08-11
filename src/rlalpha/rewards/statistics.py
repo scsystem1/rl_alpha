@@ -16,7 +16,7 @@ def newey_west_mean_se(values: np.ndarray, lag: int = 20) -> float:
     long_run_variance = float(centered @ centered / count)
     for offset in range(1, max_lag + 1):
         covariance = float(centered[offset:] @ centered[:-offset] / count)
-        weight = 1.0 - offset / (lag + 1.0)
+        weight = 1.0 - offset / (max_lag + 1.0)
         long_run_variance += 2.0 * weight * covariance
     return math.sqrt(max(0.0, long_run_variance) / count)
 
@@ -29,4 +29,3 @@ def lcb_score(values: np.ndarray, lag: int = 20, critical_value: float = 1.645) 
     mean = float(finite.mean())
     standard_error = newey_west_mean_se(finite, lag=lag)
     return mean - critical_value * standard_error, mean, standard_error
-

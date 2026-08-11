@@ -19,6 +19,8 @@ class CandidateScore:
     delta_objective: float
     shaped_reward: float
     replaced_hash: str | None = None
+    valid: bool = True
+    reason: str = "ok"
 
 
 @dataclass

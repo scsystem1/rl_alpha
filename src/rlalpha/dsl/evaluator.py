@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import hashlib
 from typing import Mapping, Protocol
 
 import numpy as np
@@ -12,6 +13,9 @@ os.environ.setdefault("NUMBA_THREADING_LAYER", "workqueue")
 from numba import njit, prange
 
 from .ast import Call, Constant, Feature, Node, Window
+
+
+EVALUATOR_SEMANTICS_VERSION = "membership-aware-v3"
 
 
 class ArrayCache(Protocol):
@@ -112,10 +116,55 @@ def _rolling_pair(left: np.ndarray, right: np.ndarray, window: int, operator: st
     return result
 
 
-def evaluate(node: Node, features: Mapping[str, np.ndarray], cache: ArrayCache | None = None) -> np.ndarray:
+def _array_digest(values: np.ndarray) -> str:
+    array = np.ascontiguousarray(values)
+    digest = hashlib.sha256()
+    digest.update(str(array.shape).encode("ascii"))
+    digest.update(array.dtype.str.encode("ascii"))
+    digest.update(array.view(np.uint8))
+    return digest.hexdigest()
+
+
+def _default_cache_namespace(features: Mapping[str, np.ndarray]) -> str:
+    """Content identity used only when a caller has not supplied panel identity.
+
+    Production panel callers pass their manifest fingerprint, avoiding repeated
+    hashing.  Direct callers still get correctness if they reuse a cache after
+    mutating or replacing feature arrays.
+    """
+    digest = hashlib.sha256(EVALUATOR_SEMANTICS_VERSION.encode("ascii"))
+    for name in sorted(features):
+        digest.update(name.encode("utf-8"))
+        digest.update(_array_digest(np.asarray(features[name])).encode("ascii"))
+    return digest.hexdigest()
+
+
+def evaluate(
+    node: Node,
+    features: Mapping[str, np.ndarray],
+    cache: ArrayCache | None = None,
+    *,
+    eligibility_mask: np.ndarray | None = None,
+    cache_namespace: str | None = None,
+) -> np.ndarray:
     shape = next((np.asarray(values).shape for values in features.values()), None)
     if shape is None:
         raise ValueError("features cannot be empty")
+    if len(shape) != 2:
+        raise ValueError("features must have [time, asset] shape")
+    if eligibility_mask is None:
+        eligibility = np.ones(shape, dtype=bool)
+    else:
+        eligibility = np.asarray(eligibility_mask, dtype=bool)
+        if eligibility.shape != shape:
+            raise ValueError("cross-sectional eligibility mask shape differs from features")
+    namespace = cache_namespace
+    if cache is not None and namespace is None:
+        namespace = _default_cache_namespace(features)
+    mask_fingerprint = _array_digest(np.packbits(eligibility, axis=None))
+
+    def cache_key(current: Node) -> str:
+        return f"{EVALUATOR_SEMANTICS_VERSION}:{namespace or 'uncached'}:{mask_fingerprint}:{current.expr_hash}"
 
     def compute(current: Node) -> np.ndarray:
         if isinstance(current, Feature):
@@ -142,10 +191,15 @@ def evaluate(node: Node, features: Mapping[str, np.ndarray], cache: ArrayCache |
             denominator = args[1]
             sign = np.where(denominator < 0, -1.0, 1.0)
             return args[0] / (sign * np.maximum(np.abs(denominator), 1e-6))
-        if operator == "Greater": return (args[0] > args[1]).astype(float)
-        if operator == "Less": return (args[0] < args[1]).astype(float)
+        if operator in {"Greater", "Less"}:
+            finite = np.isfinite(args[0]) & np.isfinite(args[1])
+            output = np.full(shape, np.nan, dtype=float)
+            compared = args[0] > args[1] if operator == "Greater" else args[0] < args[1]
+            output[finite] = compared[finite].astype(float)
+            return output
         if operator in {"CSRank", "CSZScore"}:
-            frame = _frame(args[0])
+            values = np.where(eligibility & np.isfinite(args[0]), args[0], np.nan)
+            frame = _frame(values)
             if operator == "CSRank": return frame.rank(axis=1, pct=True).to_numpy(float)
             mean = frame.mean(axis=1, skipna=True)
             std = frame.std(axis=1, skipna=True, ddof=0).replace(0.0, np.nan)
@@ -162,12 +216,12 @@ def evaluate(node: Node, features: Mapping[str, np.ndarray], cache: ArrayCache |
     def visit(current: Node) -> np.ndarray:
         cacheable = isinstance(current, Call)
         if cache is not None and cacheable:
-            cached = cache.get(current.expr_hash)
+            cached = cache.get(cache_key(current))
             if cached is not None:
                 return np.asarray(cached)
         result = compute(current)
         if cache is not None and cacheable:
-            cache.put(current.expr_hash, result)
+            cache.put(cache_key(current), result)
         return result
 
     with np.errstate(all="ignore"):

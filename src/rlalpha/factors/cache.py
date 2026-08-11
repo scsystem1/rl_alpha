@@ -35,7 +35,9 @@ class SignalCache:
             import io
 
             buffer = io.BytesIO()
-            np.save(buffer, np.asarray(value, dtype=np.float32), allow_pickle=False)
+            # Preserve the evaluator dtype exactly.  Down-casting only on the
+            # persisted/resume path makes fresh and resumed experiments differ.
+            np.save(buffer, np.asarray(value), allow_pickle=False)
             atomic_write_bytes(path, buffer.getvalue())
 
     def discard(self, key: str) -> None:

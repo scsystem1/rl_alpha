@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import yaml
+from pathlib import Path
+from pydantic import ValidationError
 
 from rlalpha.factors.pool import PoolManager
 from rlalpha.factors.records import PoolScore
 from rlalpha.search.gp import GPSearcher
 from rlalpha.search.coordinator import SearchCoordinator
-from rlalpha.search.models import SearchContext
+from rlalpha.search.models import CandidateOutcome, SearchContext
 from rlalpha.search.random_search import RandomSearcher
-from rlalpha.matrix.runner import _contains_cuda_oom, run_matrix
+from rlalpha.search.run import _snapshot_record, _write_lineage
+from rlalpha.matrix.runner import _contains_cuda_oom, _gpu_for, _pid_alive, run_matrix
+from rlalpha.config import load_yaml
+
+
+ALPHAGEN_ROOT = Path(__file__).parents[3] / "alphagen"
 
 
 class _Objective:
@@ -32,22 +40,81 @@ def test_random_resume_reproduces_proposal_sequence():
     assert [item.expression for item in resumed.propose(_context(), 16)] == expected
 
 
-def test_gp_resume_and_pool_change_invalidate_fitness():
-    gp = GPSearcher(5, population_size=16)
-    proposed = gp.propose(_context(0), 8)
+def _gp_outcomes(candidates, pool_version, scale=1e-3):
+    return [
+        CandidateOutcome(
+            candidate.expr_hash,
+            candidate.expression,
+            True,
+            "ok",
+            True,
+            (index + 1) * scale,
+            metadata={"pre_group_pool_version": pool_version},
+        )
+        for index, candidate in enumerate(candidates)
+    ]
+
+
+def test_alphagen_gp_resume_reproduces_next_generation_and_pool_delta_fitness():
+    gp = GPSearcher(5, ALPHAGEN_ROOT, population_size=8)
+    first = gp.propose(_context(0), 8)
+    gp.observe(_gp_outcomes(first, 0))
     state = gp.state_dict()
-    resumed = GPSearcher(8, population_size=16)
+    assert state["engine"] == "alphagen_modified_gplearn"
+    assert Path(state["engine_source"]).resolve() == (ALPHAGEN_ROOT / "gplearn/genetic.py").resolve()
+    assert [item["fitness"] for item in state["population"]] == pytest.approx(
+        [(index + 1) * 1e-3 for index in range(8)]
+    )
+
+    expected = gp.propose(_context(1), 8)
+    resumed = GPSearcher(999, ALPHAGEN_ROOT, population_size=8)
     resumed.load_state_dict(state)
-    assert [item.expression for item in resumed.propose(_context(0), 8)] == [item.expression for item in gp.propose(_context(0), 8)]
-    resumed.propose(_context(1), 1)
-    assert all(item.fitness == float("-inf") for item in resumed.population)
+    actual = resumed.propose(_context(1), 8)
+    assert [(item.expression, item.parents) for item in actual] == [
+        (item.expression, item.parents) for item in expected
+    ]
+    assert all(item.parents for item in actual)
 
 
-def test_random_and_gp_each_propose_32_typed_candidates():
-    for searcher in (RandomSearcher(91), GPSearcher(91, population_size=32)):
-        proposed = searcher.propose(_context(), 32)
-        assert len(proposed) == 32
+def test_alphagen_gp_rejects_mixed_frozen_pool_versions():
+    gp = GPSearcher(7, ALPHAGEN_ROOT, population_size=8)
+    candidates = gp.propose(_context(3), 8)
+    outcomes = _gp_outcomes(candidates, 3)
+    outcomes[-1].metadata["pre_group_pool_version"] = 4
+    with pytest.raises(ValueError, match="mixed frozen pool versions"):
+        gp.observe(outcomes)
+
+
+def test_random_and_alphagen_gp_each_propose_eight_typed_candidates():
+    for searcher in (RandomSearcher(91), GPSearcher(91, ALPHAGEN_ROOT, population_size=8)):
+        proposed = searcher.propose(_context(), 8)
+        assert len(proposed) == 8
         assert all(item.node is not None and item.node.depth <= 6 and item.node.lookback <= 252 for item in proposed)
+        if isinstance(searcher, GPSearcher):
+            assert len({item.expr_hash for item in proposed}) == 8
+
+
+def test_alphagen_gp_generation_uses_one_frozen_pool_and_one_admission(tmp_path):
+    searcher = GPSearcher(13, ALPHAGEN_ROOT, population_size=8)
+    pool = PoolManager(_Objective(), capacity=3, min_delta=-1.0)
+    membership = np.ones((300, 120), dtype=bool)
+
+    def evaluator(node):
+        rng = np.random.default_rng(int(node.expr_hash[:16], 16))
+        return rng.normal(size=membership.shape) + int(node.expr_hash[:4], 16) / 65536
+
+    coordinator = SearchCoordinator(searcher, pool, evaluator, membership, 8, tmp_path)
+    outcomes = coordinator.run_group(8)
+    assert searcher.generation == 1
+    assert searcher.fitness_pool_version == 0
+    assert pool.version == 1
+    assert len(pool.entries) == 1
+    assert {item.metadata["pre_group_pool_version"] for item in outcomes} == {0}
+    expected = [
+        item.delta_objective if item.valid and item.market_evaluated and np.isfinite(item.delta_objective) else -np.inf
+        for item in outcomes
+    ]
+    np.testing.assert_allclose([program.fitness_ for program in searcher.population], expected)
 
 
 def test_pool_candidate_delta_matches_complete_recomputation():
@@ -77,10 +144,79 @@ def test_staged_searcher_updates_pool_only_at_stage_boundary(tmp_path):
     assert coordinator.pool.version == 1
 
 
+def test_checkpoint_hash_mismatch_refuses_resume(tmp_path):
+    base = np.arange(300 * 120, dtype=float).reshape(300, 120)
+    coordinator = SearchCoordinator(RandomSearcher(5), PoolManager(_Objective()), lambda node: base, np.ones_like(base, dtype=bool), 8, tmp_path)
+    coordinator.run_group(8)
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(checkpoint.read_text(encoding="utf-8") + " ", encoding="utf-8")
+    resumed = SearchCoordinator(RandomSearcher(5), PoolManager(_Objective()), lambda node: base, np.ones_like(base, dtype=bool), 8, tmp_path)
+    with pytest.raises(RuntimeError, match="hash mismatch"):
+        resumed.load_checkpoint()
+
+
+def test_lineage_artifacts_preserve_proposal_admission_and_final_factor_ids(tmp_path):
+    base = np.arange(300 * 120, dtype=float).reshape(300, 120)
+    searcher = RandomSearcher(7)
+    pool = PoolManager(_Objective(), capacity=2, min_delta=-1.0)
+    coordinator = SearchCoordinator(searcher, pool, lambda node: base + int(node.expr_hash[:4], 16) / 65536, np.ones_like(base, dtype=bool), 8, tmp_path)
+    coordinator.run_group(8)
+    snapshot = _snapshot_record(pool, {"objective": 1.0, "mean_ic": 1.0, "weights": [1.0]}, 8, searcher)
+    final = _write_lineage(tmp_path, coordinator, [snapshot], snapshot, "random", "r0", 7, "lineage_test")
+    assert final["factors"]
+    assert all(item["lineage_status"] == "verified" for item in final["factors"])
+    proposals = __import__("pandas").read_parquet(tmp_path / "lineage/proposals.parquet")
+    admissions = __import__("pandas").read_parquet(tmp_path / "lineage/admission_events.parquet")
+    final_rows = __import__("pandas").read_parquet(tmp_path / "lineage/final_pool_lineage.parquet")
+    assert set(final_rows["factor_id"]).issubset(set(proposals["factor_id"]))
+    assert set(final_rows["admission_event_id"]).issubset(set(admissions["admission_event_id"]))
+
+
 def test_matrix_oom_detection_is_specific_to_cuda_allocation_failures():
     assert _contains_cuda_oom("torch.OutOfMemoryError: CUDA out of memory")
     assert _contains_cuda_oom("CUBLAS_STATUS_ALLOC_FAILED")
     assert not _contains_cuda_oom("ValueError: malformed expression")
+
+
+def test_matrix_gpu_mapping_can_pin_all_llm_cells_to_one_physical_device():
+    experiment = {"gpu_devices": {"base_llm": [3], "grpo_llm": [3]}}
+    assert _gpu_for("base_llm", "r0", 0, experiment) == 3
+    assert _gpu_for("grpo_llm", "r0", 0, experiment) == 3
+    assert _gpu_for("grpo_llm", "r2_lcb", 7, experiment) == 3
+    assert _gpu_for("random", "r0", 0, experiment) is None
+
+
+def test_matrix_pid_liveness_uses_the_operating_system(monkeypatch):
+    calls = []
+    monkeypatch.setattr("rlalpha.matrix.runner.os.kill", lambda pid, signal: calls.append((pid, signal)))
+    assert _pid_alive(1234)
+    assert calls == [(1234, 0)]
+    assert not _pid_alive(None)
+
+
+def test_unknown_config_fields_fail_instead_of_being_ignored(tmp_path):
+    config = tmp_path / "bad.yaml"
+    config.write_text("search:\n  method: random\n  silently_ignored: true\n", encoding="utf-8")
+    with pytest.raises(ValidationError):
+        load_yaml(config)
+
+
+def test_formal_gp_config_requires_eight_candidates_and_complete_probabilities(tmp_path):
+    wrong_population = tmp_path / "wrong_population.yaml"
+    wrong_population.write_text("search:\n  method: gp\n  population_size: 16\n", encoding="utf-8")
+    with pytest.raises(ValidationError, match="population_size=8"):
+        load_yaml(wrong_population)
+
+    partial_probabilities = tmp_path / "partial_probabilities.yaml"
+    partial_probabilities.write_text("search:\n  method: gp\n  population_size: 8\n  p_crossover: 0.5\n", encoding="utf-8")
+    with pytest.raises(ValidationError, match="specified together"):
+        load_yaml(partial_probabilities)
+
+
+def test_all_repository_yaml_configs_are_typed():
+    root = __import__("pathlib").Path(__file__).parents[2]
+    for path in sorted((root / "configs").glob("**/*.yaml")):
+        load_yaml(path)
 
 
 def test_matrix_failure_isolated_and_resume_only_restarts_failed_cell(tmp_path, monkeypatch):
@@ -104,6 +240,7 @@ def test_matrix_failure_isolated_and_resume_only_restarts_failed_cell(tmp_path, 
 
     monkeypatch.setattr("rlalpha.matrix.runner.subprocess.Popen", FakeProcess)
     monkeypatch.setattr("rlalpha.matrix.runner._gpu_free_mib", lambda: {})
+    monkeypatch.setattr("rlalpha.matrix.runner._cell_acceptance", lambda directory, budget: (True, None))
     first = run_matrix(config, "matrix_smoke", poll_seconds=0)
     assert first["cells"]["random/r0/seed_0"]["status"] == "complete"
     assert first["cells"]["gp/r0/seed_0"]["status"] == "failed"
@@ -112,3 +249,7 @@ def test_matrix_failure_isolated_and_resume_only_restarts_failed_cell(tmp_path, 
     assert all(state["status"] == "complete" for state in second["cells"].values())
     assert calls.count("random") == 1
     assert calls.count("gp") == 2
+    root = tmp_path / "runs/matrix_smoke"
+    assert (root / "progress.json").exists()
+    assert (root / "experiment.log").exists()
+    assert not list(root.rglob("*.lock"))

@@ -16,12 +16,16 @@ from ...dsl.parser import parse_llm_response
 from ...utils.io import atomic_write_text, write_json
 from ..base_llm import configure_packaged_cuda_toolchain, resolve_model_path
 from ..models import Candidate, CandidateOutcome, SearchContext
-from ..prompts import DSL_GRAMMAR, HINTS, build_messages
+from ..prompts import DSL_GRAMMAR, build_messages
 from .reward_bridge import place_scalar_rewards
 
 
 class StagedGRPOSearcher:
-    """Single-GPU LoRA GRPO with Verl's outcome-advantage implementation."""
+    """Legacy group-normalized REINFORCE implementation; not formal GRPO.
+
+    Kept temporarily only to make old checkpoints auditable.  Formal search
+    dispatch never instantiates this class; use the QuantEvolver/Verl adapter.
+    """
 
     admission_group_interval = 8
     rollout_group = 8
@@ -92,8 +96,7 @@ class StagedGRPOSearcher:
         if self.pool_version != context.pool_version:
             self.pool_version = context.pool_version
             self.groups_in_stage = 0
-        hint = HINTS[(self.stage * self.admission_group_interval + self.groups_in_stage) % len(HINTS)]
-        messages = build_messages(context, hint)
+        messages = build_messages(context)
         prompt = self._tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         encoded = self._tokenizer(prompt, return_tensors="pt").to("cuda")
         torch.cuda.manual_seed(self.rng.randrange(2**31))

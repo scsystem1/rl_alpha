@@ -26,6 +26,13 @@ def project_fully_neutral(
     exposures: np.ndarray,
     eligible: np.ndarray,
     max_weight: float = 0.02,
+    *,
+    net_tolerance: float = 1e-8,
+    exposure_tolerance: float = 1e-6,
+    gross_tolerance: float = 1e-6,
+    weight_tolerance: float = 1e-6,
+    previous_weights: np.ndarray | None = None,
+    turnover_limit: float | None = None,
 ) -> tuple[np.ndarray | None, dict[str, object]]:
     import cvxpy as cp
 
@@ -58,14 +65,49 @@ def project_fully_neutral(
     result = np.zeros_like(target)
     result[indices] = np.asarray(weight.value).ravel()
     residual = x.T @ result[indices]
+    net = float(result.sum())
+    gross = float(np.abs(result).sum())
+    largest_weight = float(np.abs(result).max(initial=0))
+    largest_exposure = float(np.abs(residual).max(initial=0))
+    nontradable_weight = float(np.abs(result[~valid]).max(initial=0))
+    turnover = None if previous_weights is None else float(np.abs(result - np.asarray(previous_weights, dtype=float)).sum())
+    violations = []
+    if abs(net) > net_tolerance:
+        violations.append("net")
+    if largest_exposure > exposure_tolerance:
+        violations.append("risk_exposure")
+    if abs(gross - 1.0) > gross_tolerance:
+        violations.append("gross")
+    if largest_weight > max_weight + weight_tolerance:
+        violations.append("max_weight")
+    if nontradable_weight > weight_tolerance:
+        violations.append("tradability")
+    if turnover_limit is not None and (turnover is None or not np.isfinite(turnover) or turnover > turnover_limit + weight_tolerance):
+        violations.append("turnover")
+    solver_stats = problem.solver_stats
     audit = {
         "status": str(problem.status),
         "solver": solver_used,
-        "net": float(result.sum()),
-        "gross": float(np.abs(result).sum()),
-        "max_weight": float(np.abs(result).max(initial=0)),
-        "max_risk_exposure": float(np.abs(residual).max(initial=0)),
+        "solver_iterations": getattr(solver_stats, "num_iters", None),
+        "solve_time": getattr(solver_stats, "solve_time", None),
+        "net": net,
+        "gross": gross,
+        "max_weight": largest_weight,
+        "max_risk_exposure": largest_exposure,
+        "max_nontradable_weight": nontradable_weight,
+        "turnover": turnover,
+        "tolerances": {
+            "net": net_tolerance,
+            "exposure": exposure_tolerance,
+            "gross": gross_tolerance,
+            "weight": weight_tolerance,
+            "turnover_limit": turnover_limit,
+        },
+        "constraint_violations": violations,
+        "accepted": not violations,
     }
+    if violations:
+        return None, audit
     return result, audit
 
 
@@ -87,7 +129,7 @@ class PortfolioBacktester:
         self.sleeves = holding_days // rebalance_days
         self.activation_delay = execution_delay + pnl_delay
 
-    def run(self, scores: np.ndarray, returns: np.ndarray, eligible: np.ndarray, exposures: np.ndarray | None = None, fully_neutral: bool = False, max_weight: float = 0.02) -> PortfolioResult:
+    def run(self, scores: np.ndarray, returns: np.ndarray, eligible: np.ndarray, exposures: np.ndarray | None = None, fully_neutral: bool = False, max_weight: float = 0.02, neutral_tolerances: dict[str, float] | None = None) -> PortfolioResult:
         scores, returns, eligible = np.asarray(scores, float), np.asarray(returns, float), np.asarray(eligible, bool)
         if scores.shape != returns.shape or scores.shape != eligible.shape:
             raise ValueError("portfolio panel shapes differ")
@@ -109,7 +151,7 @@ class PortfolioBacktester:
             finite_return = np.isfinite(returns[day])
             held_missing = (np.abs(current) > 0) & ~finite_return
             missing[day] = int(held_missing.sum())
-            gross_returns[day] = float(np.dot(current[finite_return], returns[day, finite_return]))
+            gross_returns[day] = np.nan if held_missing.any() else float(np.dot(current[finite_return], returns[day, finite_return]))
             if day % self.rebalance_days == 0 and day + self.activation_delay < days:
                 sleeve = (day // self.rebalance_days) % self.sleeves
                 base = dollar_neutral_target(scores[day], eligible[day])
@@ -118,7 +160,7 @@ class PortfolioBacktester:
                 if fully_neutral:
                     if exposures is None:
                         raise ValueError("exposures required")
-                    projected, audit = project_fully_neutral(base, scores[day], exposures[day], eligible[day], max_weight)
+                    projected, audit = project_fully_neutral(base, scores[day], exposures[day], eligible[day], max_weight, **(neutral_tolerances or {}))
                     audit["signal_day"] = day
                     if projected is None:
                         infeasible[day] = True
@@ -133,19 +175,27 @@ class PortfolioBacktester:
 
 def portfolio_metrics(result: PortfolioResult, cost_bps: float) -> dict[str, object]:
     net_returns = result.gross_returns - cost_bps / 10000.0 * result.turnover
+    invalid_return_path = bool(result.missing_held_returns.sum() > 0 or (~np.isfinite(net_returns)).any())
     finite = net_returns[np.isfinite(net_returns)]
-    wealth = np.cumprod(1 + np.nan_to_num(finite)) if len(finite) else np.array([])
+    wealth = np.concatenate([[1.0], np.cumprod(1.0 + finite)]) if len(finite) else np.array([1.0])
     drawdown = wealth / np.maximum.accumulate(wealth) - 1 if len(wealth) else np.array([])
     mean, std = (float(finite.mean()), float(finite.std(ddof=1))) if len(finite) > 1 else (0.0, 0.0)
+    annual_return = mean * 252
+    annual_volatility = std * np.sqrt(252)
+    sharpe = mean / std * np.sqrt(252) if std > 0 else float("nan")
+    maximum_drawdown = float(drawdown.min(initial=0))
+    if invalid_return_path:
+        annual_return = annual_volatility = sharpe = maximum_drawdown = float("nan")
     return {
         "cost_bps": cost_bps,
-        "annual_return": mean * 252,
-        "annual_volatility": std * np.sqrt(252),
-        "sharpe": mean / std * np.sqrt(252) if std > 0 else float("nan"),
-        "max_drawdown": float(drawdown.min(initial=0)),
+        "annual_return": annual_return,
+        "annual_volatility": annual_volatility,
+        "sharpe": sharpe,
+        "max_drawdown": maximum_drawdown,
         "average_turnover": float(result.turnover.mean()),
         "average_gross": float(np.abs(result.weights).sum(axis=1).mean()),
         "average_net": float(result.weights.sum(axis=1).mean()),
         "infeasible_days": int(result.infeasible.sum()),
         "missing_held_returns": int(result.missing_held_returns.sum()),
+        "invalid_return_path": invalid_return_path,
     }

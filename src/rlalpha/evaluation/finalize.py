@@ -9,16 +9,17 @@ import numpy as np
 import pandas as pd
 from scipy.stats import rankdata
 
-from ..config import load_paths
+from ..config import load_paths, load_yaml
 from ..data.store import PanelStore, SplitPanel
 from ..dsl.parser import parse_expression
 from ..factors.calculator import FactorCalculator
 from ..factors.combiner import RidgeCombiner
-from ..risk.neutralize import RiskNeutralizer
+from ..factors.transform import FactorTransformPipeline, TransformConfig
 from ..utils.hashing import file_fingerprint, stable_hash
 from ..utils.io import write_json
+from ..utils.experiment_log import append_event, update_progress, write_result_summary
 from .portfolio import PortfolioBacktester, portfolio_metrics
-from .statistics import series_summary
+from .statistics import benjamini_hochberg, factor_significance, series_summary
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -29,7 +30,7 @@ def _evaluation_code_fingerprints() -> list[dict[str, Any]]:
     package = Path(__file__).parents[1]
     relatives = (
         "data/store.py", "dsl/evaluator.py", "dsl/parser.py",
-        "factors/calculator.py", "factors/combiner.py", "risk/neutralize.py",
+        "factors/calculator.py", "factors/combiner.py", "factors/transform.py", "risk/neutralize.py",
         "evaluation/portfolio.py", "evaluation/statistics.py", "evaluation/finalize.py",
     )
     return [file_fingerprint(package / relative) for relative in relatives]
@@ -38,34 +39,6 @@ def _evaluation_code_fingerprints() -> list[dict[str, Any]]:
 def _panel_fingerprints(processed_root: Path) -> list[dict[str, Any]]:
     panel = processed_root / "panel"
     return [file_fingerprint(path) for path in (panel / "index.json", panel / "build_manifest.yaml", panel / "risk_build_manifest.yaml")]
-
-
-def _standardized_residual_signals(signals: list[np.ndarray], mask: np.ndarray, exposures: np.ndarray) -> list[np.ndarray]:
-    dummy = np.zeros(mask.shape)
-    standardized = [FactorCalculator(dummy, mask).standardize(signal) for signal in signals]
-    outputs = [np.full(mask.shape, np.nan) for _ in signals]
-    neutralizer = RiskNeutralizer()
-    for day in range(mask.shape[0]):
-        values = np.column_stack([signal[day] for signal in standardized])
-        common = mask[day] & np.isfinite(exposures[day]).all(axis=1) & np.isfinite(values).all(axis=1)
-        if common.sum() <= exposures.shape[2]:
-            continue
-        residuals, _ = neutralizer.residualize_matrix(day, values, exposures[day], common)
-        for index in range(len(signals)):
-            outputs[index][day] = residuals[:, index]
-    return outputs
-
-
-def _residual_label(label: np.ndarray, mask: np.ndarray, exposures: np.ndarray) -> np.ndarray:
-    output = np.full_like(label, np.nan, dtype=float)
-    neutralizer = RiskNeutralizer()
-    for day in range(len(label)):
-        common = mask[day] & np.isfinite(label[day]) & np.isfinite(exposures[day]).all(axis=1)
-        if common.sum() <= exposures.shape[2]:
-            continue
-        residual, _ = neutralizer.residualize_vector(day, label[day], exposures[day], common)
-        output[day] = residual
-    return output
 
 
 def _daily_correlations(signal: np.ndarray, label: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -99,14 +72,172 @@ def _max_abs_exposure(realized: np.ndarray) -> float:
     return float(np.nanmax(np.abs(realized))) if np.isfinite(realized).any() else float("nan")
 
 
-def finalize_cell(run_dir: str | Path, processed_root: str | Path, bootstrap_samples: int = 2000, trade_mask_override: np.ndarray | None = None, finalization_scope_hash: str | None = None) -> dict[str, Any]:
+def _cell_identity(run_dir: Path) -> dict[str, object]:
+    parts = run_dir.parts
+    seed_name = parts[-1]
+    return {
+        "method": parts[-3] if len(parts) >= 3 else "unknown",
+        "reward": parts[-2] if len(parts) >= 2 else "unknown",
+        "seed": int(seed_name.removeprefix("seed_")) if seed_name.startswith("seed_") and seed_name.removeprefix("seed_").isdigit() else -1,
+    }
+
+
+def _configured_cells(experiment: dict[str, Any]) -> set[tuple[str, str, int]]:
+    seeds = [int(seed) for seed in experiment["seeds"]]
+    if "cells" in experiment:
+        return {(str(method), str(reward), seed) for method, reward in experiment["cells"] for seed in seeds}
+    return {
+        (str(method), str(reward), seed)
+        for method in experiment["methods"]
+        for reward in experiment["rewards"]
+        for seed in seeds
+    }
+
+
+def _assert_experiment_frozen(config: str | Path, paths: Any, root: Path, experiment: dict[str, Any]) -> list[Path]:
+    """Refuse to open test data until the complete configured matrix is frozen."""
+    from ..matrix.runner import _cell_acceptance, _expected_cell_identity
+
+    expected = _configured_cells(experiment)
+    actual = {}
+    for final_pool in root.glob("*/*/seed_*/final_pool.json"):
+        relative = final_pool.parent.relative_to(root).parts
+        if len(relative) != 3 or not relative[2].startswith("seed_"):
+            continue
+        actual[(relative[0], relative[1], int(relative[2].removeprefix("seed_")))] = final_pool
+    missing, unexpected = sorted(expected - set(actual)), sorted(set(actual) - expected)
+    if missing or unexpected:
+        raise RuntimeError(f"test opening refused: missing_cells={missing}, unexpected_cells={unexpected}")
+    budget = int(experiment["valid_unique_budget"])
+    comparability = set()
+    for method, reward, seed in sorted(expected):
+        directory = root / method / reward / f"seed_{seed}"
+        state_path = directory / "progress.json"
+        if not state_path.exists():
+            raise RuntimeError(f"test opening refused: cell state missing for {(method, reward, seed)}")
+        state = _read_json(state_path)
+        identity = _expected_cell_identity(Path(config).resolve(), paths, method, reward, seed, budget)
+        if state.get("status") != "complete" or int(state.get("budget", -1)) != budget or state.get("cell_identity") != identity:
+            raise RuntimeError(f"test opening refused: incomplete or incompatible state for {(method, reward, seed)}")
+        accepted, reason = _cell_acceptance(directory, budget)
+        if not accepted:
+            raise RuntimeError(f"test opening refused: {(method, reward, seed)}: {reason}")
+        import yaml
+
+        manifest = yaml.safe_load((directory / "manifest.yaml").read_text(encoding="utf-8")) or {}
+        panel_identity = tuple((Path(item["path"]).name, item["sha256"]) for item in manifest.get("panel_artifacts", []))
+        comparability.add((panel_identity, manifest.get("evaluator_version")))
+    if len(comparability) != 1:
+        raise RuntimeError("test opening refused: panel/evaluator fingerprints differ across cells")
+    return [actual[key] for key in sorted(expected)]
+
+
+def _write_factor_statistics(
+    test_dir: Path,
+    run_dir: Path,
+    selected: dict[str, Any],
+    expressions: list[str],
+    weights: np.ndarray,
+    dates: pd.DatetimeIndex,
+    raw_signals: list[np.ndarray],
+    raw_label: np.ndarray,
+    transformed_signals: tuple[np.ndarray, ...],
+    transformed_label: np.ndarray,
+    common_mask: np.ndarray,
+    diagnostics: tuple[dict[str, Any], ...],
+    evaluation_config: dict[str, Any],
+) -> None:
+    identity = _cell_identity(run_dir)
+    final_pool_id = str(selected.get("final_pool_id") or f"final_pool_{stable_hash({'cell': identity, 'pool_version': selected.get('pool_version'), 'expressions': expressions})[:20]}")
+    lineage_by_expression = {str(item.get("expression")): item for item in selected.get("factors", [])}
+    raw_calculator = FactorCalculator(raw_label, common_mask)
+    raw_prepared = [raw_calculator.standardize(signal) for signal in raw_signals]
+    daily_rows: list[pd.DataFrame] = []
+    summary_rows: list[dict[str, Any]] = []
+    for index, expression in enumerate(expressions):
+        lineage = lineage_by_expression.get(expression, {})
+        factor_id = str(lineage.get("factor_id") or stable_hash({"canonical_expression": expression}))
+        lineage_id = str(lineage.get("factor_lineage_id") or lineage.get("proposal_id") or "legacy_unknown")
+        raw_ic, raw_rank = _daily_correlations(raw_prepared[index], raw_label, common_mask)
+        rnic, rank_rnic = _daily_correlations(transformed_signals[index], transformed_label, common_mask)
+        n_obs = (common_mask & np.isfinite(transformed_signals[index]) & np.isfinite(transformed_label)).sum(axis=1)
+        diag_by_day = {int(item.get("date")): item for item in diagnostics if str(item.get("date", "")).isdigit()}
+        frame = pd.DataFrame({
+            "date": dates,
+            "n_obs": n_obs,
+            "raw_pearson_ic": raw_ic,
+            "raw_rank_ic": raw_rank,
+            "pearson_rnic": rnic,
+            "rank_rnic": rank_rnic,
+            "residualization_status": [diag_by_day.get(day, {}).get("status", "missing") for day in range(len(dates))],
+            "exposure_rank": [diag_by_day.get(day, {}).get("rank") for day in range(len(dates))],
+            "condition_number": [diag_by_day.get(day, {}).get("condition_number") for day in range(len(dates))],
+            "max_residual_exposure": [diag_by_day.get(day, {}).get("max_residual_exposure") for day in range(len(dates))],
+        })
+        for key, value in {**identity, "final_pool_id": final_pool_id, "factor_id": factor_id, "factor_lineage_id": lineage_id, "expression": expression}.items():
+            frame.insert(len(frame.columns), key, value)
+        daily_rows.append(frame)
+        direction = float(np.sign(weights[index]))
+        for metric, values in (("pearson_rnic", rnic), ("rank_rnic", rank_rnic)):
+            record = factor_significance(values, hac_lag=int(evaluation_config["hac_lag"]), bootstrap_block=int(evaluation_config["bootstrap_block_length"]), bootstrap_samples=int(evaluation_config["bootstrap_samples"]), seed=int(evaluation_config["bootstrap_seed"]) + (int(identity["seed"]) if int(identity["seed"]) >= 0 else 0))
+            summary_rows.append({
+                **identity,
+                "final_pool_id": final_pool_id,
+                "factor_id": factor_id,
+                "factor_lineage_id": lineage_id,
+                "expression": expression,
+                "metric": metric,
+                "final_ridge_weight": float(weights[index]),
+                "formula_rnic_mean": record["mean"],
+                "direction_adjusted_rnic_mean": direction * float(record["mean"]),
+                **record,
+            })
+    daily = pd.concat(daily_rows, ignore_index=True)
+    summary = pd.DataFrame(summary_rows)
+    summary["q_value"] = np.nan
+    for metric in summary["metric"].unique():
+        selected_rows = summary["metric"].eq(metric)
+        summary.loc[selected_rows, "q_value"] = benjamini_hochberg(summary.loc[selected_rows, "p_value"].to_numpy())
+    fdr_threshold = float(evaluation_config["fdr_threshold"])
+    summary["fdr_threshold"] = fdr_threshold
+    summary["significant_fdr_5pct"] = summary["q_value"] <= fdr_threshold
+    daily.to_parquet(test_dir / "factor_rnic_daily.parquet", index=False)
+    summary.to_parquet(test_dir / "factor_significance.parquet", index=False)
+    summary.to_csv(test_dir / "factor_significance.csv", index=False)
+    write_json(test_dir / "factor_significance_metadata.json", {
+        "schema_version": 1,
+        "primary_metrics": ["pearson_rnic", "rank_rnic"],
+        "hac_lag": evaluation_config["hac_lag"],
+        "bootstrap": {"method": "moving_block", "block_length": evaluation_config["bootstrap_block_length"], "samples": evaluation_config["bootstrap_samples"], "seed": int(evaluation_config["bootstrap_seed"]) + int(identity["seed"])},
+        "multiple_testing": {"method": "Benjamini-Hochberg", "scope": "final_pool_by_metric", "threshold": fdr_threshold},
+        "test_direction_policy": "formula direction and ridge-weight sign were frozen before test; no test sign flip",
+    })
+
+
+def finalize_cell(
+    run_dir: str | Path,
+    processed_root: str | Path,
+    bootstrap_samples: int = 2000,
+    trade_mask_override: np.ndarray | None = None,
+    fit_mask_override: np.ndarray | None = None,
+    finalization_scope_hash: str | None = None,
+    evaluation_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     run_dir, processed_root = Path(run_dir), Path(processed_root)
     final_pool_path = run_dir / "final_pool.json"
     selected = json.loads(final_pool_path.read_text(encoding="utf-8"))
+    evaluation_config = evaluation_config or {
+        "ridge_lambda": 1e-3, "hac_lag": 20, "rebalance_days": 5, "holding_days": 20,
+        "one_way_cost_bps": [0, 10], "fully_neutral_max_weight": 0.02,
+        "net_tolerance": 1e-8, "exposure_tolerance": 1e-6, "gross_tolerance": 1e-6,
+        "weight_tolerance": 1e-6, "bootstrap_block_length": 20, "bootstrap_samples": bootstrap_samples,
+        "bootstrap_seed": 0, "fdr_threshold": 0.05,
+    }
+    bootstrap_samples = int(evaluation_config["bootstrap_samples"])
     expressions = list(selected.get("expressions", []))
     if not expressions:
         raise ValueError(f"selected pool is empty: {run_dir}")
-    input_hash = stable_hash({"schema_version": 6, "final_pool": file_fingerprint(final_pool_path), "panel": _panel_fingerprints(processed_root), "evaluation_code": _evaluation_code_fingerprints(), "bootstrap_samples": bootstrap_samples, "finalization_scope_hash": finalization_scope_hash})
+    input_hash = stable_hash({"schema_version": 7, "final_pool": file_fingerprint(final_pool_path), "panel": _panel_fingerprints(processed_root), "evaluation_code": _evaluation_code_fingerprints(), "evaluation_config": evaluation_config, "finalization_scope_hash": finalization_scope_hash})
     test_dir = run_dir / "test"
     test_dir.mkdir(parents=True, exist_ok=True)
     marker = test_dir / "finalization.json"
@@ -124,10 +255,16 @@ def finalize_cell(run_dir: str | Path, processed_root: str | Path, bootstrap_sam
     fit_mask = np.concatenate([train.target(train.common_mask), validation.target(validation.common_mask)])
     fit_exposures = np.concatenate([train.target(train.exposures), validation.target(validation.exposures)])
     fit_label = np.concatenate([train.target(train.label), validation.target(validation.label)])
-    fit_residual_signals = _standardized_residual_signals(fit_signals, fit_mask, fit_exposures)
-    fit_residual_label = _residual_label(fit_label, fit_mask, fit_exposures)
-    fit_ic_mask = fit_mask & np.isfinite(fit_residual_label)
-    weights = RidgeCombiner(1e-3).fit(fit_residual_signals, fit_residual_label, fit_ic_mask)
+    if fit_mask_override is not None:
+        if fit_mask_override.shape != fit_mask.shape:
+            raise ValueError("shared fit mask shape differs from train+validation panel")
+        fit_mask &= fit_mask_override
+    combiner = RidgeCombiner(float(evaluation_config["ridge_lambda"]), FactorTransformPipeline(TransformConfig(neutralize=True, post_residual_standardize=True)))
+    weights = combiner.fit(fit_signals, fit_label, fit_mask, fit_exposures)
+    fit_transformed = combiner.last_fit_result
+    if fit_transformed is None:
+        raise RuntimeError("combiner did not retain its fitted transform result")
+    write_json(run_dir / "combiner.json", combiner.to_dict())
 
     trade_mask = test.target(test.common_mask)
     if trade_mask_override is not None:
@@ -136,35 +273,57 @@ def finalize_cell(run_dir: str | Path, processed_root: str | Path, bootstrap_sam
         trade_mask &= trade_mask_override
     test_exposures = test.target(test.exposures)
     test_signals = _signals(test, expressions)
-    residual_signals = _standardized_residual_signals(test_signals, trade_mask, test_exposures)
-    stacked = np.stack(residual_signals, axis=-1)
-    combined = np.nansum(stacked * weights[None, None, :], axis=-1)
-    combined[~np.isfinite(stacked).any(axis=-1)] = np.nan
-    residual_label = _residual_label(test.target(test.label), trade_mask, test_exposures)
-    ic_mask = trade_mask & np.isfinite(residual_label)
-    pearson, rank = _daily_correlations(combined, residual_label, ic_mask)
     raw_label = test.target(test.label)
-    raw_calculator = FactorCalculator(raw_label, trade_mask)
+    transformed_ic = combiner.pipeline.transform_ic(test_signals, raw_label, trade_mask, test_exposures)
+    assert transformed_ic.label is not None
+    combined_ic = np.sum(np.stack(transformed_ic.signals, axis=-1) * weights[None, None, :], axis=-1)
+    combined_ic[~transformed_ic.mask] = np.nan
+    pearson, rank = _daily_correlations(combined_ic, transformed_ic.label, transformed_ic.mask)
+    combined, portfolio_mask, portfolio_diagnostics = combiner.transform(test_signals, trade_mask, test_exposures)
+    raw_common = trade_mask & np.isfinite(raw_label)
+    for signal in test_signals:
+        raw_common &= np.isfinite(signal)
+    raw_calculator = FactorCalculator(raw_label, raw_common)
     raw_prepared = [raw_calculator.standardize(signal) for signal in test_signals]
     raw_stacked = np.stack(raw_prepared, axis=-1)
-    raw_combined = np.nansum(raw_stacked * weights[None, None, :], axis=-1)
-    raw_combined[~np.isfinite(raw_stacked).any(axis=-1)] = np.nan
-    raw_pearson, raw_rank = _daily_correlations(raw_combined, raw_label, trade_mask & np.isfinite(raw_label))
+    raw_combined = np.sum(raw_stacked * weights[None, None, :], axis=-1)
+    raw_combined[~raw_common] = np.nan
+    raw_pearson, raw_rank = _daily_correlations(raw_combined, raw_label, raw_common)
     pd.DataFrame({"date": test.target_dates, "raw_ic": raw_pearson, "raw_rank_ic": raw_rank, "rnic": pearson, "rank_rnic": rank}).to_parquet(test_dir / "rnic_daily.parquet", index=False)
+    _write_factor_statistics(test_dir, run_dir, selected, expressions, weights, test.target_dates, test_signals, raw_label, transformed_ic.signals, transformed_ic.label, transformed_ic.mask, transformed_ic.diagnostics, evaluation_config)
 
-    backtester = PortfolioBacktester(5, 20)
+    backtester = PortfolioBacktester(int(evaluation_config["rebalance_days"]), int(evaluation_config["holding_days"]))
     returns = test.target(test.daily_return)
-    dollar = backtester.run(combined, returns, trade_mask)
-    fully = backtester.run(combined, returns, trade_mask, test_exposures, fully_neutral=True, max_weight=0.02)
+    dollar = backtester.run(combined, returns, portfolio_mask)
+    neutral_tolerances = {"net_tolerance": float(evaluation_config["net_tolerance"]), "exposure_tolerance": float(evaluation_config["exposure_tolerance"]), "gross_tolerance": float(evaluation_config["gross_tolerance"]), "weight_tolerance": float(evaluation_config["weight_tolerance"])}
+    fully = backtester.run(combined, returns, portfolio_mask, test_exposures, fully_neutral=True, max_weight=float(evaluation_config["fully_neutral_max_weight"]), neutral_tolerances=neutral_tolerances)
     daily_frames = {}
     portfolio_results = {}
+    audit_frames = []
     for name, result in (("dollar_neutral", dollar), ("fully_neutral", fully)):
         frame = pd.DataFrame({"date": test.target_dates, "gross_return": result.gross_returns, "turnover": result.turnover, "missing_held_returns": result.missing_held_returns, "infeasible": result.infeasible})
-        for cost in (0.0, 10.0):
+        for cost in map(float, evaluation_config["one_way_cost_bps"]):
             frame[f"net_return_{int(cost)}bps"] = result.gross_returns - cost / 10000.0 * result.turnover
         frame.to_parquet(test_dir / f"{name}_daily.parquet", index=False)
         daily_frames[name] = frame
-        portfolio_results[name] = {f"{int(cost)}bps": portfolio_metrics(result, cost) for cost in (0.0, 10.0)}
+        portfolio_results[name] = {f"{int(cost)}bps": portfolio_metrics(result, cost) for cost in map(float, evaluation_config["one_way_cost_bps"])}
+        if result.audits:
+            audit_frame = pd.DataFrame(result.audits)
+            audit_frame.insert(0, "portfolio", name)
+            audit_frames.append(audit_frame)
+        if name == "fully_neutral":
+            successful = [audit for audit in result.audits if audit.get("accepted")]
+            portfolio_results[name]["solver_audit"] = {
+                "rebalance_events": len(result.audits),
+                "accepted_events": len(successful),
+                "failure_rate": 1.0 - len(successful) / max(1, len(result.audits)),
+                "maximum_abs_net": max((abs(float(audit.get("net", 0.0))) for audit in successful), default=float("nan")),
+                "maximum_gross": max((float(audit.get("gross", 0.0)) for audit in successful), default=float("nan")),
+                "maximum_weight": max((float(audit.get("max_weight", 0.0)) for audit in successful), default=float("nan")),
+                "maximum_risk_exposure": max((float(audit.get("max_risk_exposure", 0.0)) for audit in successful), default=float("nan")),
+            }
+    if audit_frames:
+        pd.concat(audit_frames, ignore_index=True).to_parquet(test_dir / "portfolio_solver_audits.parquet", index=False)
     exposures = []
     for name, result in (("dollar_neutral", dollar), ("fully_neutral", fully)):
         finite_exposure = np.isfinite(test_exposures).all(axis=2)
@@ -190,25 +349,59 @@ def finalize_cell(run_dir: str | Path, processed_root: str | Path, bootstrap_sam
         "pool_size": len(expressions),
         "expressions": expressions,
         "ridge_weights": weights.tolist(),
-        "average_pair_correlation": _average_pair_correlation(fit_residual_signals),
+        "transform_pipeline": combiner.pipeline.to_dict(),
+        "fit_observations": int(fit_transformed.mask.sum()),
+        "test_ic_observations": int(transformed_ic.mask.sum()),
+        "test_trade_observations": int(portfolio_mask.sum()),
+        "average_pair_correlation": _average_pair_correlation(list(fit_transformed.signals)),
+        "raw_ic_diagnostic": raw_summary,
+        "primary_pearson_rnic": rnic_summary,
         "raw_ic": raw_summary,
         "rnic": rnic_summary,
         "rank_rnic": series_summary(rank, bootstrap_samples=bootstrap_samples),
         "neutralization_retention": retention,
         "portfolios": portfolio_results,
         "limitations": ["Historical borrow availability is unavailable; short eligibility assumes borrowability."],
+        "neutralization_diagnostics": {"ic_days": len(transformed_ic.diagnostics), "portfolio_days": len(portfolio_diagnostics)},
     }
     write_json(test_dir / "metrics.json", metrics)
     write_json(marker, {"status": "complete", "input_hash": input_hash, "metrics_hash": stable_hash(metrics)})
+    result_path = run_dir / "result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else {}
+    result.update({"status": "evaluated", "evaluation": metrics})
+    write_json(result_path, result)
+    identity = _cell_identity(run_dir)
+    ledger = result.get("search", {})
+    write_result_summary(
+        run_dir / "result.md",
+        experiment_id=str(result.get("experiment_id", run_dir.parents[2].name)),
+        method=str(result.get("method", identity["method"])),
+        reward=str(result.get("reward", identity["reward"])),
+        seed=int(result.get("seed", identity["seed"])),
+        budget=int(result.get("budget", ledger.get("limit", ledger.get("valid_unique_evaluations", 0)))),
+        ledger=ledger,
+        pool_version=int(selected.get("pool_version", 0)),
+        train_objective=result.get("train_objective"),
+        validation_objective=result.get("validation_objective"),
+        expressions=expressions,
+        evaluation=metrics,
+    )
+    # Matrix/report completion gates keep ``status=complete``; evaluation has
+    # its own monotonic field so adding readable progress cannot invalidate an
+    # otherwise accepted cell.
+    update_progress(run_dir / "progress.json", status="complete", evaluation_status="complete")
+    append_event(run_dir / "experiment.log", "evaluation_finished", primary_rnic=metrics["primary_pearson_rnic"].get("mean"), rank_rnic=metrics["rank_rnic"].get("mean"), fully_neutral_10bps_sharpe=metrics["portfolios"]["fully_neutral"]["10bps"].get("sharpe"))
     return metrics
 
 
 def finalize_experiment(experiment_id: str, config: str | Path) -> dict[str, Any]:
+    raw_config = load_yaml(config)
     paths = load_paths(config)
+    evaluation_config = load_yaml(paths.code_root / "configs/eval/preliminary.yaml")["evaluation"]
     root = paths.runs_root / experiment_id
-    final_pools = sorted(root.glob("*/*/seed_*/final_pool.json"))
-    if not final_pools:
-        raise ValueError(f"experiment has no frozen pools: {root}")
+    append_event(root / "experiment.log", "evaluation_started", experiment_id=experiment_id)
+    experiment = raw_config["experiment"]
+    final_pools = _assert_experiment_frozen(config, paths, root, experiment)
     scope_input_hash = stable_hash({"schema_version": 2, "experiment_id": experiment_id, "final_pools": [file_fingerprint(path) for path in final_pools], "panel": _panel_fingerprints(paths.processed_root), "evaluation_code": _evaluation_code_fingerprints()})
     transaction_path = root / "test_finalization.json"
     if transaction_path.exists():
@@ -219,24 +412,65 @@ def finalize_experiment(experiment_id: str, config: str | Path) -> dict[str, Any
             return _read_json(root / "evaluation_summary.json")
     write_json(transaction_path, {"status": "started", "scope_input_hash": scope_input_hash})
 
-    test_panel = PanelStore(paths.processed_root).load_split("test")
-    shared_trade_mask = test_panel.target(test_panel.common_mask).copy()
+    store = PanelStore(paths.processed_root)
     expressions = sorted({expression for path in final_pools for expression in _read_json(path).get("expressions", [])})
+    train_panel, validation_panel = store.load_split("train"), store.load_split("validation")
+    shared_fit_mask = np.concatenate([
+        train_panel.target(train_panel.common_mask) & np.isfinite(train_panel.target(train_panel.label)),
+        validation_panel.target(validation_panel.common_mask) & np.isfinite(validation_panel.target(validation_panel.label)),
+    ])
+    fit_before = shared_fit_mask.sum(axis=1)
+    for expression in expressions:
+        node = parse_expression(expression)
+        signal = np.concatenate([train_panel.evaluate(node), validation_panel.evaluate(node)])
+        shared_fit_mask &= np.isfinite(signal)
+    fit_after = shared_fit_mask.sum(axis=1)
+    min_assets = int(evaluation_config["common_universe_min_assets_per_day"])
+    min_days = int(evaluation_config["common_universe_min_valid_days"])
+    min_coverage = float(evaluation_config["common_universe_min_coverage"])
+    valid_fit_days = fit_after >= min_assets
+    base_observations = int(fit_before.sum())
+    fit_coverage = float(shared_fit_mask.sum() / max(1, base_observations))
+    if int(valid_fit_days.sum()) < min_days or fit_coverage < min_coverage:
+        raise RuntimeError(f"common fit universe below hard gate: valid_days={int(valid_fit_days.sum())}, coverage={fit_coverage:.6f}")
+    fit_universe_hash = hashlib.sha256(np.packbits(shared_fit_mask).tobytes()).hexdigest()
+    write_json(root / "fit_universe.json", {
+        "scope_input_hash": scope_input_hash,
+        "universe_hash": fit_universe_hash,
+        "formula_count": len(expressions),
+        "eligible_observations_before_intersection": base_observations,
+        "eligible_observations_after_intersection": int(shared_fit_mask.sum()),
+        "coverage": fit_coverage,
+        "valid_days_at_least_100_assets": int(valid_fit_days.sum()),
+        "counts_before_by_date": fit_before.tolist(),
+        "counts_after_by_date": fit_after.tolist(),
+        "hard_gates": {"minimum_coverage": min_coverage, "minimum_assets_per_day": min_assets, "minimum_valid_days": min_days},
+    })
+
+    test_panel = store.load_split("test")
+    shared_trade_mask = test_panel.target(test_panel.common_mask).copy()
+    test_before = shared_trade_mask.sum(axis=1)
     for expression in expressions:
         shared_trade_mask &= np.isfinite(test_panel.evaluate(parse_expression(expression)))
+    test_after = shared_trade_mask.sum(axis=1)
+    test_coverage = float(shared_trade_mask.sum() / max(1, int(test_before.sum())))
+    valid_test_days = test_after >= min_assets
+    if int(valid_test_days.sum()) < min_days or test_coverage < min_coverage:
+        raise RuntimeError(f"common test universe below hard gate: valid_days={int(valid_test_days.sum())}, coverage={test_coverage:.6f}")
     universe_hash = hashlib.sha256(np.packbits(shared_trade_mask).tobytes()).hexdigest()
-    finalization_scope_hash = stable_hash({"scope_input_hash": scope_input_hash, "universe_hash": universe_hash})
-    write_json(root / "test_universe.json", {"scope_input_hash": scope_input_hash, "universe_hash": universe_hash, "formula_count": len(expressions), "dates": len(shared_trade_mask), "assets": shared_trade_mask.shape[1], "eligible_observations": int(shared_trade_mask.sum()), "eligible_by_date": shared_trade_mask.sum(axis=1).tolist()})
+    finalization_scope_hash = stable_hash({"scope_input_hash": scope_input_hash, "fit_universe_hash": fit_universe_hash, "test_universe_hash": universe_hash})
+    write_json(root / "test_universe.json", {"scope_input_hash": scope_input_hash, "universe_hash": universe_hash, "formula_count": len(expressions), "dates": len(shared_trade_mask), "assets": shared_trade_mask.shape[1], "eligible_observations_before_intersection": int(test_before.sum()), "eligible_observations": int(shared_trade_mask.sum()), "coverage": test_coverage, "valid_days_at_least_minimum_assets": int(valid_test_days.sum()), "eligible_before_by_date": test_before.tolist(), "eligible_by_date": test_after.tolist(), "hard_gates": {"minimum_coverage": min_coverage, "minimum_assets_per_day": min_assets, "minimum_valid_days": min_days}})
 
     results: dict[str, Any] = {}
     for final_pool in final_pools:
         cell = final_pool.parent
         key = str(cell.relative_to(root))
         try:
-            results[key] = {"status": "complete", "metrics": finalize_cell(cell, paths.processed_root, trade_mask_override=shared_trade_mask, finalization_scope_hash=finalization_scope_hash)}
+            results[key] = {"status": "complete", "metrics": finalize_cell(cell, paths.processed_root, trade_mask_override=shared_trade_mask, fit_mask_override=shared_fit_mask, finalization_scope_hash=finalization_scope_hash, evaluation_config=evaluation_config)}
         except Exception as exc:
             results[key] = {"status": "failed", "error": str(exc)}
     write_json(root / "evaluation_summary.json", results)
     status = "complete" if all(item["status"] == "complete" for item in results.values()) else "failed"
     write_json(transaction_path, {"status": status, "scope_input_hash": scope_input_hash, "finalization_scope_hash": finalization_scope_hash, "completed_cells": sum(item["status"] == "complete" for item in results.values()), "failed_cells": sum(item["status"] == "failed" for item in results.values())})
+    append_event(root / "experiment.log", "evaluation_finished", status=status, completed=sum(item["status"] == "complete" for item in results.values()), failed=sum(item["status"] == "failed" for item in results.values()))
     return results

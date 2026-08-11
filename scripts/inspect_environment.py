@@ -8,6 +8,5 @@ from rlalpha.doctor import run_doctor
 
 
 if __name__ == "__main__":
-    config = Path(__file__).resolve().parents[1] / "configs/experiment/preliminary_screen.yaml"
+    config = Path(__file__).resolve().parents[1] / "configs/experiment/revision_v3_cpu_smoke.yaml"
     print(json.dumps(run_doctor(load_paths(config)), indent=2, default=str))
-

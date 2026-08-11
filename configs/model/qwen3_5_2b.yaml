@@ -23,4 +23,28 @@ actor:
   learning_rate: 1.0e-6
   lora_rank: 16
   lora_alpha: 32
-  lora_target_modules: all-linear
+  # Text-model linears only.  ``all-linear`` also instruments Qwen3.5's
+  # vision tower even though this project supplies text-only prompts; vLLM
+  # cannot serve those visual adapters and explicitly ignores them.
+  lora_target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+    - in_proj_a
+    - in_proj_b
+    - in_proj_qkv
+    - in_proj_z
+    - out_proj
+  clip_ratio: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.2
+  # Reuse each frozen rollout batch once after the initial on-policy pass so
+  # the old-policy ratio and clipped PPO surrogate have real training
+  # semantics instead of remaining identically one for the only epoch.
+  ppo_epochs: 2
+  entropy_coeff: 0.0
+  kl_loss_type: low_var_kl

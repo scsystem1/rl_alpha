@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import pickle
 import random
@@ -10,7 +11,7 @@ from typing import Any
 
 from ..dsl.parser import parse_llm_response
 from .models import Candidate, CandidateOutcome, SearchContext
-from .prompts import DSL_GRAMMAR, HINTS, build_messages
+from .prompts import DSL_GRAMMAR, build_messages
 
 
 def configure_packaged_cuda_toolchain() -> Path | None:
@@ -47,6 +48,26 @@ def resolve_model_path(config: dict[str, Any]) -> Path:
         path = complete[0]
     if not (path / "config.json").exists():
         raise FileNotFoundError(path)
+    expected = model.get("fingerprint") or {}
+    if expected:
+        files = {
+            "config_sha256": path / "config.json",
+            "tokenizer_sha256": path / "tokenizer.json",
+        }
+        weight_files = sorted(path.glob("*.safetensors"))
+        if len(weight_files) != 1:
+            raise RuntimeError(f"declared weights_sha256 requires exactly one safetensors file, found {len(weight_files)}")
+        files["weights_sha256"] = weight_files[0]
+        for key, candidate in files.items():
+            if not candidate.exists():
+                raise FileNotFoundError(candidate)
+            digest = hashlib.sha256()
+            with candidate.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                    digest.update(chunk)
+            actual = digest.hexdigest()
+            if actual != expected.get(key):
+                raise RuntimeError(f"model fingerprint mismatch for {candidate.name}: expected {expected.get(key)}, got {actual}")
     return path.resolve()
 
 
@@ -89,10 +110,13 @@ class BaseLLMSearcher:
         from vllm.sampling_params import StructuredOutputsParams
 
         assert self._processor is not None and self._llm is not None
-        messages = [build_messages(context, HINTS[(self.raw_completions + index) % len(HINTS)]) for index in range(n)]
-        prompts = [self._processor.apply_chat_template(value, tokenize=False, add_generation_prompt=True, enable_thinking=False) for value in messages]
+        if n != 8:
+            raise ValueError(f"Base-LLM fairness protocol requires exactly 8 completions per round, got {n}")
+        messages = build_messages(context)
+        prompt = self._processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        prompts = [prompt] * n
         structured = StructuredOutputsParams(grammar=DSL_GRAMMAR)
-        params = [SamplingParams(temperature=1.0, top_p=1.0, top_k=20, presence_penalty=2.0, repetition_penalty=1.0, max_tokens=128, seed=self.rng.randrange(2**31), structured_outputs=structured) for _ in prompts]
+        params = [SamplingParams(temperature=float(self.config.get("temperature", 1.0)), top_p=1.0, top_k=20, presence_penalty=2.0, repetition_penalty=1.0, max_tokens=int(self.config.get("response_length", 128)), seed=self.rng.randrange(2**31), structured_outputs=structured) for _ in prompts]
         started = time.monotonic()
         outputs = self._llm.generate(prompts, params, use_tqdm=False)
         self.gpu_seconds += time.monotonic() - started

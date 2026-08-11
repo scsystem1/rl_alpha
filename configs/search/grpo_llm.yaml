@@ -1,2 +1,1 @@
-search: {method: grpo_llm, staged_frozen_pool: true, group_size: 8, prompt_groups_per_stage: 8}
-
+search: {method: grpo_llm, staged_frozen_pool: true, group_size: 8}

@@ -52,6 +52,17 @@ def data_build(config: Path = typer.Option(..., exists=True)) -> None:
     typer.echo(json.dumps(report, indent=2, default=str))
 
 
+@data_app.command("audit")
+def data_audit(config: Path = typer.Option(..., exists=True), output: Path = typer.Option(Path("artifacts/data_audit"))) -> None:
+    from .data.audit import run_data_audit
+
+    paths = load_paths(config)
+    report = run_data_audit(paths.raw_data_root, output)
+    typer.echo(json.dumps(report, indent=2, default=str))
+    if not report["ok"]:
+        raise typer.Exit(2)
+
+
 @risk_app.command("build")
 def risk_build(config: Path = typer.Option(..., exists=True)) -> None:
     from .risk.builder import build_risk_panel

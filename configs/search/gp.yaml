@@ -1,11 +1,16 @@
 search:
   method: gp
-  population_size: 128
+  # One AlphaGen gplearn generation is one common eight-candidate proposal
+  # group and therefore sees exactly one frozen RLAlpha pool snapshot.
+  population_size: 8
   tournament_size: 5
-  p_crossover: 0.50
-  p_subtree_mutation: 0.25
-  p_point_mutation: 0.15
-  p_reproduction: 0.10
-  elitism: 4
-  offspring_per_pool_batch: 8
-
+  init_depth: [2, 6]
+  # Preserve the relative 30:10:1:10 weights of AlphaGen's novelty-producing
+  # operators. Pure reproduction is disabled because the formal protocol
+  # requires eight new unique factors rather than free duplicate rescoring.
+  p_crossover: 0.5882352941
+  p_subtree_mutation: 0.1960784314
+  p_hoist_mutation: 0.0196078431
+  p_point_mutation: 0.1960784314
+  p_reproduction: 0.0
+  p_point_replace: 0.60

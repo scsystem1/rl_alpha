@@ -14,6 +14,7 @@ from ..factors.cache import SignalCache
 from ..factors.records import CandidateScore, PoolEntry
 from ..leakage.guards import assert_train_only_context
 from ..utils.io import atomic_write_text, write_json
+from ..utils.hashing import file_fingerprint, stable_hash
 from .base import Searcher
 from .models import BudgetLedger, CandidateOutcome, SearchContext
 
@@ -33,6 +34,7 @@ class SearchCoordinator:
         self.pending_entries: list[PoolEntry] = []
         self.pending_scores: list[CandidateScore] = []
         self.groups_since_admission = 0
+        self.group_index = 0
 
     def context(self) -> SearchContext:
         score = self.pool._score(self.pool.entries)
@@ -41,23 +43,40 @@ class SearchCoordinator:
         return context
 
     def run_group(self, group_size: int = 8) -> list[CandidateOutcome]:
-        candidates = self.searcher.propose(self.context(), group_size)
+        context = self.context()
+        pre_group_pool_hash = stable_hash({"pool_version": self.pool.version, "factors": [entry.expr_hash for entry in self.pool.entries]})
+        candidates = self.searcher.propose(context, group_size)
+        group_index = self.group_index
+        self.group_index += 1
+        raw_start = self.ledger.raw_proposals
         self.ledger.raw_proposals += len(candidates)
         outcomes: list[CandidateOutcome] = []
         entries: list[PoolEntry] = []
         entry_candidates = []
-        for candidate in candidates:
+        for candidate_index, candidate in enumerate(candidates):
+            raw_proposal_index = raw_start + candidate_index
+            proposal_id = f"proposal_{stable_hash({'run_dir': str(self.run_dir), 'group_index': group_index, 'raw_proposal_index': raw_proposal_index, 'generator': candidate.generator, 'raw_text': candidate.raw_text})[:24]}"
+            base_metadata = {
+                "proposal_id": proposal_id,
+                "factor_id": candidate.expr_hash if candidate.node is not None else None,
+                "generator": candidate.generator,
+                "parents": list(candidate.parents),
+                "raw_text": candidate.raw_text,
+                "group_index": group_index,
+                "raw_proposal_index": raw_proposal_index,
+                "pre_group_pool_version": context.pool_version,
+                "pre_group_pool_snapshot_hash": pre_group_pool_hash,
+            }
             if candidate.node is None:
                 self.ledger.invalid += 1
-                outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, False, "parse_or_type_error", False, shaped_reward=-1.0))
+                outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, False, "parse_or_type_error", False, shaped_reward=-1.0, metadata=base_metadata))
                 continue
-            rescore = candidate.generator == "gp_rescore" and candidate.expr_hash in self.seen
-            if (candidate.expr_hash in self.seen or candidate.expr_hash in self.pool.hashes) and not rescore:
+            if candidate.expr_hash in self.seen or candidate.expr_hash in self.pool.hashes:
                 self.ledger.duplicates += 1
-                outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, False, "exact_duplicate", False, shaped_reward=-0.5))
+                outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, False, "exact_duplicate", False, shaped_reward=-0.5, metadata=base_metadata))
                 continue
-            if self.ledger.exhausted and not rescore:
-                outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, False, "budget_exhausted", False))
+            if self.ledger.exhausted:
+                outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, False, "budget_exhausted", False, metadata=base_metadata))
                 continue
             self.seen.add(candidate.expr_hash)
             started = time.monotonic()
@@ -70,24 +89,37 @@ class SearchCoordinator:
                 validity = validate_signal(signal, self.membership, [entry.signal for entry in self.pool.entries])
             except Exception as exc:
                 self.ledger.invalid += 1
-                outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, False, "evaluation_error", False, metadata={"error": str(exc)}))
+                outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, False, "evaluation_error", False, metadata={**base_metadata, "error": str(exc)}))
                 continue
             if not validity.valid:
                 self.ledger.invalid += 1
                 penalty = -0.5 if validity.reason == "near_duplicate_signal" else -0.75
-                outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, False, validity.reason, False, shaped_reward=penalty, metadata={"coverage": validity.coverage}))
+                outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, False, validity.reason, False, shaped_reward=penalty, metadata={**base_metadata, "coverage": validity.coverage, "redundancy": {"mean_abs_daily_corr": validity.mean_abs_daily_corr, "pooled_correlation": validity.pooled_correlation, "mean_abs_daily_rank_corr": validity.mean_abs_daily_rank_corr, "correlation_coverage": validity.correlation_coverage}}))
                 continue
-            if not rescore:
-                self.ledger.valid_unique_evaluations += 1
+            self.ledger.valid_unique_evaluations += 1
             self.signals[candidate.expr_hash] = signal
             self.signal_cache.put(candidate.expr_hash, signal)
-            entry = PoolEntry(candidate.expression, candidate.expr_hash, signal, {"generator": candidate.generator, "parents": candidate.parents})
+            entry = PoolEntry(candidate.expression, candidate.expr_hash, signal, base_metadata)
             entries.append(entry)
             entry_candidates.append(candidate)
-            outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, True, "ok", True, metadata={"coverage": validity.coverage, "wall_seconds": time.monotonic() - started, "rescore": rescore}))
+            outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, True, "ok", True, metadata={**base_metadata, "coverage": validity.coverage, "wall_seconds": time.monotonic() - started, "redundancy": {"mean_abs_daily_corr": validity.mean_abs_daily_corr, "pooled_correlation": validity.pooled_correlation, "mean_abs_daily_rank_corr": validity.mean_abs_daily_rank_corr, "correlation_coverage": validity.correlation_coverage}}))
         scored_entries = self.pool.score_candidates(entries)
         scores = {score.candidate_hash: score for score in scored_entries}
-        outcomes = [CandidateOutcome(item.expr_hash, item.expression, item.valid, item.reason, item.market_evaluated, scores[item.expr_hash].delta_objective, scores[item.expr_hash].shaped_reward, item.metadata) if item.expr_hash in scores else item for item in outcomes]
+        outcomes = [
+            CandidateOutcome(
+                item.expr_hash,
+                item.expression,
+                item.valid and scores[item.expr_hash].valid,
+                item.reason if scores[item.expr_hash].valid else scores[item.expr_hash].reason,
+                item.market_evaluated,
+                scores[item.expr_hash].delta_objective,
+                scores[item.expr_hash].shaped_reward,
+                item.metadata,
+            )
+            if item.expr_hash in scores
+            else item
+            for item in outcomes
+        ]
         self.pending_entries.extend(entries)
         self.pending_scores.extend(scored_entries)
         self.groups_since_admission += 1
@@ -116,16 +148,27 @@ class SearchCoordinator:
     def save_checkpoint(self) -> None:
         assert self.run_dir is not None
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        state = {"ledger": self.ledger.state_dict(), "seen": sorted(self.seen), "searcher": self.searcher.state_dict(), "pool_version": self.pool.version, "pool": [{"expression": item.expression, "expr_hash": item.expr_hash, "metadata": item.metadata} for item in self.pool.entries], "pool_history": self.pool.history, "pending_entries": [{"expression": item.expression, "expr_hash": item.expr_hash, "metadata": item.metadata} for item in self.pending_entries], "groups_since_admission": self.groups_since_admission}
+        state = {"ledger": self.ledger.state_dict(), "seen": sorted(self.seen), "searcher": self.searcher.state_dict(), "pool_version": self.pool.version, "pool": [{"expression": item.expression, "expr_hash": item.expr_hash, "metadata": item.metadata} for item in self.pool.entries], "pool_history": self.pool.history, "pending_entries": [{"expression": item.expression, "expr_hash": item.expr_hash, "metadata": item.metadata} for item in self.pending_entries], "groups_since_admission": self.groups_since_admission, "group_index": self.group_index}
         write_json(self.run_dir / "checkpoint.json", state)
         text = "".join(json.dumps(record, sort_keys=True, default=str) + "\n" for record in self.records)
         atomic_write_text(self.run_dir / "candidates.jsonl", text)
+        checkpoint_record = file_fingerprint(self.run_dir / "checkpoint.json")
+        write_json(self.run_dir / "checkpoint_commit.json", {"schema_version": 1, "checkpoint": checkpoint_record, "state_hash": stable_hash(state)})
 
     def load_checkpoint(self) -> None:
         if self.run_dir is None:
             raise ValueError("run_dir is required")
+        commit_path = self.run_dir / "checkpoint_commit.json"
+        if not commit_path.exists():
+            raise RuntimeError("checkpoint is legacy/uncommitted and cannot be resumed")
+        commit = json.loads(commit_path.read_text(encoding="utf-8"))
+        actual = file_fingerprint(self.run_dir / "checkpoint.json")
+        if actual["sha256"] != commit.get("checkpoint", {}).get("sha256"):
+            raise RuntimeError("checkpoint hash mismatch")
         with (self.run_dir / "checkpoint.json").open(encoding="utf-8") as handle:
             state = json.load(handle)
+        if stable_hash(state) != commit.get("state_hash"):
+            raise RuntimeError("checkpoint state hash mismatch")
         self.ledger = BudgetLedger.from_state_dict(state["ledger"])
         self.seen = set(state["seen"])
         self.searcher.load_state_dict(state["searcher"])
@@ -144,5 +187,6 @@ class SearchCoordinator:
         self.pending_entries = [restored_entry(item) for item in state.get("pending_entries", [])]
         self.pending_scores = self.pool.score_candidates(self.pending_entries)
         self.groups_since_admission = int(state.get("groups_since_admission", 0))
+        self.group_index = int(state.get("group_index", 0))
         candidate_path = self.run_dir / "candidates.jsonl"
         self.records = [json.loads(line) for line in candidate_path.read_text(encoding="utf-8").splitlines()] if candidate_path.exists() else []

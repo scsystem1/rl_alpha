@@ -1,0 +1,2 @@
+- name: rlalpha_structured_single_turn
+  _target_: rlalpha.search.grpo.verl_agent_loop.RLAlphaStructuredSingleTurnAgentLoop

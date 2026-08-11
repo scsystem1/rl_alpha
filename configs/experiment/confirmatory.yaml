@@ -21,4 +21,3 @@ experiment:
   pool_capacity: 20
   max_cpu_jobs: 4
   cpu_threads_per_job: 8
-  continue_seed_zero_from: preliminary_screen

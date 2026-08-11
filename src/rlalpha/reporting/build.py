@@ -8,9 +8,10 @@ import numpy as np
 import pandas as pd
 from scipy.stats import t
 
-from ..config import load_paths
+from ..config import load_paths, load_yaml
 from ..evaluation.statistics import paired_summary
 from ..utils.io import atomic_write_text
+from ..utils.experiment_log import append_event, update_progress
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -38,7 +39,10 @@ def _average_daily(cells: dict[tuple[str, str, int], Path], method: str, reward:
     merged = frames[0]
     for frame in frames[1:]:
         merged = merged.merge(frame, on="date", how="inner", validate="one_to_one")
-    merged["value"] = merged.drop(columns="date").mean(axis=1)
+    # A cross-seed daily result is valid only when every declared seed has a
+    # value.  Pandas' default skipna=True would silently turn a missing held
+    # return in one seed into a usable portfolio return.
+    merged["value"] = merged.drop(columns="date").mean(axis=1, skipna=False)
     return merged[["date", "value"]]
 
 
@@ -50,8 +54,9 @@ def _sharpe(values: np.ndarray) -> float:
 
 
 def _paired_sharpe(first: np.ndarray, second: np.ndarray, samples: int = 2000, block: int = 20, seed: int = 0) -> tuple[float, list[float]]:
-    common = np.isfinite(first) & np.isfinite(second)
-    first, second = np.asarray(first)[common], np.asarray(second)[common]
+    first, second = np.asarray(first, dtype=float), np.asarray(second, dtype=float)
+    if first.shape != second.shape or not len(first) or not np.isfinite(first).all() or not np.isfinite(second).all():
+        return float("nan"), [float("nan"), float("nan")]
     delta = _sharpe(first) - _sharpe(second)
     if len(first) < 2:
         return delta, [float("nan"), float("nan")]
@@ -81,7 +86,9 @@ def _comparison_pairs(keys: set[tuple[str, str]]) -> list[tuple[tuple[str, str],
 
 def build_report(experiment_id: str, config: str | Path) -> dict[str, Any]:
     paths = load_paths(config)
+    raw_config = load_yaml(config)
     root = paths.runs_root / experiment_id
+    append_event(root / "experiment.log", "report_started", experiment_id=experiment_id)
     cells: dict[tuple[str, str, int], Path] = {}
     search_rows, pool_rows, portfolio_rows = [], [], []
     for metrics_path in sorted(root.glob("*/*/seed_*/test/metrics.json")):
@@ -109,8 +116,8 @@ def build_report(experiment_id: str, config: str | Path) -> dict[str, Any]:
             "method": method, "reward": reward, "seed": seed,
             "train_objective": selected.get("train", {}).get("objective"),
             "validation_objective": selected.get("validation", {}).get("objective"),
-            "test_raw_ic": metrics.get("raw_ic", {}).get("mean"),
-            "test_rnic": metrics.get("rnic", {}).get("mean"),
+            "test_raw_ic_diagnostic": metrics.get("raw_ic_diagnostic", metrics.get("raw_ic", {})).get("mean"),
+            "test_primary_pearson_rnic": metrics.get("primary_pearson_rnic", metrics.get("rnic", {})).get("mean"),
             "nw_t": metrics.get("rnic", {}).get("hac_t"),
             "test_rnic_95_ci": json.dumps(metrics.get("rnic", {}).get("bootstrap_95_ci")),
             "average_pair_correlation": metrics.get("average_pair_correlation"),
@@ -131,6 +138,42 @@ def build_report(experiment_id: str, config: str | Path) -> dict[str, Any]:
                     "missing_held_returns": values.get("missing_held_returns"),
                     "missing_held_exposure_days": portfolio_metrics.get("missing_held_exposure_days"),
                 })
+
+    experiment = raw_config.get("experiment")
+    if experiment is not None:
+        if "cells" in experiment:
+            expected = {(method, reward, int(seed)) for method, reward in experiment["cells"] for seed in experiment["seeds"]}
+        else:
+            expected = {(method, reward, int(seed)) for method in experiment["methods"] for reward in experiment["rewards"] for seed in experiment["seeds"]}
+        missing = sorted(expected - set(cells))
+        unexpected = sorted(set(cells) - expected)
+        if missing or unexpected:
+            raise RuntimeError(f"formal aggregate refused: missing_cells={missing}, unexpected_cells={unexpected}")
+        transaction = _read_json(root / "test_finalization.json")
+        if transaction.get("status") != "complete":
+            raise RuntimeError("formal aggregate refused: experiment test finalization is not complete")
+        budget = int(experiment["valid_unique_budget"])
+        comparability = set()
+        for key, cell in cells.items():
+            state = _read_json(cell / "progress.json")
+            train = _read_json(cell / "train_metrics.json")
+            marker = _read_json(cell / "test/finalization.json")
+            if state.get("status") != "complete" or int(state.get("budget", -1)) != budget:
+                raise RuntimeError(f"formal aggregate refused: incomplete or wrong-budget state for {key}")
+            if int(train.get("valid_unique_evaluations", -1)) < budget:
+                raise RuntimeError(f"formal aggregate refused: budget not met for {key}")
+            if marker.get("status") != "complete":
+                raise RuntimeError(f"formal aggregate refused: cell finalization incomplete for {key}")
+            import yaml
+
+            manifest_path = cell / "manifest.yaml"
+            if not manifest_path.exists():
+                raise RuntimeError(f"formal aggregate refused: manifest missing for {key}")
+            manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+            panel_identity = tuple((Path(item["path"]).name, item["sha256"]) for item in manifest.get("panel_artifacts", []))
+            comparability.add((panel_identity, manifest.get("evaluator_version")))
+        if len(comparability) != 1:
+            raise RuntimeError("formal aggregate refused: panel/evaluator fingerprints differ across cells")
 
     search = pd.DataFrame(search_rows)
     pools = pd.DataFrame(pool_rows)
@@ -169,10 +212,10 @@ def build_report(experiment_id: str, config: str | Path) -> dict[str, Any]:
 
     if len(pools):
         summary = pools.groupby(["method", "reward"], as_index=False).agg(
-            seeds=("seed", "count"), test_rnic_mean=("test_rnic", "mean"), test_rnic_seed_std=("test_rnic", "std"),
+            seeds=("seed", "count"), test_rnic_mean=("test_primary_pearson_rnic", "mean"), test_rnic_seed_std=("test_primary_pearson_rnic", "std"),
             nw_t_mean=("nw_t", "mean"), pool_size_mean=("pool_size", "mean"),
         )
-        cis = pools.groupby(["method", "reward"])["test_rnic"].apply(_seed_ci).rename("test_rnic_seed_95_ci").reset_index()
+        cis = pools.groupby(["method", "reward"])["test_primary_pearson_rnic"].apply(_seed_ci).rename("test_rnic_seed_95_ci").reset_index()
         summary = summary.merge(cis, on=["method", "reward"])
     else:
         summary = pd.DataFrame()
@@ -184,4 +227,6 @@ def build_report(experiment_id: str, config: str | Path) -> dict[str, Any]:
         sections.extend([f"## {title}", frame.to_markdown(index=False) if len(frame) else "No completed rows."])
     sections.extend(["## Interpretation notes", "Paired RNIC intervals use same-date HAC and 20-day moving-block bootstrap. Sharpe differences use paired 20-day block resampling of fully-neutral 10bps daily returns. `uncertain` means the paired RNIC interval includes zero; it is not evidence of equivalence. GPU and wall time must be considered alongside statistical uncertainty."])
     atomic_write_text(root / "report.md", "\n\n".join(sections) + "\n")
+    update_progress(root / "progress.json", status="complete", completed_cells=len(cells), report="report.md")
+    append_event(root / "experiment.log", "report_finished", completed_cells=len(cells), paired_comparisons=len(paired), report="report.md")
     return {"experiment_id": experiment_id, "completed_cells": len(cells), "paired_comparisons": len(paired), "report": str(root / "report.md")}

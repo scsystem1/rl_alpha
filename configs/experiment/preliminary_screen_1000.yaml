@@ -16,4 +16,4 @@ experiment:
   pool_capacity: 20
   max_cpu_jobs: 4
   cpu_threads_per_job: 8
-  auto_start_expensive_jobs: true
+  auto_start_expensive_jobs: false

@@ -10,7 +10,7 @@ from .ast import Call, Constant, Feature, Node, Window
 from .evaluator import _rolling_unary
 
 
-def evaluate_torch(node: Node, features: Mapping[str, object]):
+def evaluate_torch(node: Node, features: Mapping[str, object], *, eligibility_mask: object | None = None):
     """Evaluate with Torch tensors; pandas-backed rolling kernels preserve CPU semantics."""
     import torch
 
@@ -21,6 +21,12 @@ def evaluate_torch(node: Node, features: Mapping[str, object]):
     shape = tuple(template.shape)
     device = template.device
     dtype = torch.float64
+    if eligibility_mask is None:
+        eligibility = torch.ones(shape, dtype=torch.bool, device=device)
+    else:
+        eligibility = torch.as_tensor(eligibility_mask, dtype=torch.bool, device=device)
+        if tuple(eligibility.shape) != shape:
+            raise ValueError("cross-sectional eligibility mask shape differs from features")
 
     def tensor(values: object):
         # Zarr/pandas may expose read-only views; Torch tensors need ownership.
@@ -53,10 +59,15 @@ def evaluate_torch(node: Node, features: Mapping[str, object]):
         if operator == "Div":
             sign = torch.where(args[1] < 0, -1.0, 1.0)
             return args[0] / (sign * torch.clamp(torch.abs(args[1]), min=1e-6))
-        if operator == "Greater": return (args[0] > args[1]).to(dtype)
-        if operator == "Less": return (args[0] < args[1]).to(dtype)
+        if operator in {"Greater", "Less"}:
+            finite = torch.isfinite(args[0]) & torch.isfinite(args[1])
+            output = torch.full(shape, torch.nan, dtype=dtype, device=device)
+            compared = args[0] > args[1] if operator == "Greater" else args[0] < args[1]
+            output[finite] = compared[finite].to(dtype)
+            return output
         if operator in {"CSRank", "CSZScore"}:
-            frame = pd.DataFrame(args[0].detach().cpu().numpy())
+            values = torch.where(eligibility & torch.isfinite(args[0]), args[0], torch.nan)
+            frame = pd.DataFrame(values.detach().cpu().numpy())
             if operator == "CSRank":
                 return pandas_result(frame.rank(axis=1, pct=True).to_numpy(float))
             mean = frame.mean(axis=1, skipna=True)

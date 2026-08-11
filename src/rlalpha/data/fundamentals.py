@@ -14,6 +14,9 @@ def filter_standard_fundamentals(frame: pd.DataFrame) -> pd.DataFrame:
     )
     out = frame.loc[mask].copy()
     out["datadate"] = pd.to_datetime(out["datadate"])
+    out = out.drop_duplicates()
+    if out.duplicated(["gvkey", "datadate"]).any():
+        raise ValueError("conflicting duplicate gvkey-datadate fundamentals")
     out["available_date"] = out["datadate"] + pd.DateOffset(months=6)
     return out
 
@@ -33,9 +36,11 @@ def select_ccm_links(ccm: pd.DataFrame, fundamentals: pd.DataFrame) -> pd.DataFr
     valid = (merged["linkdt"] <= merged["datadate"]) & (merged["linkenddt"].isna() | (merged["datadate"] <= merged["linkenddt"]))
     merged = merged.loc[valid].copy()
     merged["_prim"] = merged["linkprim"].map({"P": 0, "C": 1})
-    merged = merged.sort_values(["lpermno", "datadate", "_prim", "linkdt"], ascending=[True, True, True, False])
+    merged["_type"] = merged["linktype"].map({"LC": 0, "LU": 1, "LS": 2})
+    merged["_gvkey_tie"] = merged["gvkey"].astype(str)
+    merged = merged.sort_values(["lpermno", "datadate", "_prim", "linkdt", "_type", "_gvkey_tie"], ascending=[True, True, True, False, True, True], kind="stable")
     merged = merged.drop_duplicates(["lpermno", "datadate"], keep="first")
-    return merged.drop(columns="_prim").rename(columns={"lpermno": "PERMNO"})
+    return merged.drop(columns=["_prim", "_type", "_gvkey_tie"]).rename(columns={"lpermno": "PERMNO"})
 
 
 def compute_accounting_exposures(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float]]:
@@ -50,7 +55,8 @@ def compute_accounting_exposures(frame: pd.DataFrame) -> tuple[pd.DataFrame, dic
         np.nan,
     )
     out = out.sort_values(["gvkey", "datadate"])
-    out["investment"] = out.groupby("gvkey", sort=False)["at"].pct_change(fill_method=None)
+    previous_assets = out.groupby("gvkey", sort=False)["at"].shift()
+    out["investment"] = np.where((out["at"] > 0) & (previous_assets > 0), out["at"] / previous_assets - 1.0, np.nan)
     out["leverage"] = (out["dltt"].fillna(0.0) + out["dlc"].fillna(0.0)) / out["at"].where(out["at"] > 0)
     audit = {"xsga_zero_fill_rate": float(out["xsga"].isna().mean()), "xint_zero_fill_rate": float(out["xint"].isna().mean()), "nonpositive_book_equity_rate": float((~positive_be).mean())}
     return out, audit
@@ -78,4 +84,3 @@ def asof_fundamentals(stock_days: pd.DataFrame, fundamentals: pd.DataFrame, max_
     fund_columns = [column for column in result.columns if column not in left.columns]
     result.loc[stale, fund_columns] = np.nan
     return result
-
