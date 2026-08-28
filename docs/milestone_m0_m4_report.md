@@ -1,5 +1,10 @@
 # M0–M4 acceptance report
 
+> Historical checkpoint only. Its fingerprints and test counts predate the
+> revision-v3 semantic repair and are `legacy_noncomparable`; use
+> `revision_compliance_matrix.md` and `data_audit_report.md` for current
+> acceptance.
+
 ## Delivered
 
 - M0: installable Python 3.11 project, configuration, read-only doctor, repository/data/model fingerprints, CLI and reference audit.
@@ -28,9 +33,10 @@
 
 ## Subsequent milestones
 
-This document records the original M0-M4 checkpoint. M5-M9 have since been
-implemented; current commands and status live in `README.md`. Qwen3.5-2B,
-vLLM, Verl/GRPO, resumable matrix execution, transactional evaluation and the
-four required report tables are now part of the repository. Formal experiment
-completion must be judged from the matrix state and report artifacts, not this
-historical checkpoint.
+This document records the original M0-M4 checkpoint. Several M5-M9 components
+have since been repaired, including formal QuantEvolver/Verl GRPO and a real
+CUDA smoke. Prompt quality selection, exact real-GPU resume equivalence, the
+full small matrix, and clean-clone acceptance remain open.
+Current commands and status live in `README.md`; formal completion must be
+judged from the current compliance matrix and matching run artifacts, never
+from this historical report.

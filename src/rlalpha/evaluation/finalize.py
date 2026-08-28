@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +13,11 @@ from ..data.store import PanelStore, SplitPanel
 from ..dsl.parser import parse_expression
 from ..factors.calculator import FactorCalculator
 from ..factors.combiner import RidgeCombiner
-from ..factors.transform import FactorTransformPipeline, TransformConfig
+from ..factors.transform import (
+    IndependentFactorTransformPipeline,
+    TransformConfig,
+    combine_available_signals,
+)
 from ..utils.hashing import file_fingerprint, stable_hash
 from ..utils.io import write_json
 from ..utils.experiment_log import append_event, update_progress, write_result_summary
@@ -94,20 +97,26 @@ def _configured_cells(experiment: dict[str, Any]) -> set[tuple[str, str, int]]:
     }
 
 
-def _assert_experiment_frozen(config: str | Path, paths: Any, root: Path, experiment: dict[str, Any]) -> list[Path]:
-    """Refuse to open test data until the complete configured matrix is frozen."""
+def _assert_experiment_frozen(config: str | Path, paths: Any, root: Path, experiment: dict[str, Any], methods: list[str] | None = None) -> list[Path]:
+    """Refuse test access until the requested method cells are frozen."""
     from ..matrix.runner import _cell_acceptance, _expected_cell_identity
 
     expected = _configured_cells(experiment)
+    selected = set(methods or ())
+    if selected:
+        unknown = selected - {method for method, _, _ in expected}
+        if unknown:
+            raise ValueError(f"methods are not configured for this experiment: {sorted(unknown)}")
+        expected = {cell for cell in expected if cell[0] in selected}
     actual = {}
     for final_pool in root.glob("*/*/seed_*/final_pool.json"):
         relative = final_pool.parent.relative_to(root).parts
         if len(relative) != 3 or not relative[2].startswith("seed_"):
             continue
         actual[(relative[0], relative[1], int(relative[2].removeprefix("seed_")))] = final_pool
-    missing, unexpected = sorted(expected - set(actual)), sorted(set(actual) - expected)
-    if missing or unexpected:
-        raise RuntimeError(f"test opening refused: missing_cells={missing}, unexpected_cells={unexpected}")
+    missing = sorted(expected - set(actual))
+    if missing:
+        raise RuntimeError(f"test opening refused: missing_cells={missing}")
     budget = int(experiment["valid_unique_budget"])
     comparability = set()
     for method, reward, seed in sorted(expected):
@@ -237,7 +246,7 @@ def finalize_cell(
     expressions = list(selected.get("expressions", []))
     if not expressions:
         raise ValueError(f"selected pool is empty: {run_dir}")
-    input_hash = stable_hash({"schema_version": 7, "final_pool": file_fingerprint(final_pool_path), "panel": _panel_fingerprints(processed_root), "evaluation_code": _evaluation_code_fingerprints(), "evaluation_config": evaluation_config, "finalization_scope_hash": finalization_scope_hash})
+    input_hash = stable_hash({"schema_version": 9, "final_pool": file_fingerprint(final_pool_path), "panel": _panel_fingerprints(processed_root), "evaluation_code": _evaluation_code_fingerprints(), "evaluation_config": evaluation_config, "finalization_scope_hash": finalization_scope_hash, "support_policy": "independent-factor-availability-v1", "missing_return_policy": "zero-return-stale-value-v1"})
     test_dir = run_dir / "test"
     test_dir.mkdir(parents=True, exist_ok=True)
     marker = test_dir / "finalization.json"
@@ -259,7 +268,16 @@ def finalize_cell(
         if fit_mask_override.shape != fit_mask.shape:
             raise ValueError("shared fit mask shape differs from train+validation panel")
         fit_mask &= fit_mask_override
-    combiner = RidgeCombiner(float(evaluation_config["ridge_lambda"]), FactorTransformPipeline(TransformConfig(neutralize=True, post_residual_standardize=True)))
+    combiner = RidgeCombiner(
+        float(evaluation_config["ridge_lambda"]),
+        IndependentFactorTransformPipeline(
+            TransformConfig(
+                version="daily-cs-independent-availability-v1",
+                neutralize=True,
+                post_residual_standardize=True,
+            )
+        ),
+    )
     weights = combiner.fit(fit_signals, fit_label, fit_mask, fit_exposures)
     fit_transformed = combiner.last_fit_result
     if fit_transformed is None:
@@ -276,21 +294,24 @@ def finalize_cell(
     raw_label = test.target(test.label)
     transformed_ic = combiner.pipeline.transform_ic(test_signals, raw_label, trade_mask, test_exposures)
     assert transformed_ic.label is not None
-    combined_ic = np.sum(np.stack(transformed_ic.signals, axis=-1) * weights[None, None, :], axis=-1)
-    combined_ic[~transformed_ic.mask] = np.nan
-    pearson, rank = _daily_correlations(combined_ic, transformed_ic.label, transformed_ic.mask)
-    combined, portfolio_mask, portfolio_diagnostics = combiner.transform(test_signals, trade_mask, test_exposures)
+    combined_ic, ic_available = combine_available_signals(transformed_ic.signals, weights)
+    ic_mask = transformed_ic.mask & ic_available
+    combined_ic[~ic_mask] = np.nan
+    pearson, rank = _daily_correlations(combined_ic, transformed_ic.label, ic_mask)
+    transformed_portfolio = combiner.pipeline.transform_portfolio(test_signals, trade_mask, test_exposures)
+    combined, portfolio_available = combine_available_signals(transformed_portfolio.signals, weights)
+    portfolio_mask = transformed_portfolio.mask & portfolio_available
+    combined[~portfolio_mask] = np.nan
+    portfolio_diagnostics = transformed_portfolio.diagnostics
     raw_common = trade_mask & np.isfinite(raw_label)
-    for signal in test_signals:
-        raw_common &= np.isfinite(signal)
     raw_calculator = FactorCalculator(raw_label, raw_common)
     raw_prepared = [raw_calculator.standardize(signal) for signal in test_signals]
-    raw_stacked = np.stack(raw_prepared, axis=-1)
-    raw_combined = np.sum(raw_stacked * weights[None, None, :], axis=-1)
+    raw_combined, raw_available = combine_available_signals(raw_prepared, weights)
+    raw_common &= raw_available
     raw_combined[~raw_common] = np.nan
     raw_pearson, raw_rank = _daily_correlations(raw_combined, raw_label, raw_common)
     pd.DataFrame({"date": test.target_dates, "raw_ic": raw_pearson, "raw_rank_ic": raw_rank, "rnic": pearson, "rank_rnic": rank}).to_parquet(test_dir / "rnic_daily.parquet", index=False)
-    _write_factor_statistics(test_dir, run_dir, selected, expressions, weights, test.target_dates, test_signals, raw_label, transformed_ic.signals, transformed_ic.label, transformed_ic.mask, transformed_ic.diagnostics, evaluation_config)
+    _write_factor_statistics(test_dir, run_dir, selected, expressions, weights, test.target_dates, test_signals, raw_label, transformed_ic.signals, transformed_ic.label, ic_mask, transformed_ic.diagnostics, evaluation_config)
 
     backtester = PortfolioBacktester(int(evaluation_config["rebalance_days"]), int(evaluation_config["holding_days"]))
     returns = test.target(test.daily_return)
@@ -301,7 +322,14 @@ def finalize_cell(
     portfolio_results = {}
     audit_frames = []
     for name, result in (("dollar_neutral", dollar), ("fully_neutral", fully)):
-        frame = pd.DataFrame({"date": test.target_dates, "gross_return": result.gross_returns, "turnover": result.turnover, "missing_held_returns": result.missing_held_returns, "infeasible": result.infeasible})
+        frame = pd.DataFrame({
+            "date": test.target_dates,
+            "gross_return": result.gross_returns,
+            "turnover": result.turnover,
+            "missing_held_returns": result.missing_held_returns,
+            "missing_held_return_weight": result.missing_held_return_weight,
+            "infeasible": result.infeasible,
+        })
         for cost in map(float, evaluation_config["one_way_cost_bps"]):
             frame[f"net_return_{int(cost)}bps"] = result.gross_returns - cost / 10000.0 * result.turnover
         frame.to_parquet(test_dir / f"{name}_daily.parquet", index=False)
@@ -351,8 +379,11 @@ def finalize_cell(
         "ridge_weights": weights.tolist(),
         "transform_pipeline": combiner.pipeline.to_dict(),
         "fit_observations": int(fit_transformed.mask.sum()),
-        "test_ic_observations": int(transformed_ic.mask.sum()),
+        "fit_valid_days": int(fit_transformed.mask.any(axis=1).sum()),
+        "test_ic_observations": int(ic_mask.sum()),
+        "test_ic_valid_days": int(ic_mask.any(axis=1).sum()),
         "test_trade_observations": int(portfolio_mask.sum()),
+        "test_trade_valid_days": int(portfolio_mask.any(axis=1).sum()),
         "average_pair_correlation": _average_pair_correlation(list(fit_transformed.signals)),
         "raw_ic_diagnostic": raw_summary,
         "primary_pearson_rnic": rnic_summary,
@@ -361,6 +392,7 @@ def finalize_cell(
         "rank_rnic": series_summary(rank, bootstrap_samples=bootstrap_samples),
         "neutralization_retention": retention,
         "portfolios": portfolio_results,
+        "evaluation_support_policy": "Each factor is transformed on its own daily support; unavailable factors are omitted and active weights are renormalized. A constant factor never invalidates the rest of the pool.",
         "limitations": ["Historical borrow availability is unavailable; short eligibility assumes borrowability."],
         "neutralization_diagnostics": {"ic_days": len(transformed_ic.diagnostics), "portfolio_days": len(portfolio_diagnostics)},
     }
@@ -394,83 +426,37 @@ def finalize_cell(
     return metrics
 
 
-def finalize_experiment(experiment_id: str, config: str | Path) -> dict[str, Any]:
+def finalize_experiment(experiment_id: str, config: str | Path, methods: list[str] | None = None) -> dict[str, Any]:
     raw_config = load_yaml(config)
     paths = load_paths(config)
     evaluation_config = load_yaml(paths.code_root / "configs/eval/preliminary.yaml")["evaluation"]
     root = paths.runs_root / experiment_id
     append_event(root / "experiment.log", "evaluation_started", experiment_id=experiment_id)
     experiment = raw_config["experiment"]
-    final_pools = _assert_experiment_frozen(config, paths, root, experiment)
+    final_pools = _assert_experiment_frozen(config, paths, root, experiment, methods)
     scope_input_hash = stable_hash({"schema_version": 2, "experiment_id": experiment_id, "final_pools": [file_fingerprint(path) for path in final_pools], "panel": _panel_fingerprints(paths.processed_root), "evaluation_code": _evaluation_code_fingerprints()})
-    transaction_path = root / "test_finalization.json"
+    scope_name = "_".join(sorted(set(methods or ()))) or "all"
+    transaction_path = root / ("test_finalization.json" if scope_name == "all" else f"test_finalization_{scope_name}.json")
+    summary_path = root / ("evaluation_summary.json" if scope_name == "all" else f"evaluation_summary_{scope_name}.json")
     if transaction_path.exists():
         transaction = _read_json(transaction_path)
         if transaction.get("scope_input_hash") != scope_input_hash:
             raise RuntimeError("frozen experiment inputs changed after test finalization started")
         if transaction.get("status") == "complete":
-            return _read_json(root / "evaluation_summary.json")
+            return _read_json(summary_path)
     write_json(transaction_path, {"status": "started", "scope_input_hash": scope_input_hash})
-
-    store = PanelStore(paths.processed_root)
-    expressions = sorted({expression for path in final_pools for expression in _read_json(path).get("expressions", [])})
-    train_panel, validation_panel = store.load_split("train"), store.load_split("validation")
-    shared_fit_mask = np.concatenate([
-        train_panel.target(train_panel.common_mask) & np.isfinite(train_panel.target(train_panel.label)),
-        validation_panel.target(validation_panel.common_mask) & np.isfinite(validation_panel.target(validation_panel.label)),
-    ])
-    fit_before = shared_fit_mask.sum(axis=1)
-    for expression in expressions:
-        node = parse_expression(expression)
-        signal = np.concatenate([train_panel.evaluate(node), validation_panel.evaluate(node)])
-        shared_fit_mask &= np.isfinite(signal)
-    fit_after = shared_fit_mask.sum(axis=1)
-    min_assets = int(evaluation_config["common_universe_min_assets_per_day"])
-    min_days = int(evaluation_config["common_universe_min_valid_days"])
-    min_coverage = float(evaluation_config["common_universe_min_coverage"])
-    valid_fit_days = fit_after >= min_assets
-    base_observations = int(fit_before.sum())
-    fit_coverage = float(shared_fit_mask.sum() / max(1, base_observations))
-    if int(valid_fit_days.sum()) < min_days or fit_coverage < min_coverage:
-        raise RuntimeError(f"common fit universe below hard gate: valid_days={int(valid_fit_days.sum())}, coverage={fit_coverage:.6f}")
-    fit_universe_hash = hashlib.sha256(np.packbits(shared_fit_mask).tobytes()).hexdigest()
-    write_json(root / "fit_universe.json", {
-        "scope_input_hash": scope_input_hash,
-        "universe_hash": fit_universe_hash,
-        "formula_count": len(expressions),
-        "eligible_observations_before_intersection": base_observations,
-        "eligible_observations_after_intersection": int(shared_fit_mask.sum()),
-        "coverage": fit_coverage,
-        "valid_days_at_least_100_assets": int(valid_fit_days.sum()),
-        "counts_before_by_date": fit_before.tolist(),
-        "counts_after_by_date": fit_after.tolist(),
-        "hard_gates": {"minimum_coverage": min_coverage, "minimum_assets_per_day": min_assets, "minimum_valid_days": min_days},
-    })
-
-    test_panel = store.load_split("test")
-    shared_trade_mask = test_panel.target(test_panel.common_mask).copy()
-    test_before = shared_trade_mask.sum(axis=1)
-    for expression in expressions:
-        shared_trade_mask &= np.isfinite(test_panel.evaluate(parse_expression(expression)))
-    test_after = shared_trade_mask.sum(axis=1)
-    test_coverage = float(shared_trade_mask.sum() / max(1, int(test_before.sum())))
-    valid_test_days = test_after >= min_assets
-    if int(valid_test_days.sum()) < min_days or test_coverage < min_coverage:
-        raise RuntimeError(f"common test universe below hard gate: valid_days={int(valid_test_days.sum())}, coverage={test_coverage:.6f}")
-    universe_hash = hashlib.sha256(np.packbits(shared_trade_mask).tobytes()).hexdigest()
-    finalization_scope_hash = stable_hash({"scope_input_hash": scope_input_hash, "fit_universe_hash": fit_universe_hash, "test_universe_hash": universe_hash})
-    write_json(root / "test_universe.json", {"scope_input_hash": scope_input_hash, "universe_hash": universe_hash, "formula_count": len(expressions), "dates": len(shared_trade_mask), "assets": shared_trade_mask.shape[1], "eligible_observations_before_intersection": int(test_before.sum()), "eligible_observations": int(shared_trade_mask.sum()), "coverage": test_coverage, "valid_days_at_least_minimum_assets": int(valid_test_days.sum()), "eligible_before_by_date": test_before.tolist(), "eligible_by_date": test_after.tolist(), "hard_gates": {"minimum_coverage": min_coverage, "minimum_assets_per_day": min_assets, "minimum_valid_days": min_days}})
 
     results: dict[str, Any] = {}
     for final_pool in final_pools:
         cell = final_pool.parent
         key = str(cell.relative_to(root))
         try:
-            results[key] = {"status": "complete", "metrics": finalize_cell(cell, paths.processed_root, trade_mask_override=shared_trade_mask, fit_mask_override=shared_fit_mask, finalization_scope_hash=finalization_scope_hash, evaluation_config=evaluation_config)}
+            cell_scope_hash = stable_hash({"cell": key, "support": "cell-final-pool-complete-case-v1"})
+            results[key] = {"status": "complete", "metrics": finalize_cell(cell, paths.processed_root, finalization_scope_hash=cell_scope_hash, evaluation_config=evaluation_config)}
         except Exception as exc:
             results[key] = {"status": "failed", "error": str(exc)}
-    write_json(root / "evaluation_summary.json", results)
+    write_json(summary_path, results)
     status = "complete" if all(item["status"] == "complete" for item in results.values()) else "failed"
-    write_json(transaction_path, {"status": status, "scope_input_hash": scope_input_hash, "finalization_scope_hash": finalization_scope_hash, "completed_cells": sum(item["status"] == "complete" for item in results.values()), "failed_cells": sum(item["status"] == "failed" for item in results.values())})
+    write_json(transaction_path, {"status": status, "scope_input_hash": scope_input_hash, "support_policy": "each cell final pool complete-case; sample counts are descriptive", "completed_cells": sum(item["status"] == "complete" for item in results.values()), "failed_cells": sum(item["status"] == "failed" for item in results.values())})
     append_event(root / "experiment.log", "evaluation_finished", status=status, completed=sum(item["status"] == "complete" for item in results.values()), failed=sum(item["status"] == "failed" for item in results.values()))
     return results

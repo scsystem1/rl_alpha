@@ -3,7 +3,12 @@ from __future__ import annotations
 import numpy as np
 
 from .calculator import FactorCalculator, daily_corr
-from .transform import FactorTransformPipeline, TransformConfig
+from .transform import (
+    FactorTransformPipeline,
+    IndependentFactorTransformPipeline,
+    TransformConfig,
+    combine_available_signals,
+)
 
 
 class RidgeCombiner:
@@ -40,10 +45,15 @@ class RidgeCombiner:
         if self.weights_ is None:
             raise RuntimeError("combiner must be fitted before transform")
         transformed = self.pipeline.transform_portfolio(signals, mask, exposures)
-        stacked = np.stack(transformed.signals, axis=-1)
-        combined = np.sum(stacked * self.weights_[None, None, :], axis=-1)
-        combined[~transformed.mask] = np.nan
-        return combined, transformed.mask, transformed.diagnostics
+        if isinstance(self.pipeline, IndependentFactorTransformPipeline):
+            combined, available = combine_available_signals(transformed.signals, self.weights_)
+            result_mask = transformed.mask & available
+        else:
+            stacked = np.stack(transformed.signals, axis=-1)
+            combined = np.sum(stacked * self.weights_[None, None, :], axis=-1)
+            result_mask = transformed.mask
+        combined[~result_mask] = np.nan
+        return combined, result_mask, transformed.diagnostics
 
     def to_dict(self) -> dict[str, object]:
         if self.weights_ is None:

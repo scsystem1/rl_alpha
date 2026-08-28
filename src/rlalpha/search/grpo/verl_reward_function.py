@@ -4,6 +4,9 @@ import asyncio
 import json
 import math
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +27,20 @@ from rlalpha.utils.io import atomic_write_text
 
 _BATCHES: dict[str, dict[str, Any]] = {}
 _LOCKS: dict[int, asyncio.Lock] = {}
+_PANELS: dict[tuple[str, str | None, str | None], Any] = {}
+_SIGNALS: dict[tuple[tuple[str, str | None, str | None], str], np.ndarray] = {}
+_OBJECTIVES: dict[tuple[tuple[str, str | None, str | None], str, str], Any] = {}
+_POOLS: dict[tuple[Any, ...], PoolManager] = {}
+
+
+def _single_blas_thread():
+    """Prevent candidate threads from each spawning a full BLAS team."""
+    try:
+        from threadpoolctl import threadpool_limits
+
+        return threadpool_limits(limits=1)
+    except ImportError:
+        return nullcontext()
 
 
 def _loop_lock() -> asyncio.Lock:
@@ -31,16 +48,29 @@ def _loop_lock() -> asyncio.Lock:
     return _LOCKS.setdefault(id(loop), asyncio.Lock())
 
 
-def _objective(name: str, panel):
+def _objective(name: str, panel, config: dict[str, Any] | None = None):
+    config = config or {}
     label = panel.target(panel.label)
     mask = panel.target(panel.common_mask) & pd.notna(label)
+    support = {
+        "min_pool_valid_day_rate": float(config.get("min_pool_valid_day_rate", 0.80)),
+        "min_pool_observation_rate": float(config.get("min_pool_observation_rate", 0.80)),
+        "min_pool_valid_days": int(config.get("min_pool_valid_days", 252)),
+    }
     if name == "r0":
-        return R0Objective(label, mask)
+        return R0Objective(label, mask, **support)
     exposures = panel.target(panel.exposures)
     if name == "r1":
-        return R1Objective(label, mask, exposures)
+        return R1Objective(label, mask, exposures, **support)
     if name == "r2_lcb":
-        return R2LCBObjective(label, mask, exposures, hac_lag=20)
+        return R2LCBObjective(
+            label,
+            mask,
+            exposures,
+            hac_lag=int(config.get("hac_lag", 20)),
+            critical_value=float(config.get("critical_value", 1.645)),
+            **support,
+        )
     raise ValueError(f"unknown reward {name!r}")
 
 
@@ -57,9 +87,17 @@ def _empty_record(request: dict[str, Any]) -> dict[str, Any]:
         "market_evaluated": False,
         "shaped_reward": -1.0,
         "delta_objective": None,
+        "delta_add": None,
         "pool_objective_before": None,
         "pool_objective_after": None,
         "replaced_hash": None,
+        "saliency": [],
+        "eviction_candidates": [],
+        "post_prune_delta": None,
+        "self_evicted": False,
+        "formally_rechecked": False,
+        "pool_score": None,
+        "duplicate_representative_index": None,
         "coverage": None,
         "valid_days": None,
         "variable_day_rate": None,
@@ -68,6 +106,10 @@ def _empty_record(request: dict[str, Any]) -> dict[str, Any]:
         "pooled_correlation": None,
         "mean_abs_daily_rank_corr": None,
         "correlation_coverage": None,
+        "reward_valid_days": None,
+        "reward_valid_observations": None,
+        "reward_valid_day_rate": None,
+        "reward_observation_rate": None,
         "evaluation_error": None,
         "frozen_state_hash": str(request["extra_info"]["frozen_state_hash"]),
     }
@@ -86,6 +128,8 @@ def _load_spec(requests: list[dict[str, Any]]) -> dict[str, Any]:
     if stable_hash(hash_payload) != expected_hash:
         raise RuntimeError("frozen GRPO stage spec hash mismatch")
     spec["spec_hash"] = expected_hash
+    if spec.get("schema_version") != 4 or spec.get("reward_pool_semantics") != "independent-availability-same-support-admission-v4":
+        raise RuntimeError("GRPO stage spec uses incompatible reward/pool semantics")
     if len(requests) != int(spec["expected_samples"]):
         raise RuntimeError("reward batch size does not match the frozen stage spec")
     if {str(item["extra_info"]["frozen_state_hash"]) for item in requests} != {expected_hash}:
@@ -105,17 +149,56 @@ def _load_spec(requests: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
     spec = _load_spec(requests)
-    panel = PanelStore(spec["processed_root"]).load_split(
-        "train", start=spec.get("train_start"), end=spec.get("train_end")
+    panel_key = (str(spec["processed_root"]), spec.get("train_start"), spec.get("train_end"))
+    if panel_key not in _PANELS:
+        _PANELS[panel_key] = PanelStore(spec["processed_root"]).load_split(
+            "train", start=spec.get("train_start"), end=spec.get("train_end")
+        )
+    panel = _PANELS[panel_key]
+    reward_name = str(spec["reward"])
+    reward_config = dict(spec.get("reward_config") or {})
+    objective_key = (panel_key, reward_name, stable_hash(reward_config))
+    objective = _OBJECTIVES.get(objective_key)
+    if objective is None:
+        objective = _objective(reward_name, panel, reward_config)
+        _OBJECTIVES[objective_key] = objective
+    objective.parallel_workers = int(spec.get("candidate_workers", 1))
+    pool_key = (
+        panel_key,
+        reward_name,
+        stable_hash(reward_config),
+        int(spec["pool_version"]),
+        tuple(str(item["expr_hash"]) for item in spec["pool"]),
+        int(spec["pool_capacity"]),
+        float(spec["min_delta"]),
+        int(spec.get("replacement_top_k", 3)),
+        int(spec.get("admission_recheck_top_k", 3)),
     )
-    objective = _objective(str(spec["reward"]), panel)
-    pool = PoolManager(objective, capacity=int(spec["pool_capacity"]), min_delta=float(spec["min_delta"]))
-    for item in spec["pool"]:
-        node = parse_expression(str(item["expression"]))
-        signal = panel.evaluate(node)
-        pool.entries.append(PoolEntry(node.canonical(), node.expr_hash, signal, dict(item.get("metadata") or {})))
-    pool.version = int(spec["pool_version"])
-    baseline = pool._score(pool.entries)
+    pool = _POOLS.get(pool_key)
+    if pool is None:
+        pool = PoolManager(
+            objective,
+            capacity=int(spec["pool_capacity"]),
+            min_delta=float(spec["min_delta"]),
+            replacement_top_k=int(spec.get("replacement_top_k", 3)),
+            admission_recheck_top_k=int(spec.get("admission_recheck_top_k", 3)),
+        )
+        for item in spec["pool"]:
+            node = parse_expression(str(item["expression"]))
+            signal_key = (panel_key, node.expr_hash)
+            signal = _SIGNALS.get(signal_key)
+            if signal is None:
+                signal = panel.evaluate(node)
+                _SIGNALS[signal_key] = signal
+            pool.entries.append(PoolEntry(node.canonical(), node.expr_hash, signal, dict(item.get("metadata") or {})))
+        pool.version = int(spec["pool_version"])
+        # Materialize the baseline now; subsequent unchanged-pool updates reuse
+        # the complete prepared state, including neutralization and moments.
+        _ = pool.score
+        if len(_POOLS) >= 2:
+            _POOLS.pop(next(iter(_POOLS)))
+        _POOLS[pool_key] = pool
+    baseline = pool.score
     if not math.isclose(float(baseline.objective), float(spec["pool_objective"]), rel_tol=1e-8, abs_tol=1e-10):
         raise RuntimeError("frozen pool objective changed inside the reward worker")
 
@@ -132,7 +215,6 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
             record["shaped_reward"] = float(spec["invalid_penalty"])
         parsed.append((node, record))
 
-    counts = Counter(record["expr_hash"] for node, record in parsed if node is not None)
     prior_hashes = set(map(str, spec["seen_hashes"])) | pool.hashes
     order = sorted(
         range(len(parsed)),
@@ -153,6 +235,11 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
     remaining = int(spec["remaining_budget"])
     consumed = 0
     pool_signals = [entry.signal for entry in pool.entries]
+    representative: dict[str, int] = {}
+    duplicate_aliases: list[tuple[int, int]] = []
+    scored_entries: list[PoolEntry] = []
+    scored_indices: list[int] = []
+    pending_validation: list[tuple[int, Any, np.ndarray]] = []
     for index in order:
         node, record = parsed[index]
         record["rollout_index"] = rollout_indices[index]
@@ -163,22 +250,69 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
             record["reason_code"] = "exact_duplicate"
             record["shaped_reward"] = -0.5
             continue
-        if counts[expr_hash] > 1:
-            record["reason_code"] = "stage_duplicate"
-            record["shaped_reward"] = -0.5
+        if expr_hash in representative:
+            representative_index = representative[expr_hash]
+            record["reason_code"] = "intra_group_duplicate_reused"
+            record["duplicate_representative_index"] = rollout_indices[representative_index]
+            duplicate_aliases.append((index, representative_index))
             continue
-        if consumed >= remaining:
-            record["reason_code"] = "budget_exhausted"
-            record["shaped_reward"] = 0.0
-            continue
+        representative[expr_hash] = index
         try:
-            signal = panel.evaluate(node)
-            validity = validate_signal(signal, panel.target(panel.common_mask), pool_signals)
+            signal_key = (panel_key, node.expr_hash)
+            signal = _SIGNALS.get(signal_key)
+            if signal is None:
+                signal = panel.evaluate(node)
+                _SIGNALS[signal_key] = signal
         except Exception as exc:
             record["reason_code"] = "evaluation_error"
             record["shaped_reward"] = float(spec["invalid_penalty"])
             record["evaluation_error"] = f"{type(exc).__name__}: {exc}"
             continue
+        pending_validation.append((index, node, np.asarray(signal)))
+
+    candidate_workers = min(
+        max(1, int(spec.get("candidate_workers", 1))),
+        len(pending_validation) or 1,
+    )
+    # The usual path has enough budget for every unique completion.  Only the
+    # final partial group stays serial so an invalid early candidate can hand
+    # its unused budget slot to the next candidate exactly as before.
+    parallel_validation = candidate_workers > 1 and remaining >= len(pending_validation)
+
+    def validate_one(item: tuple[int, Any, np.ndarray]):
+        index, node, signal = item
+        try:
+            validity = validate_signal(
+                signal,
+                panel.target(panel.common_mask),
+                pool_signals,
+                parallel_rank=not parallel_validation,
+            )
+            return index, node, signal, validity, None
+        except Exception as exc:
+            return index, node, signal, None, exc
+
+    if parallel_validation:
+        with _single_blas_thread(), ThreadPoolExecutor(
+            max_workers=candidate_workers,
+            thread_name_prefix="reward-validity",
+        ) as executor:
+            validation_results = list(executor.map(validate_one, pending_validation))
+    else:
+        validation_results = [validate_one(item) for item in pending_validation]
+
+    for index, node, signal, validity, error in validation_results:
+        record = parsed[index][1]
+        if consumed >= remaining:
+            record["reason_code"] = "budget_exhausted"
+            record["shaped_reward"] = 0.0
+            continue
+        if error is not None:
+            record["reason_code"] = "evaluation_error"
+            record["shaped_reward"] = float(spec["invalid_penalty"])
+            record["evaluation_error"] = f"{type(error).__name__}: {error}"
+            continue
+        assert validity is not None
         record.update(
             {
                 "coverage": validity.coverage,
@@ -198,18 +332,62 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
         consumed += 1
         record["market_evaluated"] = True
         entry = PoolEntry(node.canonical(), node.expr_hash, signal)
-        candidate_score = pool.score_candidates([entry])[0]
+        scored_entries.append(entry)
+        scored_indices.append(index)
+
+    score_workers = min(candidate_workers, len(scored_entries) or 1)
+    with _single_blas_thread():
+        candidate_scores = pool.score_candidates(
+            scored_entries,
+            max_workers=score_workers,
+        )
+    for index, candidate_score in zip(scored_indices, candidate_scores, strict=True):
+        record = parsed[index][1]
         record.update(
             {
                 "valid": bool(candidate_score.valid),
                 "reason_code": candidate_score.reason if not candidate_score.valid else "ok",
                 "shaped_reward": float(candidate_score.shaped_reward),
                 "delta_objective": float(candidate_score.delta_objective),
+                "delta_add": float(candidate_score.delta_add),
                 "pool_objective_before": float(baseline.objective),
                 "pool_objective_after": float(candidate_score.pool_score.objective),
                 "replaced_hash": candidate_score.replaced_hash,
+                "saliency": list(candidate_score.saliency),
+                "eviction_candidates": list(candidate_score.eviction_candidates),
+                "post_prune_delta": float(candidate_score.post_prune_delta),
+                "self_evicted": bool(candidate_score.self_evicted),
+                "formally_rechecked": bool(candidate_score.formally_rechecked),
+                "pool_score": asdict(candidate_score.pool_score),
+                "reward_valid_days": int(candidate_score.reward_valid_days),
+                "reward_valid_observations": int(candidate_score.reward_valid_observations),
+                "reward_valid_day_rate": float(candidate_score.reward_valid_day_rate),
+                "reward_observation_rate": float(candidate_score.reward_observation_rate),
             }
         )
+
+    reused_fields = (
+        "valid", "shaped_reward", "delta_objective", "delta_add",
+        "pool_objective_before", "pool_objective_after", "replaced_hash",
+        "coverage", "valid_days", "variable_day_rate", "max_pool_correlation",
+        "mean_abs_daily_corr", "pooled_correlation", "mean_abs_daily_rank_corr",
+        "correlation_coverage", "saliency", "eviction_candidates",
+        "post_prune_delta", "self_evicted", "formally_rechecked",
+        "pool_score",
+        "reward_valid_days", "reward_valid_observations",
+        "reward_valid_day_rate", "reward_observation_rate",
+    )
+    for alias_index, representative_index in duplicate_aliases:
+        alias = parsed[alias_index][1]
+        source = parsed[representative_index][1]
+        alias.update({key: source[key] for key in reused_fields})
+        alias["market_evaluated"] = False
+        alias["reason_code"] = "intra_group_duplicate_reused"
+
+    retained = pool.hashes | {entry.expr_hash for entry in scored_entries}
+    for key in list(_SIGNALS):
+        if key[0] == panel_key and key[1] not in retained:
+            _SIGNALS.pop(key, None)
 
     records = [record for _, record in parsed]
     archive = Path(spec["archive_path"])
@@ -252,7 +430,12 @@ async def compute_score(
             futures = list(batch["futures"])
     if trigger:
         try:
-            records = await asyncio.to_thread(_score_batch_sync, requests)
+            # The barrier has already collected every completion, so there is
+            # no useful event-loop work left to overlap here.  Running the
+            # synchronous batch directly also avoids Python waiting forever
+            # for its default executor to shut down after a reward batch (the
+            # candidate-level CPU work is already parallelized internally).
+            records = _score_batch_sync(requests)
             for waiter, record in zip(futures, records, strict=True):
                 waiter.set_result(record)
         except Exception as exc:
@@ -265,4 +448,12 @@ async def compute_score(
     score = float(record["shaped_reward"])
     if not math.isfinite(score):
         score = -1.0
-    return {"score": float(np.clip(score, -1.0, 1.0)), **record}
+    # Verl turns every additional return key into a non-tensor batch column.
+    # Variable-length diagnostics such as saliency (0 or pool_size + 1) and
+    # daily_ic then become arrays with incompatible second dimensions when its
+    # agent workers are concatenated.  The complete records are already
+    # durably written to the stage archive and consumed from there after the
+    # optimizer update, so the training transport must carry only the scalar
+    # reward.  This also avoids sending thousands of daily-IC values through
+    # Ray eight times per update.
+    return {"score": float(np.clip(score, -1.0, 1.0))}

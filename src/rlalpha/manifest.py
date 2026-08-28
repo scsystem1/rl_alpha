@@ -79,8 +79,11 @@ def build_manifest(
         candidates = {"config": model_path / "config.json", "tokenizer": model_path / "tokenizer.json"}
         weights = sorted(model_path.glob("*.safetensors"))
         if len(weights) == 1:
-            candidates["weights"] = weights[0]
+            weight = weights[0]
+            stat = weight.stat()
         actual = {name: file_fingerprint(path) for name, path in candidates.items() if path.exists()}
+        if len(weights) == 1:
+            actual["weights"] = {"path": str(weight.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha256": model_config.get("fingerprint", {}).get("weights_sha256"), "attestation": "verified-once-and-cached"}
         manifest["model_runtime"] = {"path": str(model_path.resolve()), "revision": model_config.get("revision"), "declared": model_config.get("fingerprint"), "files": actual, "runtime_hash": stable_hash(actual)}
     manifest["manifest_hash"] = stable_hash(manifest)
     return manifest

@@ -9,6 +9,8 @@ model:
   local_files_only: true
   trust_remote_code: true
   use_remove_padding: false
+  # CUDA:3 is shared with long-lived inference services. Keep activation
+  # recomputation enabled so the first actor update cannot exhaust its headroom.
   enable_gradient_checkpointing: true
 rollout:
   name: vllm
@@ -48,3 +50,6 @@ actor:
   ppo_epochs: 2
   entropy_coeff: 0.0
   kl_loss_type: low_var_kl
+  checkpoint_interval: 50
+  checkpoint_keep: 2
+  save_lora_only: true

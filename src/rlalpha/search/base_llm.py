@@ -6,6 +6,8 @@ import os
 import pickle
 import random
 import time
+import json
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,40 @@ def configure_packaged_cuda_toolchain() -> Path | None:
     return cuda_home
 
 
+@lru_cache(maxsize=8)
+def _verify_model_files(path_text: str, expected_text: str, cache_root_text: str) -> None:
+    path = Path(path_text)
+    expected = json.loads(expected_text)
+    files = {
+        "config_sha256": path / "config.json",
+        "tokenizer_sha256": path / "tokenizer.json",
+    }
+    weight_files = sorted(path.glob("*.safetensors"))
+    if len(weight_files) != 1:
+        raise RuntimeError(f"declared weights_sha256 requires exactly one safetensors file, found {len(weight_files)}")
+    files["weights_sha256"] = weight_files[0]
+    stats = {key: {"path": str(candidate.resolve()), "size": candidate.stat().st_size, "mtime_ns": candidate.stat().st_mtime_ns} for key, candidate in files.items()}
+    cache_key = hashlib.sha256(json.dumps({"expected": expected, "stats": stats}, sort_keys=True).encode()).hexdigest()
+    attestation = Path(cache_root_text) / "model_attestations" / f"{cache_key}.json"
+    if attestation.exists():
+        cached = json.loads(attestation.read_text(encoding="utf-8"))
+        if cached.get("expected") == expected and cached.get("stats") == stats:
+            return
+    for key, candidate in files.items():
+        if not candidate.exists():
+            raise FileNotFoundError(candidate)
+        digest = hashlib.sha256()
+        with candidate.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        actual = digest.hexdigest()
+        if actual != expected.get(key):
+            raise RuntimeError(f"model fingerprint mismatch for {candidate.name}: expected {expected.get(key)}, got {actual}")
+    from ..utils.io import write_json
+
+    write_json(attestation, {"expected": expected, "stats": stats, "verified": True})
+
+
 def resolve_model_path(config: dict[str, Any]) -> Path:
     model = config.get("model", {})
     if model.get("path"):
@@ -50,24 +86,8 @@ def resolve_model_path(config: dict[str, Any]) -> Path:
         raise FileNotFoundError(path)
     expected = model.get("fingerprint") or {}
     if expected:
-        files = {
-            "config_sha256": path / "config.json",
-            "tokenizer_sha256": path / "tokenizer.json",
-        }
-        weight_files = sorted(path.glob("*.safetensors"))
-        if len(weight_files) != 1:
-            raise RuntimeError(f"declared weights_sha256 requires exactly one safetensors file, found {len(weight_files)}")
-        files["weights_sha256"] = weight_files[0]
-        for key, candidate in files.items():
-            if not candidate.exists():
-                raise FileNotFoundError(candidate)
-            digest = hashlib.sha256()
-            with candidate.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-                    digest.update(chunk)
-            actual = digest.hexdigest()
-            if actual != expected.get(key):
-                raise RuntimeError(f"model fingerprint mismatch for {candidate.name}: expected {expected.get(key)}, got {actual}")
+        cache_root = config.get("paths", {}).get("cache_root", "/data/sunyuxiang/rl_alpha/cache")
+        _verify_model_files(str(path.resolve()), json.dumps(expected, sort_keys=True), str(cache_root))
     return path.resolve()
 
 

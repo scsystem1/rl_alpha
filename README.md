@@ -1,93 +1,145 @@
 # RLAlpha
 
-Leakage-safe S&P 500 risk-neutral alpha mining for the experiment in
-`../REMOTE_CODEX_BUILD_GUIDE.md`. This repository is independent of the
-read-only AlphaGen and QuantEvolver reference checkouts.
+RLAlpha is a leakage-audited S&P 500 factor-search research implementation
+based on `../REMOTE_CODEX_BUILD_GUIDE.md` and the stricter repair contract in
+`../repair.md`. AlphaGen and QuantEvolver are read-only reference checkouts.
 
-## Implemented Contract
+The data/DSL/risk/reward/evaluation paths have been rebuilt and validated on
+real data. Random and GP pass a two-cell end-to-end CPU smoke. Formal
+`grpo_llm` now uses one persistent online-dataset session around
+QuantEvolver/Verl's real PPO trainer; the old custom LoRA policy gradient has
+been deleted. Base-LLM and formal GRPO now share one compact
+prompt and one fairness protocol: one frozen-pool round produces eight answers,
+scores all eight, and admits at most one factor. The project is still **not
+ready for a formal full experiment** because an exact real-GPU interrupted-vs-
+uninterrupted comparison, the complete 12-cell small matrix, and clean-clone
+reproduction remain open.
 
-The project contains the M0-M9 pipeline: point-in-time panel construction,
-canonical typed DSL, Balanced-22 neutralization, R0/R1/R2_LCB rewards, exact
-pool admission, resumable Random/typed-AST GP/Base LLM/staged LoRA GRPO,
-validation snapshot selection, transactional test finalization, dollar- and
-fully-neutral portfolios, matrix state machines, and cross-method reports.
+## Current acceptance state
 
-Qwen is pinned to `Qwen/Qwen3.5-2B` revision
-`15852e8c16360a2fea060d615a32b45270f8a8fc` at
-`/data/shared/huggingface/Qwen3.5-2B`. Critical package versions are recorded
-in `requirements-llm.lock`; every run also captures `pip freeze` and GPU state.
+- Raw six-table audit, v3 panel, v3 Balanced-22 risk panel, deterministic
+  manual trace: passed.
+- Membership-aware NumPy/Torch DSL, NaN semantics, cache identity, point-in-
+  time fundamentals/CCM, leakage sentinels: passed CPU tests.
+- Per-cell complete-case fit/test support, serialized transform, joint RNIC projection,
+  per-factor HAC/bootstrap/BH-FDR, QP post-solve gates, lineage and formal
+  report refusal rules: passed unit tests and Random/GP real-data smoke.
+- GP dispatch uses AlphaGen's repository-local modified `gplearn` engine. One
+  complete generation contains eight unique typed candidates; their fitness is
+  the shared add-only common-support delta, followed by at most one admission. The old
+  custom 128-individual/rescore implementation is removed.
+- Qwen3.5-2B file hashes: verified. The only maintained prompt is
+  `unified_compact_v1`; there are no hint- or reward-specific prompt variants.
+- Formal Verl GRPO: implemented; focused tests exercise old-policy
+  ratio/clipping, reference KL, entropy logging, LoRA optimizer/scheduler and
+  checkpoint resume. Each update learns from exactly eight completions of one
+  prompt and performs at most one pool admission. A fresh GPU smoke and the
+  full 12-cell matrix have not run under this new protocol.
 
-## Setup And Acceptance
+The authoritative gap list is
+[`docs/revision_compliance_matrix.md`](docs/revision_compliance_matrix.md).
+The GP call boundary is documented in
+[`docs/gp_integration.md`](docs/gp_integration.md).
+
+## Setup and CPU acceptance
 
 ```bash
 conda activate rlalpha
 cd /home/sunyuxiang/rl_alpha/ours
 python -m pip install -e .
-python -m pip install -r requirements-llm.lock
 
-python -m rlalpha.cli doctor --config configs/experiment/preliminary_screen.yaml
-pytest
-pytest -m real_data
-
-CUDA_VISIBLE_DEVICES=4 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-  RLALPHA_VLLM_MEMORY_UTILIZATION=0.18 \
-  python scripts/smoke_model.py --n 500 --seed 2026 \
-  --output /home/sunyuxiang/rl_alpha/ours/output/acceptance/model/base_llm_500.json
-
-CUDA_VISIBLE_DEVICES=2 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-  python scripts/smoke_grpo.py --updates 2
+python -m rlalpha.cli doctor \
+  --config configs/experiment/revision_v3_cpu_smoke.yaml
+python -m rlalpha.cli data audit \
+  --config configs/experiment/revision_v3_cpu_smoke.yaml \
+  --output /data/sunyuxiang/rl_alpha/runs/data_audit
+pytest -q
 ```
 
-GPUStack services are never stopped or modified. The matrix runner waits for
-free-memory thresholds and maps Base LLM to physical GPU 4 and single-GPU GRPO
-jobs to physical GPUs 2 and 3. It does not create collectives across the A100
-and H800. CUDA OOM retries preserve rollout group eight and reduce only the
-within-group microbatch. CPU cells run at most four concurrently with eight
-threads each.
-
-## Experiments
+Build a new panel; never point these commands at a legacy result and relabel
+it:
 
 ```bash
-# 12 cells: 4 methods x 3 rewards x seed 0, 5,000 valid unique formulas.
-python -m rlalpha.cli matrix run \
-  --config configs/experiment/preliminary_screen.yaml \
-  --experiment-id preliminary_screen
-
-python -m rlalpha.cli evaluate run \
-  --experiment-id preliminary_screen \
-  --config configs/experiment/preliminary_screen.yaml
-python -m rlalpha.cli report build \
-  --experiment-id preliminary_screen \
-  --config configs/experiment/preliminary_screen.yaml
-
-# Six core configurations x seeds 0,1,2, budget 20,000. Seed 0 resumes the
-# corresponding screening archive and budget rather than starting over.
-python -m rlalpha.cli matrix run \
-  --config configs/experiment/confirmatory.yaml \
-  --experiment-id confirmatory
-
-python -m rlalpha.cli evaluate run \
-  --experiment-id confirmatory \
-  --config configs/experiment/confirmatory.yaml
-python -m rlalpha.cli report build \
-  --experiment-id confirmatory \
-  --config configs/experiment/confirmatory.yaml
+python -m rlalpha.cli data build \
+  --config configs/experiment/revision_v3_cpu_smoke.yaml
+python -m rlalpha.cli risk build \
+  --config configs/experiment/revision_v3_cpu_smoke.yaml
+python scripts/audit_panel_trace.py \
+  --raw-root /data/sunyuxiang/rl_alpha \
+  --processed-root /data/sunyuxiang/rl_alpha/processed \
+  --output /data/sunyuxiang/rl_alpha/runs/data_audit/panel_trace_sample.parquet
 ```
 
-Each cell is independent. A failed cell is recorded and does not stop the
-others; rerunning the same command resumes its atomic checkpoint. Test data is
-opened only by `evaluate run`, after formulas and validation selection are
-frozen. Evaluation first fixes one cross-method test universe. A transaction
-hash covers all frozen pools, panel/risk manifests and evaluation code, so a
-changed input cannot silently reuse prior test output. Reports include raw IC,
-RNIC, neutralization retention, paired same-date inference, portfolio costs,
-named Balanced-22 exposures, candidate efficiency and GPU/wall time.
+The accepted local artifacts have panel fingerprint
+`180957ab...d40456` and risk fingerprint `019f26ba...0dc21`; full hashes and
+exceptions are in [`docs/data_audit_report.md`](docs/data_audit_report.md).
 
-## Timing And Leakage
+## Verified CPU search/evaluation smoke
 
-A signal is formed after close `t`, executed at close `t+1`, and starts earning
-daily `DlyRet` at `t+2`. The 20-day label compounds `t+2` through `t+21` and is
-never used for portfolio PnL. Membership boundaries are inclusive; Compustat
-is lagged six months; labels that cross a split end are invalid. Historical
-borrow availability is unavailable, so the preliminary test assumes short
-borrowability and records that limitation in every final report.
+```bash
+python -m rlalpha.cli matrix run \
+  --config configs/experiment/revision_v3_cpu_smoke.yaml \
+  --experiment-id revision_v3_cpu_smoke_new
+python -m rlalpha.cli evaluate run \
+  --config configs/experiment/revision_v3_cpu_smoke.yaml \
+  --experiment-id revision_v3_cpu_smoke_new
+python -m rlalpha.cli report build \
+  --config configs/experiment/revision_v3_cpu_smoke.yaml \
+  --experiment-id revision_v3_cpu_smoke_new
+```
+
+Every rerun needs a new experiment ID unless every effective config and
+data/code/model/prompt/reward/evaluator fingerprint matches. Method-specific
+test opening checks only the requested method cells. The accepted diagnostic run
+`revision_v3_cpu_smoke_final` completed Random/GP R0 at budget 8. It predates the
+current missing-return policy and should not be used as portfolio-performance
+evidence without rerunning evaluation.
+
+## Timing and statistical contract
+
+A signal uses information through close `t`, executes at close `t+1`, and
+starts earning `DlyRet` at `t+2`. The label compounds `t+2` through `t+21` and
+never drives portfolio PnL. Cross-sectional operators see only that day's
+member-and-eligible universe while rolling operators retain earlier available
+history. Fundamentals have a six-month lag and 18-month expiry, and CCM links
+must still be active on the stock date.
+
+Final primary factor metrics are neutralized Pearson/rank RNIC. Raw IC is
+diagnostic. Every final factor receives daily RNIC, HAC inference, moving-block
+bootstrap and pool-wise BH-FDR. Dollar-neutral and Balanced-22 fully-neutral
+portfolios are reported separately. Missing held returns use a zero daily
+contribution at the position's last observable value without reweighting other
+holdings; missing name/weight coverage remains explicit in the artifacts.
+Historical borrow availability remains an explicit limitation. See
+[`docs/evaluation_protocol.md`](docs/evaluation_protocol.md).
+
+## GRPO and expensive jobs
+
+`scripts/smoke_grpo.py` is a real two-update QuantEvolver/Verl smoke, not a
+mock or forward-only check. On this host it must be launched with an explicit
+GPU mapping, for example:
+
+```bash
+CUDA_VISIBLE_DEVICES=<gpu-index> RLALPHA_PHYSICAL_GPU=<gpu-index> \
+  python scripts/smoke_grpo.py \
+  --run-dir /data/sunyuxiang/rl_alpha/runs/grpo_persistent_smoke_new_id \
+  --updates 2
+```
+
+`configs/experiment/revision_v3_full_smoke.yaml` declares the future four
+methods × three rewards matrix but keeps `auto_start_expensive_jobs: false`.
+Do not enable the full matrix until the remaining gates in
+[`docs/revision_compliance_matrix.md`](docs/revision_compliance_matrix.md) are
+closed. The exact GRPO call boundary and evidence are documented in
+[`docs/grpo_integration.md`](docs/grpo_integration.md).
+
+Qwen is pinned to `Qwen/Qwen3.5-2B` revision
+`15852e8c16360a2fea060d615a32b45270f8a8fc` at
+`/data/shared/huggingface/Qwen3.5-2B`; config, tokenizer, and weight SHA-256
+values are verified at runtime. GPUStack services must not be stopped or
+modified.
+
+Migration/trust rules are in
+[`docs/migration_and_cleanup.md`](docs/migration_and_cleanup.md). Existing
+`preliminary_screen`/`confirmatory` output is legacy and is not a continuation
+of revision v3.

@@ -42,3 +42,14 @@ class SignalCache:
 
     def discard(self, key: str) -> None:
         self._memory.pop(key, None)
+
+    def prune(self, retained: set[str]) -> None:
+        """Remove signals that cannot participate in resume or the final pool."""
+        for key in list(self._memory):
+            if key not in retained:
+                self._memory.pop(key, None)
+        if self.root is None or not self.root.exists():
+            return
+        for path in self.root.glob("*.npy"):
+            if path.stem not in retained:
+                path.unlink()

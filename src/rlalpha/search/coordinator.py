@@ -13,13 +13,16 @@ from ..factors.pool import PoolManager
 from ..factors.cache import SignalCache
 from ..factors.records import CandidateScore, PoolEntry
 from ..leakage.guards import assert_train_only_context
-from ..utils.io import atomic_write_text, write_json
+from ..utils.io import write_json
 from ..utils.hashing import file_fingerprint, stable_hash
 from .base import Searcher
 from .models import BudgetLedger, CandidateOutcome, SearchContext
 
 
 class SearchCoordinator:
+    CHECKPOINT_SCHEMA_VERSION = 4
+    REWARD_POOL_SEMANTICS = "independent-availability-same-support-admission-v4"
+
     def __init__(self, searcher: Searcher, pool: PoolManager, evaluator: Callable[[object], np.ndarray], membership: np.ndarray, budget: int, run_dir: str | Path | None = None):
         self.searcher = searcher
         self.pool = pool
@@ -35,9 +38,10 @@ class SearchCoordinator:
         self.pending_scores: list[CandidateScore] = []
         self.groups_since_admission = 0
         self.group_index = 0
+        self._persisted_record_count = 0
 
     def context(self) -> SearchContext:
-        score = self.pool._score(self.pool.entries)
+        score = self.pool.score
         context = SearchContext(self.pool.version, tuple(item.expression for item in self.pool.entries), tuple(score.weights), score.objective, self.ledger.valid_unique_evaluations, self.ledger.limit, tuple(self.records[-64:]))
         assert_train_only_context(context.to_prompt_dict())
         return context
@@ -114,7 +118,21 @@ class SearchCoordinator:
                 item.market_evaluated,
                 scores[item.expr_hash].delta_objective,
                 scores[item.expr_hash].shaped_reward,
-                item.metadata,
+                {
+                    **item.metadata,
+                    "delta_add": scores[item.expr_hash].delta_add,
+                    "post_prune_delta": scores[item.expr_hash].post_prune_delta,
+                    "saliency": list(scores[item.expr_hash].saliency),
+                    "eviction_candidates": list(scores[item.expr_hash].eviction_candidates),
+                    "replaced_hash": scores[item.expr_hash].replaced_hash,
+                    "self_evicted": scores[item.expr_hash].self_evicted,
+                    "formally_rechecked": scores[item.expr_hash].formally_rechecked,
+                    "positive_not_admitted": scores[item.expr_hash].positive_not_admitted,
+                    "reward_valid_days": scores[item.expr_hash].reward_valid_days,
+                    "reward_valid_observations": scores[item.expr_hash].reward_valid_observations,
+                    "reward_valid_day_rate": scores[item.expr_hash].reward_valid_day_rate,
+                    "reward_observation_rate": scores[item.expr_hash].reward_observation_rate,
+                },
             )
             if item.expr_hash in scores
             else item
@@ -124,12 +142,34 @@ class SearchCoordinator:
         self.pending_scores.extend(scored_entries)
         self.groups_since_admission += 1
         interval = int(getattr(self.searcher, "admission_group_interval", 1))
+        admission = None
         if self.groups_since_admission >= interval:
-            self.flush_admission()
+            admission = self.flush_admission()
+        if admission is not None:
+            outcomes = [
+                CandidateOutcome(
+                    item.expr_hash,
+                    item.expression,
+                    item.valid,
+                    item.reason,
+                    item.market_evaluated,
+                    item.delta_objective,
+                    item.shaped_reward,
+                    {
+                        **item.metadata,
+                        "admitted": bool(admission.admitted and admission.candidate_hash == item.expr_hash),
+                        "positive_not_admitted": bool(
+                            item.delta_objective > 0
+                            and not (admission.admitted and admission.candidate_hash == item.expr_hash)
+                        ),
+                    },
+                )
+                for item in outcomes
+            ]
         self.searcher.observe(outcomes)
         self.ledger.tokens = int(getattr(self.searcher, "total_tokens", self.ledger.tokens))
         self.ledger.gpu_seconds = float(getattr(self.searcher, "gpu_seconds", self.ledger.gpu_seconds))
-        retained = self.pool.hashes | {item.expr_hash for item in self.pending_entries} | set(getattr(self.searcher, "retained_hashes", set()))
+        retained = self.pool.hashes | {item.expr_hash for item in self.pending_entries}
         self.signals = {key: value for key, value in self.signals.items() if key in retained}
         for key, signal in self.signals.items():
             self.signal_cache.put(key, signal, permanent=True)
@@ -138,22 +178,33 @@ class SearchCoordinator:
             self.save_checkpoint()
         return outcomes
 
-    def flush_admission(self) -> None:
+    def flush_admission(self):
+        admission = None
         if self.pending_entries:
-            self.pool.consider_group(self.pending_entries, self.pending_scores)
+            admission = self.pool.consider_group(self.pending_entries, self.pending_scores)
         self.pending_entries = []
         self.pending_scores = []
         self.groups_since_admission = 0
+        return admission
 
     def save_checkpoint(self) -> None:
         assert self.run_dir is not None
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        state = {"ledger": self.ledger.state_dict(), "seen": sorted(self.seen), "searcher": self.searcher.state_dict(), "pool_version": self.pool.version, "pool": [{"expression": item.expression, "expr_hash": item.expr_hash, "metadata": item.metadata} for item in self.pool.entries], "pool_history": self.pool.history, "pending_entries": [{"expression": item.expression, "expr_hash": item.expr_hash, "metadata": item.metadata} for item in self.pending_entries], "groups_since_admission": self.groups_since_admission, "group_index": self.group_index}
+        state = {"schema_version": self.CHECKPOINT_SCHEMA_VERSION, "reward_pool_semantics": self.REWARD_POOL_SEMANTICS, "ledger": self.ledger.state_dict(), "seen": sorted(self.seen), "searcher": self.searcher.state_dict(), "pool_version": self.pool.version, "pool": [{"expression": item.expression, "expr_hash": item.expr_hash, "metadata": item.metadata} for item in self.pool.entries], "pool_history": self.pool.history, "pending_entries": [{"expression": item.expression, "expr_hash": item.expr_hash, "metadata": item.metadata} for item in self.pending_entries], "groups_since_admission": self.groups_since_admission, "group_index": self.group_index}
         write_json(self.run_dir / "checkpoint.json", state)
-        text = "".join(json.dumps(record, sort_keys=True, default=str) + "\n" for record in self.records)
-        atomic_write_text(self.run_dir / "candidates.jsonl", text)
+        if self._persisted_record_count < len(self.records):
+            candidate_path = self.run_dir / "candidates.jsonl"
+            candidate_path.parent.mkdir(parents=True, exist_ok=True)
+            with candidate_path.open("a", encoding="utf-8") as handle:
+                for record in self.records[self._persisted_record_count :]:
+                    handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+                handle.flush()
+                __import__("os").fsync(handle.fileno())
+            self._persisted_record_count = len(self.records)
         checkpoint_record = file_fingerprint(self.run_dir / "checkpoint.json")
-        write_json(self.run_dir / "checkpoint_commit.json", {"schema_version": 1, "checkpoint": checkpoint_record, "state_hash": stable_hash(state)})
+        write_json(self.run_dir / "checkpoint_commit.json", {"schema_version": self.CHECKPOINT_SCHEMA_VERSION, "reward_pool_semantics": self.REWARD_POOL_SEMANTICS, "checkpoint": checkpoint_record})
+        retained = self.pool.hashes | {item.expr_hash for item in self.pending_entries}
+        self.signal_cache.prune(retained)
 
     def load_checkpoint(self) -> None:
         if self.run_dir is None:
@@ -162,13 +213,15 @@ class SearchCoordinator:
         if not commit_path.exists():
             raise RuntimeError("checkpoint is legacy/uncommitted and cannot be resumed")
         commit = json.loads(commit_path.read_text(encoding="utf-8"))
+        if commit.get("schema_version") != self.CHECKPOINT_SCHEMA_VERSION or commit.get("reward_pool_semantics") != self.REWARD_POOL_SEMANTICS:
+            raise RuntimeError("checkpoint uses incompatible reward/pool semantics; start a new experiment ID")
         actual = file_fingerprint(self.run_dir / "checkpoint.json")
         if actual["sha256"] != commit.get("checkpoint", {}).get("sha256"):
             raise RuntimeError("checkpoint hash mismatch")
         with (self.run_dir / "checkpoint.json").open(encoding="utf-8") as handle:
             state = json.load(handle)
-        if stable_hash(state) != commit.get("state_hash"):
-            raise RuntimeError("checkpoint state hash mismatch")
+        if state.get("schema_version") != self.CHECKPOINT_SCHEMA_VERSION or state.get("reward_pool_semantics") != self.REWARD_POOL_SEMANTICS:
+            raise RuntimeError("checkpoint state uses incompatible reward/pool semantics")
         self.ledger = BudgetLedger.from_state_dict(state["ledger"])
         self.seen = set(state["seen"])
         self.searcher.load_state_dict(state["searcher"])
@@ -183,6 +236,7 @@ class SearchCoordinator:
 
         self.pool.entries = [restored_entry(item) for item in state["pool"]]
         self.pool.version = int(state["pool_version"])
+        self.pool.invalidate_cache()
         self.pool.history = list(state["pool_history"])
         self.pending_entries = [restored_entry(item) for item in state.get("pending_entries", [])]
         self.pending_scores = self.pool.score_candidates(self.pending_entries)
@@ -190,3 +244,4 @@ class SearchCoordinator:
         self.group_index = int(state.get("group_index", 0))
         candidate_path = self.run_dir / "candidates.jsonl"
         self.records = [json.loads(line) for line in candidate_path.read_text(encoding="utf-8").splitlines()] if candidate_path.exists() else []
+        self._persisted_record_count = len(self.records)

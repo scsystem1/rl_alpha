@@ -17,7 +17,7 @@ class PathsConfig(BaseModel):
     raw_data_root: Path = Path("/data/sunyuxiang/rl_alpha")
     processed_root: Path = Path("/data/sunyuxiang/rl_alpha/processed")
     cache_root: Path = Path("/data/sunyuxiang/rl_alpha/cache")
-    runs_root: Path = Path("/home/sunyuxiang/rl_alpha/ours/output")
+    runs_root: Path = Path("/data/sunyuxiang/rl_alpha/runs")
     model_search_root: Path = Path("/data/shared/huggingface")
     alphagen_root: Path = Path("/home/sunyuxiang/rl_alpha/alphagen")
     quantevolver_root: Path = Path("/home/sunyuxiang/rl_alpha/QuantEvolver")
@@ -38,7 +38,7 @@ class DataConfig(StrictModel):
     fundamental_max_age_months: int = Field(gt=0)
 
 
-SearchMethod = Literal["random", "gp", "base_llm", "grpo_llm"]
+SearchMethod = Literal["random", "gp", "base_llm", "grpo_llm", "alphasage"]
 RewardName = Literal["r0", "r1", "r2_lcb"]
 
 
@@ -52,6 +52,10 @@ class ExperimentConfig(StrictModel):
     pool_capacity: int = Field(default=20, gt=0)
     max_cpu_jobs: int = Field(default=4, gt=0)
     cpu_threads_per_job: int = Field(default=8, gt=0)
+    max_total_cpu_threads: int = Field(default=90, gt=0)
+    grpo_ray_cpus: int = Field(default=8, gt=0)
+    grpo_reward_candidate_workers: int = Field(default=4, gt=0, le=8)
+    grpo_object_store_gib: float = Field(default=8, gt=0)
     gpu_devices: dict[SearchMethod, list[int]] = Field(default_factory=dict)
     gpu_min_free_mib: dict[int, int] = Field(default_factory=dict)
     gpu_memory_utilization: dict[int, float] = Field(default_factory=dict)
@@ -111,6 +115,9 @@ class ActorConfig(StrictModel):
     ppo_epochs: int = Field(default=1, gt=0)
     entropy_coeff: float = Field(default=0.0, ge=0)
     kl_loss_type: Literal["kl", "abs", "mse", "low_var_kl", "full"] = "low_var_kl"
+    checkpoint_interval: int = Field(default=50, gt=0)
+    checkpoint_keep: int = Field(default=2, gt=0)
+    save_lora_only: bool = True
 
 
 class SearchConfig(StrictModel):
@@ -131,6 +138,19 @@ class SearchConfig(StrictModel):
     p_reproduction: float | None = Field(default=None, ge=0, le=1)
     p_point_replace: float | None = Field(default=None, ge=0, le=1)
     staged_frozen_pool: bool | None = None
+    replacement_top_k: int = Field(default=3, gt=0)
+    admission_recheck_top_k: int = Field(default=3, gt=0)
+    algorithm: Literal["trajectory_balance_gflownet"] | None = None
+    encoder: Literal["rgcn"] | None = None
+    hidden_dim: int | None = Field(default=None, gt=0)
+    max_expression_tokens: int | None = Field(default=None, gt=0)
+    entropy_coef: float | None = Field(default=None, ge=0)
+    entropy_temperature: float | None = Field(default=None, gt=0)
+    mask_dropout_prob: float | None = Field(default=None, ge=0, le=1)
+    ssl_weight: float | None = Field(default=None, ge=0)
+    novelty_weight: float | None = Field(default=None, ge=0)
+    final_weight_ratio: float | None = Field(default=None, ge=0, le=1)
+    mutual_ic_threshold: float | None = Field(default=None, ge=0, le=1)
 
     @model_validator(mode="after")
     def validate_gp(self) -> "SearchConfig":
@@ -165,6 +185,9 @@ class RewardConfig(StrictModel):
     hac_lag: int | None = Field(default=None, ge=0)
     critical_value: float | None = Field(default=None, gt=0)
     invalid_penalty: float = -1.0
+    min_pool_valid_day_rate: float = Field(default=0.80, gt=0, le=1)
+    min_pool_observation_rate: float = Field(default=0.80, gt=0, le=1)
+    min_pool_valid_days: int = Field(default=252, gt=0)
 
 
 class EvaluationConfig(StrictModel):
@@ -175,9 +198,6 @@ class EvaluationConfig(StrictModel):
     sleeves: int = Field(default=4, gt=0)
     one_way_cost_bps: list[float] = [0, 10]
     fully_neutral_max_weight: float = Field(default=0.02, gt=0)
-    common_universe_min_coverage: float = Field(default=0.50, gt=0, le=1)
-    common_universe_min_assets_per_day: int = Field(default=100, gt=0)
-    common_universe_min_valid_days: int = Field(default=252, gt=0)
     net_tolerance: float = Field(default=1e-8, gt=0)
     exposure_tolerance: float = Field(default=1e-6, gt=0)
     gross_tolerance: float = Field(default=1e-6, gt=0)

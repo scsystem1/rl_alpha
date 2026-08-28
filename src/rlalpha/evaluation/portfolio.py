@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -119,6 +119,7 @@ class PortfolioResult:
     missing_held_returns: np.ndarray
     infeasible: np.ndarray
     audits: list[dict[str, object]]
+    missing_held_return_weight: np.ndarray = field(default_factory=lambda: np.array([], dtype=float))
 
 
 class PortfolioBacktester:
@@ -139,6 +140,7 @@ class PortfolioBacktester:
         weights = np.zeros((days, assets))
         gross_returns, turnover = np.zeros(days), np.zeros(days)
         missing = np.zeros(days, dtype=int)
+        missing_weight = np.zeros(days)
         infeasible = np.zeros(days, dtype=bool)
         audits: list[dict[str, object]] = []
         for day in range(days):
@@ -151,7 +153,13 @@ class PortfolioBacktester:
             finite_return = np.isfinite(returns[day])
             held_missing = (np.abs(current) > 0) & ~finite_return
             missing[day] = int(held_missing.sum())
-            gross_returns[day] = np.nan if held_missing.any() else float(np.dot(current[finite_return], returns[day, finite_return]))
+            missing_weight[day] = float(np.abs(current[held_missing]).sum())
+            # A missing quote/return does not make the rest of the portfolio
+            # unobservable.  Keep that position at its last observable value
+            # (zero return for this day) while preserving the actual weights;
+            # renormalizing the observable names would use future data and
+            # create leverage that the strategy never held.
+            gross_returns[day] = float(np.dot(current[finite_return], returns[day, finite_return]))
             if day % self.rebalance_days == 0 and day + self.activation_delay < days:
                 sleeve = (day // self.rebalance_days) % self.sleeves
                 base = dollar_neutral_target(scores[day], eligible[day])
@@ -170,12 +178,23 @@ class PortfolioBacktester:
                 execution_day = day + self.activation_delay - 1
                 turnover[execution_day] += float(np.abs(target - sleeve_weights[sleeve]).sum()) / self.sleeves
                 pending[day + self.activation_delay] = (sleeve, target, audit)
-        return PortfolioResult(weights, gross_returns, turnover, missing, infeasible, audits)
+        return PortfolioResult(
+            weights=weights,
+            gross_returns=gross_returns,
+            turnover=turnover,
+            missing_held_returns=missing,
+            infeasible=infeasible,
+            audits=audits,
+            missing_held_return_weight=missing_weight,
+        )
 
 
 def portfolio_metrics(result: PortfolioResult, cost_bps: float) -> dict[str, object]:
     net_returns = result.gross_returns - cost_bps / 10000.0 * result.turnover
-    invalid_return_path = bool(result.missing_held_returns.sum() > 0 or (~np.isfinite(net_returns)).any())
+    # Missing individual held returns have already been valued at zero in the
+    # backtester and are audited separately.  Only a non-finite portfolio-level
+    # result indicates that the performance path itself is unusable.
+    invalid_return_path = bool((~np.isfinite(net_returns)).any())
     finite = net_returns[np.isfinite(net_returns)]
     wealth = np.concatenate([[1.0], np.cumprod(1.0 + finite)]) if len(finite) else np.array([1.0])
     drawdown = wealth / np.maximum.accumulate(wealth) - 1 if len(wealth) else np.array([])
@@ -186,6 +205,19 @@ def portfolio_metrics(result: PortfolioResult, cost_bps: float) -> dict[str, obj
     maximum_drawdown = float(drawdown.min(initial=0))
     if invalid_return_path:
         annual_return = annual_volatility = sharpe = maximum_drawdown = float("nan")
+    missing_weight = np.asarray(result.missing_held_return_weight, dtype=float)
+    if missing_weight.shape != net_returns.shape:
+        # Compatibility for manually constructed/legacy PortfolioResult
+        # objects that predate missing-weight auditing.
+        missing_weight = np.zeros_like(net_returns)
+    gross_weight = np.abs(result.weights).sum(axis=1)
+    total_gross_weight = float(gross_weight.sum())
+    held_return_weight_coverage = (
+        1.0 - float(missing_weight.sum()) / total_gross_weight
+        if total_gross_weight > 0
+        else 1.0
+    )
+    held_return_weight_coverage = float(np.clip(held_return_weight_coverage, 0.0, 1.0))
     return {
         "cost_bps": cost_bps,
         "annual_return": annual_return,
@@ -197,5 +229,10 @@ def portfolio_metrics(result: PortfolioResult, cost_bps: float) -> dict[str, obj
         "average_net": float(result.weights.sum(axis=1).mean()),
         "infeasible_days": int(result.infeasible.sum()),
         "missing_held_returns": int(result.missing_held_returns.sum()),
+        "missing_held_return_days": int((result.missing_held_returns > 0).sum()),
+        "average_missing_held_return_weight": float(missing_weight.mean()) if len(missing_weight) else 0.0,
+        "maximum_missing_held_return_weight": float(missing_weight.max(initial=0.0)),
+        "held_return_weight_coverage": held_return_weight_coverage,
+        "missing_return_policy": "zero_return_at_last_observable_value",
         "invalid_return_path": invalid_return_path,
     }

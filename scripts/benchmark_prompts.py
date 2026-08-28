@@ -14,7 +14,7 @@ from rlalpha.utils.io import write_json
 def main() -> None:
     parser = argparse.ArgumentParser(description="Token profile for the one shared RLAlpha prompt.")
     parser.add_argument("--model", default="/data/shared/huggingface/Qwen3.5-2B")
-    parser.add_argument("--output", default="artifacts/prompt_benchmark/token_profile.json")
+    parser.add_argument("--output", default="/data/sunyuxiang/rl_alpha/runs/prompt_benchmark/token_profile.json")
     args = parser.parse_args()
     from transformers import AutoProcessor
 

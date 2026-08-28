@@ -84,16 +84,19 @@ def _comparison_pairs(keys: set[tuple[str, str]]) -> list[tuple[tuple[str, str],
     return sorted(pairs)
 
 
-def build_report(experiment_id: str, config: str | Path) -> dict[str, Any]:
+def build_report(experiment_id: str, config: str | Path, methods: list[str] | None = None) -> dict[str, Any]:
     paths = load_paths(config)
     raw_config = load_yaml(config)
     root = paths.runs_root / experiment_id
     append_event(root / "experiment.log", "report_started", experiment_id=experiment_id)
     cells: dict[tuple[str, str, int], Path] = {}
     search_rows, pool_rows, portfolio_rows = [], [], []
+    selected_methods = set(methods or ())
     for metrics_path in sorted(root.glob("*/*/seed_*/test/metrics.json")):
         cell = metrics_path.parents[1]
         method, reward, seed_name = cell.relative_to(root).parts
+        if selected_methods and method not in selected_methods:
+            continue
         seed = int(seed_name.removeprefix("seed_"))
         key = method, reward, seed
         cells[key] = cell
@@ -136,6 +139,9 @@ def build_report(experiment_id: str, config: str | Path) -> dict[str, Any]:
                     "max_risk_exposure": portfolio_metrics.get("max_realized_risk_exposure"),
                     "infeasible_days": values.get("infeasible_days"),
                     "missing_held_returns": values.get("missing_held_returns"),
+                    "missing_held_return_days": values.get("missing_held_return_days"),
+                    "held_return_weight_coverage": values.get("held_return_weight_coverage"),
+                    "maximum_missing_held_return_weight": values.get("maximum_missing_held_return_weight"),
                     "missing_held_exposure_days": portfolio_metrics.get("missing_held_exposure_days"),
                 })
 
@@ -145,11 +151,17 @@ def build_report(experiment_id: str, config: str | Path) -> dict[str, Any]:
             expected = {(method, reward, int(seed)) for method, reward in experiment["cells"] for seed in experiment["seeds"]}
         else:
             expected = {(method, reward, int(seed)) for method in experiment["methods"] for reward in experiment["rewards"] for seed in experiment["seeds"]}
+        if selected_methods:
+            unknown = selected_methods - {method for method, _, _ in expected}
+            if unknown:
+                raise ValueError(f"methods are not configured for this experiment: {sorted(unknown)}")
+            expected = {cell for cell in expected if cell[0] in selected_methods}
         missing = sorted(expected - set(cells))
         unexpected = sorted(set(cells) - expected)
         if missing or unexpected:
             raise RuntimeError(f"formal aggregate refused: missing_cells={missing}, unexpected_cells={unexpected}")
-        transaction = _read_json(root / "test_finalization.json")
+        scope_name = "_".join(sorted(selected_methods)) or "all"
+        transaction = _read_json(root / ("test_finalization.json" if scope_name == "all" else f"test_finalization_{scope_name}.json"))
         if transaction.get("status") != "complete":
             raise RuntimeError("formal aggregate refused: experiment test finalization is not complete")
         budget = int(experiment["valid_unique_budget"])
@@ -178,9 +190,10 @@ def build_report(experiment_id: str, config: str | Path) -> dict[str, Any]:
     search = pd.DataFrame(search_rows)
     pools = pd.DataFrame(pool_rows)
     portfolios = pd.DataFrame(portfolio_rows)
+    artifact_suffix = "" if not selected_methods else "_" + "_".join(sorted(selected_methods))
     for name, frame in (("search_efficiency", search), ("pool_quality", pools), ("portfolio_results", portfolios)):
-        frame.to_parquet(root / f"{name}.parquet", index=False)
-        frame.to_csv(root / f"{name}.csv", index=False)
+        frame.to_parquet(root / f"{name}{artifact_suffix}.parquet", index=False)
+        frame.to_csv(root / f"{name}{artifact_suffix}.csv", index=False)
 
     paired_rows = []
     keys = {(method, reward) for method, reward, _ in cells}
@@ -207,8 +220,8 @@ def build_report(experiment_id: str, config: str | Path) -> dict[str, Any]:
             "delta_sharpe_95_ci": json.dumps(sharpe_ci), "interpretation": f"{dimension}:{significance}",
         })
     paired = pd.DataFrame(paired_rows)
-    paired.to_parquet(root / "paired_comparisons.parquet", index=False)
-    paired.to_csv(root / "paired_comparisons.csv", index=False)
+    paired.to_parquet(root / f"paired_comparisons{artifact_suffix}.parquet", index=False)
+    paired.to_csv(root / f"paired_comparisons{artifact_suffix}.csv", index=False)
 
     if len(pools):
         summary = pools.groupby(["method", "reward"], as_index=False).agg(
@@ -219,14 +232,16 @@ def build_report(experiment_id: str, config: str | Path) -> dict[str, Any]:
         summary = summary.merge(cis, on=["method", "reward"])
     else:
         summary = pd.DataFrame()
-    summary.to_parquet(root / "cross_method_summary.parquet", index=False)
-    summary.to_csv(root / "cross_method_summary.csv", index=False)
+    summary.to_parquet(root / f"cross_method_summary{artifact_suffix}.parquet", index=False)
+    summary.to_csv(root / f"cross_method_summary{artifact_suffix}.csv", index=False)
 
     sections = [f"# {experiment_id}", f"Completed cells: {len(cells)}"]
     for title, frame in (("Search efficiency", search), ("Factor pool quality", pools), ("Portfolio results", portfolios), ("Paired comparisons", paired), ("Across-seed summary", summary)):
         sections.extend([f"## {title}", frame.to_markdown(index=False) if len(frame) else "No completed rows."])
     sections.extend(["## Interpretation notes", "Paired RNIC intervals use same-date HAC and 20-day moving-block bootstrap. Sharpe differences use paired 20-day block resampling of fully-neutral 10bps daily returns. `uncertain` means the paired RNIC interval includes zero; it is not evidence of equivalence. GPU and wall time must be considered alongside statistical uncertainty."])
-    atomic_write_text(root / "report.md", "\n\n".join(sections) + "\n")
-    update_progress(root / "progress.json", status="complete", completed_cells=len(cells), report="report.md")
-    append_event(root / "experiment.log", "report_finished", completed_cells=len(cells), paired_comparisons=len(paired), report="report.md")
-    return {"experiment_id": experiment_id, "completed_cells": len(cells), "paired_comparisons": len(paired), "report": str(root / "report.md")}
+    scope_name = "_".join(sorted(selected_methods)) or "all"
+    report_name = "report.md" if scope_name == "all" else f"report_{scope_name}.md"
+    atomic_write_text(root / report_name, "\n\n".join(sections) + "\n")
+    update_progress(root / "progress.json", status="complete", completed_cells=len(cells), report=report_name)
+    append_event(root / "experiment.log", "report_finished", completed_cells=len(cells), paired_comparisons=len(paired), report=report_name)
+    return {"experiment_id": experiment_id, "completed_cells": len(cells), "paired_comparisons": len(paired), "report": str(root / report_name)}

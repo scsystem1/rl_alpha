@@ -13,10 +13,16 @@ class R2LCBObjective(RewardObjective):
         self.hac_lag = hac_lag
         self.critical_value = critical_value
 
-    def score_pool(self, signals: list[np.ndarray]) -> PoolScore:
-        if not signals:
-            return PoolScore(0.0, 0.0, tuple(), tuple(), 0.0)
-        residual_signals, residual_label = self._neutralized_inputs(signals)
-        daily, weights = self._daily_ic(residual_signals, residual_label)
+    def _objective_inputs(
+        self, signals: list[np.ndarray], raw_common: np.ndarray
+    ) -> tuple[list[np.ndarray], np.ndarray]:
+        return self._neutralized_inputs(signals, raw_common)
+
+    def _score_from_daily(self, daily: np.ndarray, weights: np.ndarray) -> PoolScore:
         objective, mean, standard_error = lcb_score(daily, self.hac_lag, self.critical_value)
+        if int(np.isfinite(daily).sum()) < self.required_valid_days():
+            objective = float("-inf")
         return PoolScore(objective, mean, tuple(map(float, daily)), tuple(map(float, weights)), standard_error)
+
+    def objective_name(self) -> str:
+        return "r2"

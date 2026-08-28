@@ -16,11 +16,28 @@ class PoolScore:
 class CandidateScore:
     candidate_hash: str
     pool_score: PoolScore
+    # Kept as the public search fitness name. Its value is the add-only delta,
+    # never the result of the later capacity pruning decision.
     delta_objective: float
     shaped_reward: float
     replaced_hash: str | None = None
     valid: bool = True
     reason: str = "ok"
+    delta_add: float | None = None
+    saliency: tuple[float, ...] = ()
+    eviction_candidates: tuple[str, ...] = ()
+    post_prune_delta: float = float("-inf")
+    self_evicted: bool = False
+    formally_rechecked: bool = False
+    positive_not_admitted: bool = False
+    reward_valid_days: int = 0
+    reward_valid_observations: int = 0
+    reward_valid_day_rate: float = 0.0
+    reward_observation_rate: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.delta_add is None:
+            object.__setattr__(self, "delta_add", self.delta_objective)
 
 
 @dataclass

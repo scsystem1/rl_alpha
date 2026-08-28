@@ -53,7 +53,7 @@ def data_build(config: Path = typer.Option(..., exists=True)) -> None:
 
 
 @data_app.command("audit")
-def data_audit(config: Path = typer.Option(..., exists=True), output: Path = typer.Option(Path("artifacts/data_audit"))) -> None:
+def data_audit(config: Path = typer.Option(..., exists=True), output: Path = typer.Option(Path("/data/sunyuxiang/rl_alpha/runs/data_audit"))) -> None:
     from .data.audit import run_data_audit
 
     paths = load_paths(config)
@@ -92,24 +92,24 @@ def search_run(method: str = typer.Option(...), reward: str = typer.Option(...),
 
 
 @matrix_app.command("run")
-def matrix_run(config: Path = typer.Option(..., exists=True), experiment_id: str = typer.Option("preliminary_screen"), resume: bool = typer.Option(True)) -> None:
+def matrix_run(config: Path = typer.Option(..., exists=True), experiment_id: str = typer.Option("preliminary_screen"), resume: bool = typer.Option(True), method: list[str] = typer.Option([], "--method"), reward: list[str] = typer.Option([], "--reward")) -> None:
     from .matrix.runner import run_matrix
 
-    typer.echo(json.dumps(run_matrix(config, experiment_id, resume), indent=2, default=str))
+    typer.echo(json.dumps(run_matrix(config, experiment_id, resume, methods=method, rewards=reward), indent=2, default=str))
 
 
 @evaluate_app.command("run")
-def evaluate_run(experiment_id: str = typer.Option(...), config: Path = typer.Option(Path("configs/experiment/preliminary_screen.yaml"), exists=True)) -> None:
+def evaluate_run(experiment_id: str = typer.Option(...), config: Path = typer.Option(Path("configs/experiment/preliminary_screen.yaml"), exists=True), method: list[str] = typer.Option([], "--method")) -> None:
     from .evaluation.finalize import finalize_experiment
 
-    typer.echo(json.dumps(finalize_experiment(experiment_id, config), indent=2, default=str))
+    typer.echo(json.dumps(finalize_experiment(experiment_id, config, methods=method), indent=2, default=str))
 
 
 @report_app.command("build")
-def report_build(experiment_id: str = typer.Option(...), config: Path = typer.Option(Path("configs/experiment/preliminary_screen.yaml"), exists=True)) -> None:
+def report_build(experiment_id: str = typer.Option(...), config: Path = typer.Option(Path("configs/experiment/preliminary_screen.yaml"), exists=True), method: list[str] = typer.Option([], "--method")) -> None:
     from .reporting.build import build_report
 
-    typer.echo(json.dumps(build_report(experiment_id, config), indent=2, default=str))
+    typer.echo(json.dumps(build_report(experiment_id, config, methods=method), indent=2, default=str))
 
 
 if __name__ == "__main__":

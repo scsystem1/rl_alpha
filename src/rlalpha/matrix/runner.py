@@ -42,15 +42,28 @@ def _gpu_free_mib() -> dict[int, int]:
 
 
 def _gpu_for(method: str, reward: str, seed: int, experiment: dict[str, Any] | None = None) -> int | None:
+    candidates = _gpu_candidates(method, reward, seed, experiment)
+    return candidates[0] if candidates else None
+
+
+def _gpu_candidates(
+    method: str,
+    reward: str,
+    seed: int,
+    experiment: dict[str, Any] | None = None,
+) -> list[int]:
     configured = (experiment or {}).get("gpu_devices", {}).get(method)
     if configured:
         offset = {"r0": 0, "r1": 1, "r2_lcb": 2}.get(reward, 0)
-        return int(configured[(seed + offset) % len(configured)])
+        start = (seed + offset) % len(configured)
+        return [int(configured[(start + index) % len(configured)]) for index in range(len(configured))]
     if method == "base_llm":
-        return 4
+        return [4]
     if method == "grpo_llm":
-        return (2, 3)[(seed + {"r0": 0, "r1": 1, "r2_lcb": 2}[reward]) % 2]
-    return None
+        devices = [2, 3]
+        start = (seed + {"r0": 0, "r1": 1, "r2_lcb": 2}[reward]) % len(devices)
+        return devices[start:] + devices[:start]
+    return []
 
 
 def _cell_dir(root: Path, method: str, reward: str, seed: int) -> Path:
@@ -66,7 +79,11 @@ def _matrix_progress(root: Path, cells: list[tuple[str, str, int]]) -> dict[str,
     for method, reward, seed in cells:
         path = _cell_progress(root, method, reward, int(seed))
         states[f"{method}/{reward}/seed_{seed}"] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"status": "pending"}
-    update_progress(root / "progress.json", experiment_id=root.name, cells=states)
+    progress_path = root / "progress.json"
+    prior = json.loads(progress_path.read_text(encoding="utf-8")) if progress_path.exists() else {}
+    merged = dict(prior.get("cells") or {})
+    merged.update(states)
+    update_progress(progress_path, experiment_id=root.name, cells=merged)
     return states
 
 
@@ -107,7 +124,10 @@ def _expected_cell_identity(config: Path, paths: Any, method: str, reward: str, 
         for candidate in candidates:
             if candidate.exists():
                 stat = candidate.stat()
-                model_runtime.append(_cached_file_identity(str(candidate.resolve()), stat.st_size, stat.st_mtime_ns))
+                if candidate.suffix == ".safetensors":
+                    model_runtime.append({"path": str(candidate.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "declared_sha256": model_config["fingerprint"]["weights_sha256"]})
+                else:
+                    model_runtime.append(_cached_file_identity(str(candidate.resolve()), stat.st_size, stat.st_mtime_ns))
     return stable_hash({"schema_version": 2, "method": method, "reward": reward, "seed": seed, "budget": budget, "inputs": records, "repositories": repositories, "model_runtime": model_runtime})
 
 
@@ -146,7 +166,7 @@ def _cell_acceptance(directory: Path, budget: int) -> tuple[bool, str | None]:
     return True, None
 
 
-def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = True, poll_seconds: int = 30) -> dict[str, Any]:
+def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = True, poll_seconds: int = 30, methods: list[str] | None = None, rewards: list[str] | None = None) -> dict[str, Any]:
     config = Path(config).resolve()
     raw = load_yaml(config)
     experiment = raw["experiment"]
@@ -158,6 +178,23 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
         cells = [(method, reward, seed) for (method, reward), seed in itertools.product(experiment["cells"], experiment["seeds"])]
     else:
         cells = list(itertools.product(experiment["methods"], experiment["rewards"], experiment["seeds"]))
+    selected_methods = set(methods or ())
+    if selected_methods:
+        unknown = selected_methods - {str(cell[0]) for cell in cells}
+        if unknown:
+            raise ValueError(f"methods are not configured for this experiment: {sorted(unknown)}")
+        cells = [cell for cell in cells if cell[0] in selected_methods]
+    selected_rewards = set(rewards or ())
+    if selected_rewards:
+        configured_rewards = {str(cell[1]) for cell in cells}
+        unknown = selected_rewards - configured_rewards
+        if unknown:
+            raise ValueError(f"rewards are not configured for this experiment: {sorted(unknown)}")
+        cells = [cell for cell in cells if cell[1] in selected_rewards]
+    if not resume:
+        occupied = [str(_cell_dir(root, method, reward, int(seed))) for method, reward, seed in cells if _cell_dir(root, method, reward, int(seed)).exists() and any(_cell_dir(root, method, reward, int(seed)).iterdir())]
+        if occupied:
+            raise RuntimeError(f"--no-resume refuses existing cell directories: {occupied}; use a new experiment ID")
     if any(method in {"base_llm", "grpo_llm"} for method, _, _ in cells) and not bool(experiment.get("auto_start_expensive_jobs", False)):
         raise RuntimeError("expensive Base-LLM/GRPO cells are disabled by experiment.auto_start_expensive_jobs=false")
     budget = int(experiment["valid_unique_budget"])
@@ -188,12 +225,30 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
         free = _gpu_free_mib()
         busy_gpus = {item[5] for item in running.values()} | {item.get("gpu") for item in external.values()}
         cpu_jobs = sum(item[5] is None for item in running.values()) + sum(item.get("gpu") is None for item in external.values())
+        total_cpu_threads = sum(
+            int(experiment.get("grpo_ray_cpus", 8)) if item[0] == "grpo_llm" else int(experiment.get("cpu_threads_per_job", 8))
+            for item in running.values()
+        ) + sum(
+            int(experiment.get("grpo_ray_cpus", 8)) if cell[0] == "grpo_llm" else int(experiment.get("cpu_threads_per_job", 8))
+            for cell in external
+        )
         base_busy = any(item[0] == "base_llm" for item in running.values()) or any(
             cell[0] == "base_llm" for cell in external
         )
         for cell in list(pending):
             method, reward, seed, attempt, microbatch = cell
-            gpu = _gpu_for(method, reward, seed, experiment)
+            gpu_options = _gpu_candidates(method, reward, seed, experiment)
+            gpu = next(
+                (
+                    device for device in gpu_options
+                    if device not in busy_gpus
+                    and free.get(device, 0) >= gpu_thresholds.get(device, 32 * 1024)
+                ),
+                gpu_options[0] if gpu_options else None,
+            )
+            required_threads = int(experiment.get("grpo_ray_cpus", 8)) if method == "grpo_llm" else int(experiment.get("cpu_threads_per_job", 8))
+            if total_cpu_threads + required_threads > int(experiment.get("max_total_cpu_threads", 90)):
+                continue
             if gpu is None and cpu_jobs >= max_cpu_jobs:
                 continue
             if gpu is not None and (gpu in busy_gpus or free.get(gpu, 0) < gpu_thresholds.get(gpu, 32 * 1024)):
@@ -216,11 +271,11 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
                 env["CUDA_VISIBLE_DEVICES"] = str(gpu)
                 env["RLALPHA_PHYSICAL_GPU"] = str(gpu)
                 env["RLALPHA_VLLM_MEMORY_UTILIZATION"] = gpu_memory_utilization.get(gpu, "0.18")
+            thread_count = int(experiment.get("grpo_ray_cpus", 8)) if method == "grpo_llm" else int(experiment.get("cpu_threads_per_job", 8))
+            for variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMBA_NUM_THREADS"):
+                env[variable] = str(thread_count)
             if method == "grpo_llm":
                 env["RLALPHA_GRPO_MICROBATCH"] = str(microbatch)
-            if gpu is None:
-                for variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMBA_NUM_THREADS"):
-                    env[variable] = str(int(experiment.get("cpu_threads_per_job", 8)))
             command = [sys.executable, "-m", "rlalpha.cli", "search", "run", "--method", method, "--reward", reward, "--seed", str(seed), "--budget", str(budget), "--experiment-id", experiment_id, "--config", str(config)]
             process = subprocess.Popen(command, cwd=paths.code_root, env=env, stdout=log_handle, stderr=subprocess.STDOUT, text=True)
             update_progress(state_path, status="running", method=method, reward=reward, seed=seed, budget=budget, cell_identity=cell_identity, gpu=gpu, pid=process.pid, attempt=attempt, rollout_microbatch=microbatch, started_at=time.time(), gpu_free_mib=free.get(gpu) if gpu is not None else None)
@@ -229,6 +284,7 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
             busy_gpus.add(gpu)
             cpu_jobs += gpu is None
             base_busy = base_busy or method == "base_llm"
+            total_cpu_threads += required_threads
             _matrix_progress(root, [(str(a), str(b), int(c)) for a, b, c in cells])
         if not running and (pending or external):
             time.sleep(poll_seconds)
@@ -274,12 +330,16 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
     for method, reward, seed in cells:
         path = _cell_dir(root, method, reward, int(seed)) / "progress.json"
         states[f"{method}/{reward}/seed_{seed}"] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"status": "missing"}
-    update_progress(root / "progress.json", experiment_id=experiment_id, cells=states)
+    progress_path = root / "progress.json"
+    prior = json.loads(progress_path.read_text(encoding="utf-8")) if progress_path.exists() else {}
+    merged_states = dict(prior.get("cells") or {})
+    merged_states.update(states)
+    update_progress(progress_path, experiment_id=experiment_id, cells=merged_states)
     append_event(root / "experiment.log", "matrix_finished", completed=sum(state.get("status") == "complete" for state in states.values()), failed=sum(state.get("status") == "failed" for state in states.values()))
     return {"experiment_id": experiment_id, "cells": states}
 
 
-def run_matrix(config: str | Path, experiment_id: str, resume: bool = True, poll_seconds: int = 30) -> dict[str, Any]:
+def run_matrix(config: str | Path, experiment_id: str, resume: bool = True, poll_seconds: int = 30, methods: list[str] | None = None, rewards: list[str] | None = None) -> dict[str, Any]:
     paths = load_paths(config)
     root = paths.runs_root / experiment_id
     root.mkdir(parents=True, exist_ok=True)
@@ -288,6 +348,6 @@ def run_matrix(config: str | Path, experiment_id: str, resume: bool = True, poll
     lock = FileLock(str(lock_root / f"matrix-{stable_hash(str(root.resolve()))}.lock"))
     try:
         with lock.acquire(timeout=0):
-            return _run_matrix_unlocked(config, experiment_id, resume, poll_seconds)
+            return _run_matrix_unlocked(config, experiment_id, resume, poll_seconds, methods, rewards)
     except Timeout as exc:
         raise RuntimeError(f"another matrix runner owns {lock.lock_file}") from exc

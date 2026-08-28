@@ -12,8 +12,8 @@ from rlalpha.search.gp import GPSearcher
 from rlalpha.search.coordinator import SearchCoordinator
 from rlalpha.search.models import CandidateOutcome, SearchContext
 from rlalpha.search.random_search import RandomSearcher
-from rlalpha.search.run import _snapshot_record, _write_lineage
-from rlalpha.matrix.runner import _contains_cuda_oom, _gpu_for, _pid_alive, run_matrix
+from rlalpha.search.run import _select_snapshot, _snapshot_record, _write_lineage
+from rlalpha.matrix.runner import _contains_cuda_oom, _gpu_candidates, _gpu_for, _pid_alive, run_matrix
 from rlalpha.config import load_yaml
 
 
@@ -117,7 +117,7 @@ def test_alphagen_gp_generation_uses_one_frozen_pool_and_one_admission(tmp_path)
     np.testing.assert_allclose([program.fitness_ for program in searcher.population], expected)
 
 
-def test_pool_candidate_delta_matches_complete_recomputation():
+def test_pool_candidate_reward_is_add_only_and_pruning_is_separate():
     pool = PoolManager(_Objective(), capacity=2)
     from rlalpha.factors.records import PoolEntry
 
@@ -126,7 +126,27 @@ def test_pool_candidate_delta_matches_complete_recomputation():
     score = pool.score_candidates([candidate])[0]
     alternatives = [_Objective().score_pool([entry.signal for entry in entries]).objective for entries in ([candidate, pool.entries[1]], [pool.entries[0], candidate])]
     baseline = _Objective().score_pool([entry.signal for entry in pool.entries]).objective
-    assert score.delta_objective == max(alternatives) - baseline
+    assert score.delta_add == 5.0
+    assert score.delta_objective == score.delta_add
+    assert score.post_prune_delta == max(alternatives) - baseline
+
+
+def test_snapshot_selection_rejects_high_objective_with_low_support():
+    sparse = {
+        "pool_version": 2,
+        "expressions": ["sparse"],
+        "train": {"support": {"valid": False}},
+        "validation": {"objective": 0.50, "support": {"valid": False}},
+    }
+    broad = {
+        "pool_version": 1,
+        "expressions": ["broad"],
+        "train": {"support": {"valid": True}},
+        "validation": {"objective": 0.03, "support": {"valid": True}},
+    }
+    assert _select_snapshot([sparse, broad]) is broad
+    with pytest.raises(RuntimeError, match="support requirements"):
+        _select_snapshot([sparse])
 
 
 def test_staged_searcher_updates_pool_only_at_stage_boundary(tmp_path):
@@ -184,6 +204,14 @@ def test_matrix_gpu_mapping_can_pin_all_llm_cells_to_one_physical_device():
     assert _gpu_for("grpo_llm", "r0", 0, experiment) == 3
     assert _gpu_for("grpo_llm", "r2_lcb", 7, experiment) == 3
     assert _gpu_for("random", "r0", 0, experiment) is None
+
+
+def test_matrix_gpu_candidates_rotate_and_retain_fallbacks():
+    experiment = {"gpu_devices": {"base_llm": [1, 2, 4], "grpo_llm": [3]}}
+    assert _gpu_candidates("base_llm", "r0", 0, experiment) == [1, 2, 4]
+    assert _gpu_candidates("base_llm", "r1", 0, experiment) == [2, 4, 1]
+    assert _gpu_candidates("base_llm", "r2_lcb", 0, experiment) == [4, 1, 2]
+    assert _gpu_candidates("grpo_llm", "r1", 0, experiment) == [3]
 
 
 def test_matrix_pid_liveness_uses_the_operating_system(monkeypatch):
@@ -253,3 +281,55 @@ def test_matrix_failure_isolated_and_resume_only_restarts_failed_cell(tmp_path, 
     assert (root / "progress.json").exists()
     assert (root / "experiment.log").exists()
     assert not list(root.rglob("*.lock"))
+
+
+def test_matrix_method_filter_never_launches_other_methods(tmp_path, monkeypatch):
+    config = tmp_path / "matrix.yaml"
+    config.write_text(yaml.safe_dump({
+        "paths": {"code_root": str(tmp_path), "raw_data_root": str(tmp_path), "processed_root": str(tmp_path), "cache_root": str(tmp_path), "runs_root": str(tmp_path / "runs"), "model_search_root": str(tmp_path), "alphagen_root": str(tmp_path), "quantevolver_root": str(tmp_path)},
+        "experiment": {"cells": [["random", "r0"], ["gp", "r0"]], "seeds": [0], "valid_unique_budget": 8, "max_cpu_jobs": 2},
+    }), encoding="utf-8")
+    calls = []
+
+    class FakeProcess:
+        pid = 999999
+        returncode = 0
+
+        def __init__(self, command, **kwargs):
+            calls.append(command[command.index("--method") + 1])
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr("rlalpha.matrix.runner.subprocess.Popen", FakeProcess)
+    monkeypatch.setattr("rlalpha.matrix.runner._gpu_free_mib", lambda: {})
+    monkeypatch.setattr("rlalpha.matrix.runner._cell_acceptance", lambda directory, budget: (True, None))
+    result = run_matrix(config, "method_only", poll_seconds=0, methods=["random"])
+    assert calls == ["random"]
+    assert set(result["cells"]) == {"random/r0/seed_0"}
+
+
+def test_matrix_reward_filter_never_launches_other_rewards(tmp_path, monkeypatch):
+    config = tmp_path / "matrix.yaml"
+    config.write_text(yaml.safe_dump({
+        "paths": {"code_root": str(tmp_path), "raw_data_root": str(tmp_path), "processed_root": str(tmp_path), "cache_root": str(tmp_path), "runs_root": str(tmp_path / "runs"), "model_search_root": str(tmp_path), "alphagen_root": str(tmp_path), "quantevolver_root": str(tmp_path)},
+        "experiment": {"cells": [["random", "r1"], ["random", "r0"]], "seeds": [0], "valid_unique_budget": 8, "max_cpu_jobs": 2},
+    }), encoding="utf-8")
+    calls = []
+
+    class FakeProcess:
+        pid = 999999
+        returncode = 0
+
+        def __init__(self, command, **kwargs):
+            calls.append(command[command.index("--reward") + 1])
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr("rlalpha.matrix.runner.subprocess.Popen", FakeProcess)
+    monkeypatch.setattr("rlalpha.matrix.runner._gpu_free_mib", lambda: {})
+    monkeypatch.setattr("rlalpha.matrix.runner._cell_acceptance", lambda directory, budget: (True, None))
+    result = run_matrix(config, "reward_only", poll_seconds=0, rewards=["r1"])
+    assert calls == ["r1"]
+    assert set(result["cells"]) == {"random/r1/seed_0"}

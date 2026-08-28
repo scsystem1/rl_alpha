@@ -1,0 +1,30 @@
+paths:
+  code_root: /home/sunyuxiang/rl_alpha/ours
+  raw_data_root: /data/sunyuxiang/rl_alpha
+  processed_root: /data/sunyuxiang/rl_alpha/processed
+  cache_root: /data/sunyuxiang/rl_alpha/cache
+  runs_root: /data/sunyuxiang/rl_alpha/runs
+  model_search_root: /data/shared/huggingface
+  alphagen_root: /home/sunyuxiang/rl_alpha/alphagen
+  quantevolver_root: /home/sunyuxiang/rl_alpha/QuantEvolver
+experiment:
+  methods: [random, gp, base_llm, grpo_llm]
+  rewards: [r0, r1, r2_lcb]
+  seeds: [0]
+  valid_unique_budget: 2000
+  proposal_group_size: 8
+  pool_capacity: 20
+  max_cpu_jobs: 2
+  cpu_threads_per_job: 8
+  max_total_cpu_threads: 90
+  grpo_ray_cpus: 8
+  grpo_object_store_gib: 8
+  # CUDA 2/4 are currently memory-constrained by unrelated jobs. All GPU
+  # cells use CUDA 3 and are serialized by the matrix scheduler, while CPU
+  # baselines continue in parallel.
+  gpu_devices:
+    base_llm: [3]
+    grpo_llm: [3]
+  gpu_min_free_mib: {3: 34000}
+  gpu_memory_utilization: {3: 0.15}
+  auto_start_expensive_jobs: true

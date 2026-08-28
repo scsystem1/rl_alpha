@@ -1,0 +1,13 @@
+search:
+  method: alphasage
+  algorithm: trajectory_balance_gflownet
+  encoder: rgcn
+  hidden_dim: 128
+  max_expression_tokens: 20
+  entropy_coef: 0.01
+  entropy_temperature: 1.0
+  mask_dropout_prob: 1.0
+  ssl_weight: 1.0
+  novelty_weight: 0.3
+  final_weight_ratio: 0.0
+  mutual_ic_threshold: 0.3

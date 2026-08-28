@@ -6,9 +6,6 @@ evaluation:
   sleeves: 4
   one_way_cost_bps: [0, 10]
   fully_neutral_max_weight: 0.02
-  common_universe_min_coverage: 0.50
-  common_universe_min_assets_per_day: 100
-  common_universe_min_valid_days: 252
   net_tolerance: 1.0e-8
   exposure_tolerance: 1.0e-6
   gross_tolerance: 1.0e-6

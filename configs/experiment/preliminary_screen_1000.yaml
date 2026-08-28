@@ -3,7 +3,7 @@ paths:
   raw_data_root: /data/sunyuxiang/rl_alpha
   processed_root: /data/sunyuxiang/rl_alpha/processed
   cache_root: /data/sunyuxiang/rl_alpha/cache
-  runs_root: /home/sunyuxiang/rl_alpha/ours/output
+  runs_root: /data/sunyuxiang/rl_alpha/runs
   model_search_root: /data/shared/huggingface
   alphagen_root: /home/sunyuxiang/rl_alpha/alphagen
   quantevolver_root: /home/sunyuxiang/rl_alpha/QuantEvolver
@@ -16,4 +16,7 @@ experiment:
   pool_capacity: 20
   max_cpu_jobs: 4
   cpu_threads_per_job: 8
+  max_total_cpu_threads: 90
+  grpo_ray_cpus: 8
+  grpo_object_store_gib: 8
   auto_start_expensive_jobs: false

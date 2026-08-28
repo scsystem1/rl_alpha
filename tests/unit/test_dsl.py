@@ -209,6 +209,43 @@ def test_signal_coverage_is_not_overwritten_by_pool_correlation_coverage():
     assert np.isclose(result.correlation_coverage, 0.5)
 
 
+def test_numba_rank_correlation_matches_scipy_with_ties_and_missing_values():
+    from scipy.stats import rankdata
+    from rlalpha.dsl.validity import _daily_rank_corr_exact, _daily_rank_corr_exact_serial
+
+    rng = np.random.default_rng(913)
+    signal = np.round(rng.normal(size=(30, 140)), 1)
+    pool = np.round(rng.normal(size=signal.shape), 1)
+    membership = rng.random(signal.shape) > 0.08
+    signal[3:7, :11] = np.nan
+    pool[9:13, 17:29] = np.nan
+    valid_days = (np.isfinite(signal) & membership).sum(axis=1) >= 100
+    actual = _daily_rank_corr_exact(signal, pool, membership, valid_days)
+    serial = _daily_rank_corr_exact_serial(signal, pool, membership, valid_days)
+    expected = np.full(len(signal), np.nan)
+    for day in np.flatnonzero(valid_days):
+        common = membership[day] & np.isfinite(signal[day]) & np.isfinite(pool[day])
+        if common.sum() >= 3:
+            expected[day] = finite_corr(rankdata(signal[day, common]), rankdata(pool[day, common]))
+    assert np.allclose(actual, expected, equal_nan=True, atol=1e-12)
+    assert np.allclose(serial, expected, equal_nan=True, atol=1e-12)
+
+
+def test_intrinsic_validity_failure_skips_pool_redundancy(monkeypatch):
+    import rlalpha.dsl.validity as validity
+
+    signal = np.full((300, 120), np.nan)
+    signal[:, :10] = 1.0
+    membership = np.ones_like(signal, dtype=bool)
+    monkeypatch.setattr(
+        validity,
+        "_daily_rank_corr_exact",
+        lambda *args: (_ for _ in ()).throw(AssertionError("redundancy should be skipped")),
+    )
+    result = validity.validate_signal(signal, membership, [np.ones_like(signal)])
+    assert result.reason == "coverage_failure"
+
+
 @pytest.mark.parametrize("formula", ["Mean($close,20)", "Var($return,10)", "Med($close,5)", "Mad($return,5)", "TSRank($close,10)", "WMA($volume,5)", "Corr($close,$volume,20)"])
 def test_optimized_rolling_kernels_match_reference_path(formula):
     torch = pytest.importorskip("torch")

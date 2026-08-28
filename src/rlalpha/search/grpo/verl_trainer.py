@@ -90,7 +90,8 @@ def run_quant_evolver_verl_trainer(
         if not ray.is_initialized():
             ray_cfg = config.get("ray_kwargs", {}).get("ray_init", {})
             num_cpus = ray_cfg.get("num_cpus") if ray_cfg else config.get("ray_init", {}).get("num_cpus")
-            ray.init(runtime_env={"env_vars": env_vars}, num_cpus=num_cpus)
+            object_store_memory = ray_cfg.get("object_store_memory") if ray_cfg else config.get("ray_init", {}).get("object_store_memory")
+            ray.init(runtime_env={"env_vars": env_vars}, num_cpus=num_cpus, object_store_memory=object_store_memory)
         local_path = copy_to_local(config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False))
         tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
         processor = hf_processor(local_path, trust_remote_code=True, use_fast=True)
@@ -131,14 +132,35 @@ def run_quant_evolver_verl_trainer(
             raise RuntimeError("installed Verl uses the configured custom reward hook; do not pass reward_fn")
         trainer = RayPPOTrainer(**kwargs)
         trainer.init_workers()
-        trainer.fit()
+        stopped_online = False
+        try:
+            trainer.fit()
+        except Exception as exc:
+            from .online_dataset import OnlineTrainingComplete
+
+            if not isinstance(exc, OnlineTrainingComplete):
+                raise
+            stopped_online = True
+            # The domain callback runs only after the optimizer step.  Verl may
+            # already have saved this step when it lands on ``save_freq``.  A
+            # duplicate save of the same global step advances Verl's retention
+            # queue a second time and can incorrectly evict the preceding
+            # checkpoint, so force the terminal save only when it is absent.
+            completed_step = int(trainer.global_steps) - 1
+            completed_actor = Path(config.trainer.default_local_dir) / f"global_step_{completed_step}" / "actor"
+            if not completed_actor.is_dir():
+                trainer.global_steps -= 1
+                try:
+                    trainer._save_checkpoint()
+                finally:
+                    trainer.global_steps += 1
         completed_step = int(trainer.global_steps) - 1
         if expected_global_step is not None and completed_step != int(expected_global_step):
             raise RuntimeError(f"Verl stopped at optimizer step {completed_step}, expected {expected_global_step}")
         checkpoint = Path(config.trainer.default_local_dir) / f"global_step_{completed_step}"
         if not checkpoint.is_dir() or not (checkpoint / "actor").is_dir():
             raise RuntimeError(f"Verl did not commit the expected actor checkpoint: {checkpoint}")
-        return {"global_step": completed_step, "checkpoint": str(checkpoint)}
+        return {"global_step": completed_step, "checkpoint": str(checkpoint), "stopped_online": stopped_online}
     finally:
         if ray.is_initialized():
             ray.shutdown()

@@ -72,13 +72,34 @@ def test_max_drawdown_includes_initial_wealth():
     assert np.isclose(portfolio_metrics(path, 0)["max_drawdown"], -0.28)
 
 
-def test_missing_held_return_invalidates_pnl_and_performance_path():
+def test_missing_held_return_uses_zero_contribution_without_renormalizing():
     scores = np.tile(np.arange(20), (4, 1)).astype(float)
     returns = np.zeros_like(scores)
+    returns[2, -2] = 0.10
     returns[2, -1] = np.nan
     result = PortfolioBacktester(1, 1).run(scores, returns, np.ones_like(scores, dtype=bool))
     assert result.missing_held_returns[2] == 1
-    assert np.isnan(result.gross_returns[2])
+    assert np.isclose(result.missing_held_return_weight[2], 0.125)
+    # The missing 12.5% position contributes zero.  The other long is not
+    # retrospectively scaled up, so it contributes exactly 12.5% * 10%.
+    assert np.isclose(result.gross_returns[2], 0.0125)
+    metrics = portfolio_metrics(result, 0)
+    assert not metrics["invalid_return_path"]
+    assert np.isfinite(metrics["annual_return"])
+    assert metrics["missing_held_return_days"] == 1
+    assert metrics["missing_return_policy"] == "zero_return_at_last_observable_value"
+    assert np.isclose(metrics["held_return_weight_coverage"], 0.9375)
+
+
+def test_nonfinite_portfolio_level_path_is_still_invalid():
+    result = PortfolioResult(
+        np.zeros((2, 1)),
+        np.array([0.01, np.nan]),
+        np.zeros(2),
+        np.zeros(2, int),
+        np.zeros(2, bool),
+        [],
+    )
     metrics = portfolio_metrics(result, 0)
     assert metrics["invalid_return_path"]
     assert np.isnan(metrics["annual_return"])

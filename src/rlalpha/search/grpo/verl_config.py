@@ -41,6 +41,7 @@ def build_verl_grpo_config(
     reward_function_path: str | Path | None = None,
     agent_loop_config_path: str | Path | None = None,
     metrics_path: str | Path | None = None,
+    online_dataset: bool = False,
 ):
     """Compose RLAlpha settings onto QuantEvolver's real Verl trainer config."""
     from omegaconf import OmegaConf
@@ -48,6 +49,11 @@ def build_verl_grpo_config(
     quantevolver_root, run_dir = Path(quantevolver_root), Path(run_dir)
     base, base_path = _load_verl_base(quantevolver_root)
     model, rollout, actor = effective["model"], effective["rollout"], effective["actor"]
+    experiment = effective.get("experiment", {})
+    checkpoint_interval = int(actor.get("checkpoint_interval", 50))
+    checkpoint_keep = int(actor.get("checkpoint_keep", 2))
+    ray_cpus = int(experiment.get("grpo_ray_cpus", 8))
+    object_store_bytes = int(float(experiment.get("grpo_object_store_gib", 8)) * 1024**3)
     prompt_groups = int(prompt_groups or 1)
     rollout_n = int(rollout["n"])
     if prompt_groups != 1:
@@ -130,6 +136,11 @@ def build_verl_grpo_config(
                 "use_torch_compile": False,
                 "optim": {"lr": float(actor["learning_rate"])},
                 "fsdp_config": {"param_offload": False, "optimizer_offload": False, "seed": seed},
+                "checkpoint": {
+                    "save_contents": ["model", "optimizer", "extra"],
+                    "load_contents": ["model", "optimizer", "extra"],
+                    "save_lora_only": bool(actor.get("save_lora_only", True)),
+                },
             },
             "ref": {"log_prob_micro_batch_size_per_gpu": micro_batch, "fsdp_config": {"param_offload": False, "seed": seed}},
         },
@@ -138,7 +149,7 @@ def build_verl_grpo_config(
             "project_name": "rlalpha", "experiment_name": experiment_name,
             "logger": ["console", "file"] if metrics_path else ["console"], "nnodes": 1, "n_gpus_per_node": 1,
             "total_epochs": int(expected_global_step), "total_training_steps": max_steps,
-            "save_freq": 1, "test_freq": -1,
+            "save_freq": checkpoint_interval, "test_freq": -1,
             "val_before_train": False, "critic_warmup": 0,
             "balance_batch": False,
             "use_v1": False,
@@ -147,9 +158,19 @@ def build_verl_grpo_config(
             "rollout_data_dir": str(run_dir / "logs/verl_rollouts"),
             "resume_mode": "resume_path" if resume_from_path else "disable",
             "resume_from_path": str(resume_from_path) if resume_from_path else None,
+            "max_actor_ckpt_to_keep": checkpoint_keep,
         },
-        "ray_init": {"num_cpus": None},
+        "ray_init": {"num_cpus": ray_cpus, "object_store_memory": object_store_bytes},
     })
+    if online_dataset:
+        overrides = OmegaConf.merge(overrides, OmegaConf.create({
+            "data": {
+                "custom_cls": {
+                    "path": str(Path(__file__).with_name("online_dataset.py").resolve()),
+                    "name": "OnlinePoolDataset",
+                }
+            }
+        }))
     if current_api:
         overrides = OmegaConf.merge(overrides, OmegaConf.create({
             "reward": {
@@ -168,7 +189,7 @@ def build_verl_grpo_config(
                     },
                 },
             },
-            "ray_kwargs": {"ray_init": {"num_cpus": None}},
+            "ray_kwargs": {"ray_init": {"num_cpus": ray_cpus, "object_store_memory": object_store_bytes}},
         }))
     config = OmegaConf.merge(base, overrides)
     OmegaConf.resolve(config)

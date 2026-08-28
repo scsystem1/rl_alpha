@@ -1,1 +1,1 @@
-search: {method: base_llm, group_size: 8, temperature: 1.0, response_length: 128}
+search: {method: base_llm, group_size: 8, temperature: 1.0, response_length: 128, replacement_top_k: 3, admission_recheck_top_k: 3}

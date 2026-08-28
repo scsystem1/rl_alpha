@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import math
 import os
-import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
@@ -12,11 +10,10 @@ import numpy as np
 import pandas as pd
 
 from ...dsl.parser import parse_expression
-from ...dsl.validity import validate_signal
 from ...factors.cache import SignalCache
 from ...factors.pool import PoolManager
-from ...factors.records import PoolEntry
-from ...utils.hashing import directory_fingerprint, file_fingerprint, stable_hash
+from ...factors.records import CandidateScore, PoolEntry, PoolScore
+from ...utils.hashing import file_fingerprint, stable_hash
 from ...utils.io import atomic_write_text, write_json
 from ..models import BudgetLedger, SearchContext
 from ..prompts import build_messages
@@ -25,12 +22,12 @@ from .verl_trainer import run_quant_evolver_verl_trainer
 
 
 class VerlGRPOStageCoordinator:
-    """Frozen-pool stage state machine around QuantEvolver/Verl.
+    """Persistent online-pool state machine around one QuantEvolver/Verl run.
 
     Verl owns rollout, old/reference log probabilities, GRPO advantages, the
     PPO clipped loss, KL/entropy terms, optimizer and distributed model state.
     This coordinator owns only domain prompts, train-only scoring, one admission
-    per stage and an outer atomic commit linking pool state to a Verl checkpoint.
+    per update and paired domain commits linking pool state to Verl checkpoints.
     """
 
     def __init__(
@@ -77,9 +74,11 @@ class VerlGRPOStageCoordinator:
         self.total_tokens = 0
         self.gpu_seconds = 0.0
         self.searcher = self
+        self.pool_snapshots: list[dict[str, Any]] = []
+        self._persisted_record_count = 0
 
     def context(self) -> SearchContext:
-        score = self.pool._score(self.pool.entries)
+        score = self.pool.score
         return SearchContext(
             self.pool.version,
             tuple(item.expression for item in self.pool.entries),
@@ -97,20 +96,29 @@ class VerlGRPOStageCoordinator:
         return event
 
     def _stage_spec(self, archive_path: Path, expected_samples: int) -> dict[str, Any]:
-        score = self.pool._score(self.pool.entries)
+        score = self.pool.score
         spec = {
-            "schema_version": 1,
+            "schema_version": 4,
+            "reward_pool_semantics": "independent-availability-same-support-admission-v4",
             "stage": self.stage,
             "expected_samples": int(expected_samples),
             "remaining_budget": self.ledger.remaining,
             "invalid_penalty": float(self.effective_config.get("reward", {}).get("invalid_penalty", -1.0)),
             "reward": self.reward,
+            "reward_config": dict(self.effective_config.get("reward", {})),
             "processed_root": str(self.processed_root.resolve()),
             "train_start": self.train_start,
             "train_end": self.train_end,
             "pool_version": self.pool.version,
             "pool_capacity": self.pool.capacity,
             "min_delta": self.pool.min_delta,
+            "replacement_top_k": self.pool.replacement_top_k,
+            "admission_recheck_top_k": self.pool.admission_recheck_top_k,
+            "candidate_workers": int(
+                self.effective_config.get("experiment", {}).get(
+                    "grpo_reward_candidate_workers", 4
+                )
+            ),
             "pool_objective": float(score.objective),
             "pool_weights": list(map(float, score.weights)),
             "pool": [
@@ -230,11 +238,11 @@ class VerlGRPOStageCoordinator:
             reason = str(item["reason_code"])
             expr_hash = item.get("expr_hash")
             expression = item.get("expression") or item.get("raw_text") or ""
-            if reason in {"exact_duplicate", "stage_duplicate"}:
+            if reason in {"exact_duplicate", "intra_group_duplicate_reused"}:
                 self.ledger.duplicates += 1
             elif reason not in {"ok", "budget_exhausted"}:
                 self.ledger.invalid += 1
-            if expr_hash and reason not in {"exact_duplicate", "stage_duplicate", "budget_exhausted"}:
+            if expr_hash and reason not in {"exact_duplicate", "intra_group_duplicate_reused", "budget_exhausted"}:
                 self.seen.add(str(expr_hash))
             metadata = {
                 "proposal_id": f"proposal_{stable_hash({'seed': self.seed, 'stage': self.stage, 'prompt_group': item['prompt_group'], 'rollout_index': item['rollout_index'], 'raw_text': item['raw_text']})[:24]}",
@@ -259,9 +267,6 @@ class VerlGRPOStageCoordinator:
                 if signal is None:
                     signal = self.evaluator(node)
                     self.signal_cache.put(node.expr_hash, signal, permanent=True)
-                validity = validate_signal(signal, self.membership, [entry.signal for entry in self.pool.entries])
-                if not validity.valid:
-                    raise RuntimeError(f"parent/reward-worker signal validity disagreement for {node.canonical()}")
                 self.signals[node.expr_hash] = np.asarray(signal)
                 entries.append(PoolEntry(node.canonical(), node.expr_hash, signal, metadata))
             standard_records.append(
@@ -277,116 +282,232 @@ class VerlGRPOStageCoordinator:
                 }
             )
         self.ledger.raw_proposals += len(records)
-        scored = self.pool.score_candidates(entries)
-        archive_by_hash = {str(item["expr_hash"]): item for item in records if item.get("expr_hash")}
-        for score in scored:
-            archived = archive_by_hash[score.candidate_hash]
-            if not math.isclose(float(score.shaped_reward), float(archived["shaped_reward"]), rel_tol=1e-7, abs_tol=1e-8):
-                raise RuntimeError(f"parent/reward-worker reward disagreement for {score.candidate_hash}")
-            archived_delta = float(archived["delta_objective"])
-            if not math.isclose(float(score.delta_objective), archived_delta, rel_tol=1e-7, abs_tol=1e-10):
-                raise RuntimeError(f"parent/reward-worker objective disagreement for {score.candidate_hash}")
+        archived_scored = [item for item in records if bool(item.get("market_evaluated"))]
+        if len(archived_scored) != len(entries):
+            raise RuntimeError("reward archive and parent candidate counts differ")
+        scored = []
+        for entry, archived in zip(entries, archived_scored, strict=True):
+            raw_pool_score = dict(archived["pool_score"])
+            pool_score = PoolScore(
+                float(raw_pool_score["objective"]),
+                float(raw_pool_score["mean_ic"]),
+                tuple(map(float, raw_pool_score["daily_ic"])),
+                tuple(map(float, raw_pool_score["weights"])),
+                float(raw_pool_score.get("standard_error", float("nan"))),
+            )
+            scored.append(CandidateScore(
+                entry.expr_hash,
+                pool_score,
+                float(archived["delta_objective"]),
+                float(archived["shaped_reward"]),
+                archived.get("replaced_hash"),
+                bool(archived["valid"]),
+                str(archived["reason_code"]),
+                float(archived["delta_add"]),
+                tuple(map(float, archived.get("saliency") or ())),
+                tuple(map(str, archived.get("eviction_candidates") or ())),
+                float(archived["post_prune_delta"]),
+                bool(archived["self_evicted"]),
+                bool(archived["formally_rechecked"]),
+                bool(float(archived["delta_add"]) > 0 and float(archived["post_prune_delta"]) <= self.pool.min_delta),
+                int(archived.get("reward_valid_days") or 0),
+                int(archived.get("reward_valid_observations") or 0),
+                float(archived.get("reward_valid_day_rate") or 0.0),
+                float(archived.get("reward_observation_rate") or 0.0),
+            ))
         self.records.extend(standard_records)
         return entries, scored
 
-    def run_stage(self) -> dict[str, Any]:
-        if self.ledger.exhausted:
-            raise RuntimeError("cannot run a GRPO stage after the valid-unique budget is exhausted")
-        groups = 1
-        rollout_n = int(self.effective_config["rollout"]["n"])
-        if rollout_n != 8:
-            raise ValueError(f"GRPO fairness protocol requires rollout.n=8, got {rollout_n}")
-        expected_samples = groups * rollout_n
-        attempt_id = self._attempt_id()
-        attempt = self.run_dir / "stages" / f"stage_{self.stage:05d}" / attempt_id
+    def _prepare_online_stage(self, session_dir: Path) -> dict[str, Any]:
+        base = session_dir / "stages" / f"stage_{self.stage:05d}"
+        attempt = base
+        retry = 0
+        while attempt.exists():
+            retry += 1
+            attempt = base.with_name(f"{base.name}_retry_{retry:02d}")
         attempt.mkdir(parents=True, exist_ok=False)
         archive_path = attempt / "rollouts.jsonl"
         spec_path = attempt / "frozen_stage_spec.json"
-        spec = self._stage_spec(archive_path, expected_samples)
+        spec = self._stage_spec(archive_path, int(self.effective_config["rollout"]["n"]))
         write_json(spec_path, spec)
         context = self.context()
-        train_file, validation_file = attempt / "train.parquet", attempt / "validation.parquet"
-        self._write_prompts(train_file, context, self.stage, groups, spec_path, spec["spec_hash"], expected_samples, "train")
-        self._write_prompts(validation_file, context, self.stage, groups, spec_path, spec["spec_hash"], expected_samples, "validation")
-        metrics_path = attempt / "verl_metrics.jsonl"
-        expected_step = self.updates + 1
+        return {
+            "data_source": "rlalpha/grpo/train",
+            "prompt": build_messages(context),
+            "reward_model": {"ground_truth": [], "style": "rule"},
+            "extra_info": {
+                "index": self.stage,
+                "stage": self.stage,
+                "prompt_group": 0,
+                "split": "train",
+                "pool_version": context.pool_version,
+                "stage_spec_path": str(spec_path.resolve()),
+                "frozen_state_hash": spec["spec_hash"],
+                "expected_stage_samples": int(self.effective_config["rollout"]["n"]),
+            },
+        }
+
+    def _commit_online_stage(self, row: dict[str, Any], session_dir: Path) -> dict[str, Any] | None:
+        extra = row["extra_info"]
+        spec_path = Path(extra["stage_spec_path"])
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        archive_path = Path(spec["archive_path"])
+        if not archive_path.exists():
+            raise RuntimeError("optimizer completed without a pending domain transition")
+        records = [json.loads(line) for line in archive_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        expected = int(spec["expected_samples"])
+        if len(records) != expected:
+            raise RuntimeError(f"pending domain transition has {len(records)} records, expected {expected}")
+        records.sort(key=lambda item: (int(item["prompt_group"]), int(item["rollout_index"]), str(item.get("expression") or "")))
+        context = self.context()
+        entries, scores = self._consume_records(records)
+        admission = self.pool.consider_group(entries, scores)
+        for record in self.records[-len(records) :]:
+            metadata = dict(record.get("metadata") or {})
+            admitted = bool(admission.admitted and admission.candidate_hash == record.get("expr_hash"))
+            metadata["admitted"] = admitted
+            metadata["positive_not_admitted"] = bool(
+                float(record.get("delta_objective") or 0.0) > 0 and not admitted
+            )
+            record["metadata"] = metadata
+        self.updates += 1
+        self.stage += 1
+        domain_metrics = self._domain_metrics(records, 1)
+        self.zero_group_variance += int(domain_metrics["domain/zero_variance_groups"])
+        self.total_tokens += int(sum(len(str(item.get("raw_text") or "").split()) for item in records))
+        self.ledger.tokens = self.total_tokens
+        prepared = self.pool.prepared_state()
+        train_score = asdict(self.pool.score)
+        support_diagnostics = getattr(self.pool.objective, "support_diagnostics", None)
+        if prepared is not None and callable(support_diagnostics):
+            train_score["support"] = support_diagnostics(prepared)
+        snapshot_factors = [
+            {
+                "factor_id": entry.expr_hash,
+                "proposal_id": entry.metadata.get("proposal_id"),
+                "expression": entry.expression,
+                "generator": entry.metadata.get("generator"),
+                "parents": entry.metadata.get("parents", []),
+                "search_weight": train_score.get("weights", [])[index] if index < len(train_score.get("weights", [])) else None,
+            }
+            for index, entry in enumerate(self.pool.entries)
+        ]
+        pool_hash = stable_hash({"pool_version": self.pool.version, "factor_ids": [item["factor_id"] for item in snapshot_factors]})
+        self.pool_snapshots.append({
+            "snapshot_id": f"snapshot_{stable_hash({'pool_hash': pool_hash, 'valid_unique_evaluations': self.ledger.valid_unique_evaluations})[:20]}",
+            "stage": self.stage - 1,
+            "optimizer_update": self.updates,
+            "admission": asdict(admission),
+            "expressions": [entry.expression for entry in self.pool.entries],
+            "factors": snapshot_factors,
+            "pool_version": self.pool.version,
+            "pool_snapshot_hash": pool_hash,
+            "train": train_score,
+            "valid_unique_evaluations": self.ledger.valid_unique_evaluations,
+            "checkpoint": None,
+        })
+        journal = self.run_dir / "checkpoints/domain_journal.jsonl"
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        with journal.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "optimizer_update": self.updates,
+                "pending_spec_hash": spec["spec_hash"],
+                "pool_version_before": context.pool_version,
+                "pool_version_after": self.pool.version,
+                "admission": asdict(admission),
+                "ledger": self.ledger.state_dict(),
+            }, sort_keys=True, default=str) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        retained = self.pool.hashes
+        self.signals = {key: value for key, value in self.signals.items() if key in retained}
+        for key, signal in self.signals.items():
+            self.signal_cache.put(key, signal, permanent=True)
+        self.signal_cache.prune(retained)
+        self._event("optimizer_update_committed", admission=asdict(admission), metrics=domain_metrics)
+        checkpoint_interval = int(self.effective_config["actor"].get("checkpoint_interval", 50))
+        if self.updates % checkpoint_interval == 0:
+            paired = session_dir / "checkpoints/verl" / f"global_step_{self.updates}"
+            if not (paired / "actor").is_dir():
+                raise RuntimeError(f"Verl did not save the expected paired checkpoint {paired}")
+            self.checkpoint = paired
+            self.checkpoint_fingerprint = {
+                "global_step": self.updates,
+                "save_lora_only": bool(self.effective_config["actor"].get("save_lora_only", True)),
+            }
+            self.pool_snapshots[-1]["checkpoint"] = str(paired)
+            self.save_checkpoint()
+        if self.ledger.exhausted:
+            return None
+        return self._prepare_online_stage(session_dir)
+
+    def run_cell(self) -> dict[str, Any]:
+        """Run all GRPO updates with one Ray/Verl/vLLM lifetime."""
+        if self.ledger.exhausted:
+            raise RuntimeError("cannot run a completed GRPO cell")
+        from .online_dataset import register_online_callback, unregister_online_callback
+
+        session_dir = self.run_dir / "grpo_session"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        initial_row = self._prepare_online_stage(session_dir)
+        # One valid representative per update is the conservative upper bound.
+        # Keep dataset length stable across paired-checkpoint resume so Verl's
+        # StatefulDataLoader sampler offset remains valid.
+        max_updates = min(self.max_training_steps, max(2, self.ledger.limit + 1))
+        train_file = session_dir / "online_train.parquet"
+        validation_file = session_dir / "validation.parquet"
+        pd.DataFrame([initial_row for _ in range(max_updates)]).to_parquet(train_file, index=False)
+        pd.DataFrame([initial_row]).to_parquet(validation_file, index=False)
+        current_row = initial_row
+
+        def on_batch_end(_: dict[str, Any]) -> dict[str, Any] | None:
+            nonlocal current_row
+            next_row = self._commit_online_stage(current_row, session_dir)
+            if next_row is not None:
+                current_row = next_row
+            return next_row
+
+        register_online_callback(train_file, on_batch_end)
+        metrics_path = session_dir / "verl_metrics.jsonl"
         config = build_verl_grpo_config(
             self.quantevolver_root,
             self.effective_config,
             train_file,
             validation_file,
-            attempt,
-            experiment_name=f"stage_{self.stage:05d}_{attempt_id}",
+            session_dir,
+            experiment_name=f"cell_seed_{self.seed}",
             resume_from_path=self.checkpoint,
-            prompt_groups=groups,
-            expected_global_step=expected_step,
-            total_training_steps=self.max_training_steps,
+            prompt_groups=1,
+            expected_global_step=max(1, self.updates + 1),
+            total_training_steps=max_updates,
             reward_function_path=Path(__file__).with_name("verl_reward_function.py"),
-            # This is a Verl agent-loop registry (a YAML list), not an
-            # RLAlpha ProjectConfig fragment, so keep it beside the adapter
-            # instead of under the strictly typed project config tree.
             agent_loop_config_path=Path(__file__).with_name("agent_loop_config.yaml"),
             metrics_path=metrics_path,
+            online_dataset=True,
         )
         from omegaconf import OmegaConf
 
-        atomic_write_text(attempt / "effective_verl_config.yaml", OmegaConf.to_yaml(config, resolve=True))
-        started = time.monotonic()
-        trainer_result = run_quant_evolver_verl_trainer(config, expected_global_step=expected_step)
-        elapsed = time.monotonic() - started
-        pending_checkpoint = Path(trainer_result["checkpoint"])
-        pending_fingerprint = directory_fingerprint(pending_checkpoint)
-        committed_parent = self.run_dir / "checkpoints/verl_committed" / f"stage_{self.stage:05d}_{attempt_id}"
-        committed_parent.mkdir(parents=True, exist_ok=False)
-        committed_checkpoint = committed_parent / pending_checkpoint.name
-        os.replace(pending_checkpoint, committed_checkpoint)
-        committed_fingerprint = directory_fingerprint(committed_checkpoint)
-        if pending_fingerprint["sha256"] != committed_fingerprint["sha256"]:
-            raise RuntimeError("Verl checkpoint changed during atomic commit")
-        if not archive_path.exists():
-            raise RuntimeError("reward hook did not commit the frozen-stage rollout archive")
-        records = [json.loads(line) for line in archive_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        if len(records) != expected_samples:
-            raise RuntimeError(f"reward archive has {len(records)} records, expected {expected_samples}")
-        records.sort(key=lambda item: (int(item["prompt_group"]), int(item["rollout_index"]), str(item.get("expression") or "")))
-        for group in range(groups):
-            group_records = [item for item in records if int(item["prompt_group"]) == group]
-            self._event("group_complete", prompt_group=group, sample_count=len(group_records), frozen_state_hash=spec["spec_hash"])
-        self.updates = expected_step
-        self.checkpoint = committed_checkpoint
-        self.checkpoint_fingerprint = committed_fingerprint
-        self._event("optimizer_update", checkpoint=str(committed_checkpoint), checkpoint_sha256=committed_fingerprint["sha256"])
-        entries, scores = self._consume_records(records)
-        admission = self.pool.consider_group(entries, scores)
-        self._event("pool_update", admission=asdict(admission), pre_stage_pool_version=context.pool_version, post_stage_pool_version=self.pool.version)
-        domain_metrics = self._domain_metrics(records, groups)
-        self.zero_group_variance += int(domain_metrics["domain/zero_variance_groups"])
-        verl_metrics = self._read_verl_metrics(metrics_path)
-        required = {"actor/pg_clipfrac", "actor/ppo_kl", "actor/kl_loss", "actor/grad_norm", "actor/lr", "critic/advantages/mean", "actor/entropy"}
-        missing = sorted(required - set(verl_metrics))
-        if missing:
-            raise RuntimeError(f"Verl omitted required formal-GRPO metrics: {missing}")
-        stage_metrics = {
-            **verl_metrics,
-            **domain_metrics,
-            "domain/stage_wall_seconds": elapsed,
-            "domain/optimizer_update": self.updates,
-            "domain/checkpoint_sha256": committed_fingerprint["sha256"],
+        atomic_write_text(session_dir / "effective_verl_config.yaml", OmegaConf.to_yaml(config, resolve=True))
+        try:
+            trainer_result = run_quant_evolver_verl_trainer(config, expected_global_step=None)
+        finally:
+            unregister_online_callback(train_file)
+        if not self.ledger.exhausted:
+            raise RuntimeError("GRPO online dataset reached its safety limit before exhausting the valid-unique budget")
+        self.checkpoint = Path(trainer_result["checkpoint"])
+        self.checkpoint_fingerprint = {
+            "global_step": int(trainer_result["global_step"]),
+            "save_lora_only": bool(self.effective_config["actor"].get("save_lora_only", True)),
         }
-        write_json(attempt / "stage_metrics.json", stage_metrics)
-        self.total_tokens += int(round(float(verl_metrics.get("response_length/mean", 0.0)) * expected_samples))
-        self.gpu_seconds += float(verl_metrics.get("timing_s/step", elapsed))
-        self.ledger.tokens = self.total_tokens
-        self.ledger.gpu_seconds = self.gpu_seconds
-        completed_stage = self.stage
-        self._event("stage_end", completed_stage=completed_stage, admitted=admission.admitted, metrics_path=str(attempt / "stage_metrics.json"))
-        self.stage += 1
+        if self.pool_snapshots:
+            self.pool_snapshots[-1]["checkpoint"] = str(self.checkpoint)
         self.save_checkpoint()
-        return {"stage": completed_stage, "admission": asdict(admission), "checkpoint": str(committed_checkpoint), "checkpoint_fingerprint": committed_fingerprint, "metrics": stage_metrics, "attempt_dir": str(attempt)}
-
-    def record_validation_event(self, snapshot_id: str, objective: float) -> None:
-        self._event("validation_selection", snapshot_id=snapshot_id, validation_objective=float(objective))
-        self.save_checkpoint()
+        return {
+            "updates": self.updates,
+            "checkpoint": str(self.checkpoint),
+            "pool_snapshots": list(self.pool_snapshots),
+            "metrics_path": str(metrics_path),
+        }
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -403,12 +524,12 @@ class VerlGRPOStageCoordinator:
 
     def save_checkpoint(self) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        if self.checkpoint is not None:
-            actual = directory_fingerprint(self.checkpoint)
-            if self.checkpoint_fingerprint is None or actual["sha256"] != self.checkpoint_fingerprint["sha256"]:
-                raise RuntimeError("outer state points to a changed Verl checkpoint")
+        if self.checkpoint is not None and not (self.checkpoint / "actor").is_dir():
+            raise RuntimeError("paired Verl actor checkpoint is missing")
         state = {
-            "schema_version": 1,
+            "schema_version": 4,
+            "reward_pool_semantics": "independent-availability-same-support-admission-v4",
+            "paired_optimizer_step": self.updates,
             "ledger": self.ledger.state_dict(),
             "seen": sorted(self.seen),
             "stage": self.stage,
@@ -423,18 +544,26 @@ class VerlGRPOStageCoordinator:
             "pool_version": self.pool.version,
             "pool": [{"expression": item.expression, "expr_hash": item.expr_hash, "metadata": item.metadata} for item in self.pool.entries],
             "pool_history": self.pool.history,
+            "pool_snapshots": self.pool_snapshots,
+            "record_count": len(self.records),
         }
         candidates_path = self.run_dir / "candidates.jsonl"
-        atomic_write_text(candidates_path, "".join(json.dumps(record, sort_keys=True, default=str) + "\n" for record in self.records))
+        if self._persisted_record_count < len(self.records):
+            with candidates_path.open("a", encoding="utf-8") as handle:
+                for record in self.records[self._persisted_record_count :]:
+                    handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._persisted_record_count = len(self.records)
         checkpoint_path = self.run_dir / "checkpoint.json"
         write_json(checkpoint_path, state)
         write_json(
             self.run_dir / "checkpoint_commit.json",
             {
-                "schema_version": 1,
-                "state_hash": stable_hash(state),
+                "schema_version": 4,
+                "reward_pool_semantics": "independent-availability-same-support-admission-v4",
+                "paired_optimizer_step": self.updates,
                 "checkpoint": file_fingerprint(checkpoint_path),
-                "candidates": file_fingerprint(candidates_path),
                 "verl_checkpoint": self.checkpoint_fingerprint,
             },
         )
@@ -446,18 +575,19 @@ class VerlGRPOStageCoordinator:
         if not commit_path.exists():
             raise RuntimeError("GRPO checkpoint is uncommitted and cannot be resumed")
         commit = json.loads(commit_path.read_text(encoding="utf-8"))
-        for key, path in (("checkpoint", state_path), ("candidates", candidates_path)):
-            if file_fingerprint(path)["sha256"] != commit[key]["sha256"]:
-                raise RuntimeError(f"GRPO {key} hash mismatch")
+        if commit.get("schema_version") != 4 or commit.get("reward_pool_semantics") != "independent-availability-same-support-admission-v4":
+            raise RuntimeError("GRPO checkpoint uses incompatible reward/pool semantics")
+        if file_fingerprint(state_path)["sha256"] != commit["checkpoint"]["sha256"]:
+            raise RuntimeError("GRPO checkpoint hash mismatch")
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        if stable_hash(state) != commit["state_hash"]:
-            raise RuntimeError("GRPO outer state hash mismatch")
+        if state.get("schema_version") != 4 or state.get("reward_pool_semantics") != "independent-availability-same-support-admission-v4":
+            raise RuntimeError("GRPO state uses incompatible reward/pool semantics")
+        if int(state["paired_optimizer_step"]) != int(commit["paired_optimizer_step"]):
+            raise RuntimeError("model/domain checkpoint step mismatch")
         checkpoint = Path(state["checkpoint"]) if state.get("checkpoint") else None
         fingerprint = state.get("checkpoint_fingerprint")
-        if checkpoint is not None:
-            actual = directory_fingerprint(checkpoint)
-            if not fingerprint or actual["sha256"] != fingerprint["sha256"] or actual["sha256"] != commit["verl_checkpoint"]["sha256"]:
-                raise RuntimeError("GRPO Verl checkpoint hash mismatch")
+        if checkpoint is not None and not (checkpoint / "actor").is_dir():
+            raise RuntimeError("paired GRPO Verl checkpoint is missing")
         self.ledger = BudgetLedger.from_state_dict(state["ledger"])
         self.seen = set(state["seen"])
         self.stage = int(state["stage"])
@@ -469,6 +599,7 @@ class VerlGRPOStageCoordinator:
         self.gpu_seconds = float(state.get("gpu_seconds", 0.0))
         self.checkpoint = checkpoint
         self.checkpoint_fingerprint = fingerprint
+        self.pool_snapshots = list(state.get("pool_snapshots", []))
         self.pool.entries = []
         for item in state["pool"]:
             node = parse_expression(str(item["expression"]))
@@ -480,4 +611,7 @@ class VerlGRPOStageCoordinator:
             self.pool.entries.append(PoolEntry(node.canonical(), node.expr_hash, signal, dict(item.get("metadata") or {})))
         self.pool.version = int(state["pool_version"])
         self.pool.history = list(state["pool_history"])
-        self.records = [json.loads(line) for line in candidates_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.pool.invalidate_cache()
+        all_records = [json.loads(line) for line in candidates_path.read_text(encoding="utf-8").splitlines() if line.strip()] if candidates_path.exists() else []
+        self.records = all_records[: int(state.get("record_count", len(all_records)))]
+        self._persisted_record_count = len(all_records)

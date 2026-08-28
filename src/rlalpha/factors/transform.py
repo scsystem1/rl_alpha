@@ -140,7 +140,138 @@ class FactorTransformPipeline:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "FactorTransformPipeline":
-        pipeline = cls(TransformConfig(**value["config"]))
+        config = TransformConfig(**value["config"])
+        pipeline = (
+            IndependentFactorTransformPipeline(config)
+            if config.version.startswith("daily-cs-independent-availability-")
+            else cls(config)
+        )
         pipeline.fitted = bool(value.get("fitted"))
         pipeline.n_factors = int(value["n_factors"])
         return pipeline
+
+
+class IndependentFactorTransformPipeline(FactorTransformPipeline):
+    """Frozen-pool transform with per-factor, rather than joint, availability.
+
+    A factor whose cross-section is constant (or otherwise unavailable) on a
+    date carries no information on that date.  It must not invalidate other
+    factors in the pool.  Reward/search implements the same semantics through
+    its reusable prepared-state kernel; evaluation uses this serializable
+    pipeline directly.
+    """
+
+    def __init__(self, config: TransformConfig | None = None):
+        super().__init__(config or TransformConfig(version="daily-cs-independent-availability-v1"))
+
+    @staticmethod
+    def _standardize_one(values: np.ndarray, support: np.ndarray) -> np.ndarray:
+        return FactorCalculator(np.zeros(support.shape, dtype=float), support).standardize(values)
+
+    def _apply(self, signals: list[np.ndarray], mask: np.ndarray, label: np.ndarray | None, exposures: np.ndarray | None) -> TransformResult:
+        signals, mask, label, exposures = self._validate(signals, mask, label, exposures)
+        base = mask.copy()
+        if label is not None:
+            base &= np.isfinite(label)
+        if self.config.neutralize:
+            if exposures is None:
+                raise ValueError("neutralized transform requires exposures")
+            base &= np.isfinite(exposures).all(axis=2)
+
+        prepared = [self._standardize_one(signal, base & np.isfinite(signal)) for signal in signals]
+        target = None if label is None else self._standardize_one(label, base)
+        diagnostics: list[dict[str, Any]] = []
+
+        if self.config.neutralize:
+            assert exposures is not None
+            neutralizer = RiskNeutralizer()
+            residual_signals = [np.full(base.shape, np.nan) for _ in signals]
+            residual_target = None if target is None else np.full(base.shape, np.nan)
+            for day in range(base.shape[0]):
+                # Signals with the same support share one QR solve and are
+                # residualized as multiple RHS columns.  A constant factor has
+                # empty support and is simply absent for this day.
+                groups: dict[bytes, tuple[np.ndarray, list[int]]] = {}
+                for factor_index, signal in enumerate(prepared):
+                    support = base[day] & np.isfinite(signal[day])
+                    if support.sum() <= exposures.shape[2]:
+                        diagnostics.append({
+                            "date": str(day), "status": "factor_unavailable",
+                            "factor_index": factor_index,
+                            "n_observations": int(support.sum()),
+                            "n_columns": int(exposures.shape[2]),
+                        })
+                        continue
+                    key = support.tobytes()
+                    if key not in groups:
+                        groups[key] = (support, [])
+                    groups[key][1].append(factor_index)
+                for support, factor_indices in groups.values():
+                    matrix = np.column_stack([prepared[index][day] for index in factor_indices])
+                    residual, records = neutralizer.residualize_matrix(day, matrix, exposures[day], support)
+                    for column, factor_index in enumerate(factor_indices):
+                        residual_signals[factor_index][day] = residual[:, column]
+                        diagnostics.append({
+                            **records[column], "status": "ok", "factor_index": factor_index,
+                        })
+                if target is not None:
+                    target_support = base[day] & np.isfinite(target[day])
+                    if target_support.sum() > exposures.shape[2]:
+                        residual, records = neutralizer.residualize_matrix(
+                            day, target[day], exposures[day], target_support
+                        )
+                        assert residual_target is not None
+                        residual_target[day] = residual[:, 0]
+                        diagnostics.append({**records[0], "status": "ok", "column": "label"})
+                    else:
+                        diagnostics.append({
+                            "date": str(day), "status": "label_unavailable", "column": "label",
+                            "n_observations": int(target_support.sum()),
+                            "n_columns": int(exposures.shape[2]),
+                        })
+            prepared = residual_signals
+            target = residual_target
+
+        if self.config.post_residual_standardize:
+            prepared = [
+                self._standardize_one(signal, base & np.isfinite(signal))
+                for signal in prepared
+            ]
+            if target is not None:
+                target = self._standardize_one(target, base & np.isfinite(target))
+
+        available = np.zeros(base.shape, dtype=bool)
+        for signal in prepared:
+            available |= np.isfinite(signal)
+        result_mask = base & available
+        if target is not None:
+            result_mask &= np.isfinite(target)
+        return TransformResult(tuple(prepared), target, result_mask, tuple(diagnostics))
+
+
+def combine_available_signals(signals: tuple[np.ndarray, ...] | list[np.ndarray], weights: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Combine only available factors and renormalize their absolute weight.
+
+    Renormalization prevents a temporarily missing factor from mechanically
+    shrinking an observation's score.  If every non-zero-weight factor is
+    unavailable, the combined signal is unavailable as well.
+    """
+
+    if not signals:
+        raise ValueError("at least one transformed signal is required")
+    values = np.stack(signals, axis=-1)
+    weights = np.asarray(weights, dtype=float)
+    if values.shape[-1] != len(weights):
+        raise ValueError("signal and weight counts differ")
+    finite = np.isfinite(values)
+    absolute = np.abs(weights)
+    active_weight = np.sum(finite * absolute[None, None, :], axis=-1)
+    total_weight = float(absolute.sum())
+    combined = np.sum(np.where(finite, values, 0.0) * weights[None, None, :], axis=-1)
+    available = active_weight > 1e-15
+    if total_weight > 1e-15:
+        combined[available] *= total_weight / active_weight[available]
+    else:
+        available[:] = False
+    combined[~available] = np.nan
+    return combined, available

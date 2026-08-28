@@ -43,6 +43,8 @@ def test_cross_method_report_generation_with_paired_outputs(tmp_path: Path) -> N
     assert result["paired_comparisons"] == 1
     assert (experiment / "search_efficiency.parquet").exists()
     assert (experiment / "paired_comparisons.csv").exists()
+    portfolio_columns = set(pd.read_parquet(experiment / "portfolio_results.parquet").columns)
+    assert {"missing_held_return_days", "held_return_weight_coverage", "maximum_missing_held_return_weight"} <= portfolio_columns
     assert "Paired comparisons" in (experiment / "report.md").read_text(encoding="utf-8")
 
 

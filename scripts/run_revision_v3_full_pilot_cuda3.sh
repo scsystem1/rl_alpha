@@ -3,7 +3,7 @@ set -euo pipefail
 
 experiment_id="${1:-revision_v3_full_pilot_cuda3_20260811}"
 config="configs/experiment/revision_v3_full_pilot_cuda3.yaml"
-run_root="artifacts/runs_v3/${experiment_id}"
+run_root="/data/sunyuxiang/rl_alpha/runs/${experiment_id}"
 
 mkdir -p "${run_root}"
 exec > >(tee -a "${run_root}/launcher.log") 2>&1

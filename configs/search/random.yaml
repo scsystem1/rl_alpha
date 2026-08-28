@@ -1,2 +1,1 @@
-search: {method: random, group_size: 8, budget: 5000, max_depth: 6, max_nodes: 21}
-
+search: {method: random, group_size: 8, budget: 5000, max_depth: 6, max_nodes: 21, replacement_top_k: 3, admission_recheck_top_k: 3}

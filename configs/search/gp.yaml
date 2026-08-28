@@ -14,3 +14,5 @@ search:
   p_point_mutation: 0.1960784314
   p_reproduction: 0.0
   p_point_replace: 0.60
+  replacement_top_k: 3
+  admission_recheck_top_k: 3

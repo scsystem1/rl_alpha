@@ -12,7 +12,7 @@ from rlalpha.dsl.parser import parse_expression
 
 @pytest.mark.real_data
 def test_real_data_small_interval_dsl_smoke():
-    root = Path(os.getenv("RLALPHA_ACCEPTANCE_PROCESSED_ROOT", Path(__file__).parents[2] / "artifacts/processed_v3"))
+    root = Path(os.getenv("RLALPHA_ACCEPTANCE_PROCESSED_ROOT", "/data/sunyuxiang/rl_alpha/processed"))
     if not (root / "panel/index.json").exists():
         pytest.skip("revision-v3 acceptance panel is unavailable")
     panel = PanelStore(root).load_split("validation", history=30, start="2019-01-02", end="2019-03-29")

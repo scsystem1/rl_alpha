@@ -1,0 +1,35 @@
+paths:
+  code_root: /home/sunyuxiang/rl_alpha/ours
+  raw_data_root: /data/sunyuxiang/rl_alpha
+  processed_root: /data/sunyuxiang/rl_alpha/processed
+  cache_root: /data/sunyuxiang/rl_alpha/cache
+  runs_root: /data/sunyuxiang/rl_alpha/runs
+  model_search_root: /data/shared/huggingface
+  alphagen_root: /home/sunyuxiang/rl_alpha/alphagen
+  quantevolver_root: /home/sunyuxiang/rl_alpha/QuantEvolver
+experiment:
+  methods: [random, gp, base_llm, grpo_llm]
+  rewards: [r1, r0, r2_lcb]
+  seeds: [0]
+  valid_unique_budget: 1000
+  proposal_group_size: 8
+  pool_capacity: 20
+  max_cpu_jobs: 2
+  cpu_threads_per_job: 8
+  max_total_cpu_threads: 90
+  grpo_ray_cpus: 8
+  # Full-panel candidate threads contend for memory bandwidth on this host.
+  # Exact support grouping and prepared-state reuse provide the speedup; keep
+  # one outer worker and retain Numba's efficient day-level parallelism.
+  grpo_reward_candidate_workers: 1
+  grpo_object_store_gib: 8
+  # Four methods run together inside one reward phase. Base-LLM rotates over
+  # CUDA 2 -> 1 -> 4 for R1 -> R0 -> R2, with fallbacks if a preferred card
+  # is temporarily unavailable. GRPO uses the only card with enough current
+  # headroom for colocated FSDP + vLLM.
+  gpu_devices:
+    base_llm: [1, 2, 4]
+    grpo_llm: [3]
+  gpu_min_free_mib: {1: 12000, 2: 13000, 3: 26000, 4: 11000}
+  gpu_memory_utilization: {1: 0.20, 2: 0.12, 3: 0.15, 4: 0.20}
+  auto_start_expensive_jobs: true

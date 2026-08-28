@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from ..config import load_paths, load_yaml
@@ -40,7 +41,7 @@ def _record_round(
     normalized = [item.to_dict() if hasattr(item, "to_dict") else dict(item) for item in records]
     selected_hash = admission.get("candidate_hash")
     selected_expression = next((str(item.get("expression")) for item in normalized if item.get("expr_hash") == selected_hash), None)
-    score = pool._score(pool.entries)
+    score = pool.score
     fields = {
         "round": round_number,
         "generated": len(normalized),
@@ -69,7 +70,11 @@ def _record_round(
 
 
 def _snapshot_record(pool: PoolManager, validation_score: dict[str, Any], valid_unique_evaluations: int, searcher: object) -> dict[str, Any]:
-    train_score = asdict(pool._score(pool.entries))
+    prepared = pool.prepared_state()
+    train_score = asdict(pool.score)
+    support_diagnostics = getattr(pool.objective, "support_diagnostics", None)
+    if prepared is not None and callable(support_diagnostics):
+        train_score["support"] = support_diagnostics(prepared)
     state = searcher.state_dict()
     factors = []
     for index, entry in enumerate(pool.entries):
@@ -130,7 +135,7 @@ def _write_lineage(run_dir: Path, coordinator: SearchCoordinator, snapshots: lis
     pd.DataFrame(proposal_rows).to_parquet(lineage_root / "proposals.parquet", index=False)
     admission_rows = [{"experiment_id": experiment_id, "cell_id": f"{method}/{reward}/seed_{seed}", **item} for item in coordinator.pool.history]
     pd.DataFrame(admission_rows).to_parquet(lineage_root / "admission_events.parquet", index=False)
-    snapshot_rows = [{**{key: item.get(key) for key in ("snapshot_id", "pool_version", "pool_snapshot_hash", "valid_unique_evaluations", "stage", "group", "optimizer_update", "checkpoint")}, "expressions_json": json.dumps(item.get("expressions", [])), "factors_json": json.dumps(item.get("factors", []), sort_keys=True), "train_objective": item.get("train", {}).get("objective"), "validation_objective": item.get("validation", {}).get("objective")} for item in snapshots]
+    snapshot_rows = [{**{key: item.get(key) for key in ("snapshot_id", "pool_version", "pool_snapshot_hash", "valid_unique_evaluations", "stage", "group", "optimizer_update", "checkpoint")}, "expressions_json": json.dumps(item.get("expressions", [])), "factors_json": json.dumps(item.get("factors", []), sort_keys=True), "train_objective": item.get("train", {}).get("objective"), "validation_objective": item.get("validation", {}).get("objective"), "train_valid_days": item.get("train", {}).get("support", {}).get("valid_days"), "train_observation_rate": item.get("train", {}).get("support", {}).get("observation_rate"), "validation_valid_days": item.get("validation", {}).get("support", {}).get("valid_days"), "validation_observation_rate": item.get("validation", {}).get("support", {}).get("observation_rate")} for item in snapshots]
     pd.DataFrame(snapshot_rows).to_parquet(lineage_root / "pool_snapshots.parquet", index=False)
     final_pool_id = f"final_pool_{stable_hash({'experiment_id': experiment_id, 'cell': f'{method}/{reward}/seed_{seed}', 'snapshot_id': selected.get('snapshot_id')})[:20]}"
     admission_by_factor = {item.get("candidate_hash"): item for item in coordinator.pool.history if item.get("admitted")}
@@ -155,7 +160,7 @@ def _write_lineage(run_dir: Path, coordinator: SearchCoordinator, snapshots: lis
             "group": selected.get("group"),
             "optimizer_update": selected.get("optimizer_update"),
             "checkpoint": selected.get("checkpoint"),
-            "selection_rule": "maximum predeclared validation objective; tie smaller pool then earlier pool version",
+            "selection_rule": "support-qualified maximum predeclared validation objective; tie smaller pool then earlier pool version",
         },
         "factors": final_factors,
     }
@@ -164,16 +169,29 @@ def _write_lineage(run_dir: Path, coordinator: SearchCoordinator, snapshots: lis
     return final
 
 
-def objective_for(reward: str, panel: SplitPanel):
+def objective_for(reward: str, panel: SplitPanel, reward_config: dict[str, Any] | None = None):
+    reward_config = reward_config or {}
     label = panel.target(panel.label)
     mask = panel.target(panel.common_mask) & pd.notna(label)
+    support = {
+        "min_pool_valid_day_rate": float(reward_config.get("min_pool_valid_day_rate", 0.80)),
+        "min_pool_observation_rate": float(reward_config.get("min_pool_observation_rate", 0.80)),
+        "min_pool_valid_days": int(reward_config.get("min_pool_valid_days", 252)),
+    }
     if reward == "r0":
-        return R0Objective(label, mask)
+        return R0Objective(label, mask, **support)
     exposures = panel.target(panel.exposures)
     if reward == "r1":
-        return R1Objective(label, mask, exposures)
+        return R1Objective(label, mask, exposures, **support)
     if reward == "r2_lcb":
-        return R2LCBObjective(label, mask, exposures, hac_lag=20)
+        return R2LCBObjective(
+            label,
+            mask,
+            exposures,
+            hac_lag=int(reward_config.get("hac_lag", 20)),
+            critical_value=float(reward_config.get("critical_value", 1.645)),
+            **support,
+        )
     raise ValueError(f"unknown reward {reward}")
 
 
@@ -202,16 +220,48 @@ def searcher_for(method: str, seed: int, config: dict[str, Any], alphagen_root: 
         return BaseLLMSearcher.from_config(seed, config)
     if method == "grpo_llm":
         raise RuntimeError(
-            "formal GRPO is stage-driven and cannot use the per-group Searcher interface; "
+            "formal GRPO is cell-persistent and cannot use the per-group Searcher interface; "
             "call run_search(), which dispatches VerlGRPOStageCoordinator"
         )
     raise ValueError(f"unknown method {method}")
 
 
-def _score_validation(expressions: list[str], panel: SplitPanel, reward: str) -> dict[str, Any]:
-    signals = [panel.evaluate(parse_expression(expression)) for expression in expressions]
-    score = objective_for(reward, panel).score_pool(signals)
-    return {"objective": score.objective, "mean_ic": score.mean_ic, "standard_error": score.standard_error, "weights": list(score.weights), "daily_ic": list(score.daily_ic)}
+def _score_validation(
+    expressions: list[str],
+    panel: SplitPanel,
+    reward: str,
+    signal_cache: dict[str, Any] | None = None,
+    reward_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    signal_cache = {} if signal_cache is None else signal_cache
+    signals = []
+    for expression in expressions:
+        if expression not in signal_cache:
+            signal_cache[expression] = panel.evaluate(parse_expression(expression))
+        signals.append(signal_cache[expression])
+    objective = objective_for(reward, panel, reward_config)
+    state = objective.prepare_pool(signals)
+    score = state.score
+    return {"objective": score.objective, "mean_ic": score.mean_ic, "standard_error": score.standard_error, "weights": list(score.weights), "daily_ic": list(score.daily_ic), "support": objective.support_diagnostics(state)}
+
+
+def _select_snapshot(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
+    eligible = [
+        item for item in snapshots
+        if bool(item.get("train", {}).get("support", {}).get("valid"))
+        and bool(item.get("validation", {}).get("support", {}).get("valid"))
+        and np.isfinite(float(item.get("validation", {}).get("objective", float("nan"))))
+    ]
+    if snapshots and not eligible:
+        raise RuntimeError("no pool snapshot satisfies train/validation support requirements")
+    return max(
+        eligible,
+        key=lambda item: (
+            item["validation"]["objective"],
+            -len(item["expressions"]),
+            -item["pool_version"],
+        ),
+    ) if eligible else {"pool_version": 0, "expressions": [], "factors": [], "train": {}, "validation": {}}
 
 
 def run_search(config_path: str | Path, method: str, reward: str, seed: int, budget: int, experiment_id: str, resume: bool = True) -> dict[str, Any]:
@@ -224,6 +274,10 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, bud
     evaluation_config = load_yaml(paths.code_root / "configs/eval/preliminary.yaml").get("evaluation", {})
     merged_config = {**method_config, **model_config, "method": method, "reward": reward, "seed": seed, "budget": budget}
     run_dir = paths.runs_root / experiment_id / method / reward / f"seed_{seed}"
+    if not resume and run_dir.exists() and any(run_dir.iterdir()):
+        raise RuntimeError(
+            f"--no-resume refuses non-empty cell directory {run_dir}; use a new experiment ID or an empty directory"
+        )
     run_dir.mkdir(parents=True, exist_ok=True)
     append_event(run_dir / "experiment.log", "search_started", experiment_id=experiment_id, method=method, reward=reward, seed=seed, budget=budget, resume=resume)
     update_progress(run_dir / "progress.json", status="initializing", method=method, reward=reward, seed=seed, budget=budget)
@@ -268,8 +322,14 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, bud
     store = PanelStore(paths.processed_root)
     train = store.load_split("train")
     validation = store.load_split("validation")
-    objective = objective_for(reward, train)
-    pool = PoolManager(objective, capacity=int(raw_config.get("experiment", {}).get("pool_capacity", 20)))
+    reward_options = dict(reward_config.get("reward", {}))
+    objective = objective_for(reward, train, reward_options)
+    pool = PoolManager(
+        objective,
+        capacity=int(raw_config.get("experiment", {}).get("pool_capacity", 20)),
+        replacement_top_k=int(method_config.get("replacement_top_k", 3)),
+        admission_recheck_top_k=int(method_config.get("admission_recheck_top_k", 3)),
+    )
     if method == "grpo_llm":
         from .grpo.stage_coordinator import VerlGRPOStageCoordinator
 
@@ -293,27 +353,37 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, bud
     if resume and checkpoint.exists():
         coordinator.load_checkpoint()
         coordinator.ledger.limit = budget
-    snapshots_path = run_dir / "checkpoints/snapshots.json"
-    snapshots = []
+    snapshots_path = run_dir / "checkpoints/snapshots.jsonl"
+    snapshots: list[dict[str, Any]] = []
     if snapshots_path.exists():
-        import json
+        snapshots = [json.loads(line) for line in snapshots_path.read_text(encoding="utf-8").splitlines()]
+    validation_signal_cache: dict[str, Any] = {}
 
-        snapshots = json.loads(snapshots_path.read_text(encoding="utf-8"))
+    def append_snapshot(snapshot: dict[str, Any]) -> None:
+        snapshots_path.parent.mkdir(parents=True, exist_ok=True)
+        with snapshots_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(snapshot, sort_keys=True, default=str) + "\n")
+            handle.flush()
     started = time.monotonic()
     group_size = int(raw_config.get("experiment", {}).get("proposal_group_size", 8))
     if method in {"random", "gp", "base_llm", "grpo_llm"} and group_size != 8:
         raise ValueError(f"{method} fairness protocol requires proposal_group_size=8, got {group_size}")
     if method == "grpo_llm":
-        while not coordinator.ledger.exhausted:
-            records_before = len(coordinator.records)
-            result = coordinator.run_stage()
-            _record_round(run_dir, method, int(result["stage"]) + 1, coordinator.records[records_before:], result["admission"], coordinator, pool)
-            expressions = [entry.expression for entry in pool.entries]
-            validation_score = _score_validation(expressions, validation, reward)
-            snapshot = _snapshot_record(pool, validation_score, coordinator.ledger.valid_unique_evaluations, searcher)
-            snapshots.append(snapshot)
-            write_json(snapshots_path, snapshots)
-            coordinator.record_validation_event(snapshot["snapshot_id"], validation_score["objective"])
+        cell_result = coordinator.run_cell()
+        for snapshot in cell_result["pool_snapshots"]:
+            validation_score = _score_validation(
+                list(snapshot["expressions"]), validation, reward, validation_signal_cache, reward_options
+            )
+            completed = {**snapshot, "validation": validation_score}
+            snapshots.append(completed)
+            append_snapshot(completed)
+        append_event(
+            run_dir / "experiment.log",
+            "persistent_grpo_complete",
+            optimizer_updates=coordinator.updates,
+            ray_initializations=1,
+            checkpoint=cell_result["checkpoint"],
+        )
     else:
         last_version = pool.version
         while not coordinator.ledger.exhausted:
@@ -323,28 +393,30 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, bud
             _record_round(run_dir, method, int(coordinator.group_index), outcomes, admission, coordinator, pool)
             if pool.version != last_version:
                 expressions = [entry.expression for entry in pool.entries]
-                validation_score = _score_validation(expressions, validation, reward)
+                validation_score = _score_validation(expressions, validation, reward, validation_signal_cache, reward_options)
                 snapshot = _snapshot_record(pool, validation_score, coordinator.ledger.valid_unique_evaluations, searcher)
                 snapshots.append(snapshot)
-                write_json(snapshots_path, snapshots)
+                append_snapshot(snapshot)
                 last_version = pool.version
         previous_version = pool.version
         if int(getattr(searcher, "admission_group_interval", 1)) == 1:
             coordinator.flush_admission()
         if pool.version != previous_version:
             expressions = [entry.expression for entry in pool.entries]
-            snapshots.append(_snapshot_record(pool, _score_validation(expressions, validation, reward), coordinator.ledger.valid_unique_evaluations, searcher))
-            write_json(snapshots_path, snapshots)
+            snapshot = _snapshot_record(pool, _score_validation(expressions, validation, reward, validation_signal_cache, reward_options), coordinator.ledger.valid_unique_evaluations, searcher)
+            snapshots.append(snapshot)
+            append_snapshot(snapshot)
     coordinator.save_checkpoint()
     pd.DataFrame(coordinator.records).to_parquet(run_dir / "candidates.parquet", index=False)
-    selected = max(snapshots, key=lambda item: (item["validation"]["objective"], -len(item["expressions"]), -item["pool_version"])) if snapshots else {"pool_version": 0, "expressions": [], "factors": [], "train": {}, "validation": {}}
+    pd.DataFrame(snapshots).to_parquet(run_dir / "checkpoints/snapshots.parquet", index=False)
+    selected = _select_snapshot(snapshots)
     selected = _write_lineage(run_dir, coordinator, snapshots, selected, method, reward, seed, experiment_id)
     write_json(run_dir / "final_pool.json", selected)
     train_metrics = {**coordinator.ledger.state_dict(), "pool_size": len(pool.entries), "pool_version": pool.version, "wall_seconds": time.monotonic() - started}
     write_json(run_dir / "train_metrics.json", train_metrics)
     write_json(run_dir / "validation_metrics.json", selected.get("validation", {}))
     prompt = prompt_contract() if method in {"base_llm", "grpo_llm"} else None
-    manifest = build_manifest(paths, list(discover_data_files(paths.raw_data_root).values()), effective_config=effective_config, model_config=model_config.get("model") if model_config else None, prompt=prompt, reward_version=f"{reward}:joint-complete-case-v2", evaluator_version=EVALUATOR_SEMANTICS_VERSION)
+    manifest = build_manifest(paths, list(discover_data_files(paths.raw_data_root).values()), effective_config=effective_config, model_config=model_config.get("model") if model_config else None, prompt=prompt, reward_version=f"{reward}:independent-availability-same-support-admission-v4", evaluator_version=EVALUATOR_SEMANTICS_VERSION)
     manifest.update({"experiment_id": experiment_id, "method": method, "reward": reward, "seed": seed, "budget": coordinator.ledger.state_dict(), "model": model_config.get("model") if model_config else None, "splits": {name: {"start": str(split.start.date()), "end": str(split.end.date())} for name, split in __import__("rlalpha.data.splits", fromlist=["SPLITS"]).SPLITS.items()}, "conventions": {"label": "20 trading-day next-close total return", "signal": "formed after t close", "execution": "next trading-day close", "pnl_start": "trading day after execution"}})
     manifest.pop("manifest_hash", None)
     manifest["manifest_hash"] = stable_hash(manifest)

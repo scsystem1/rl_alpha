@@ -1,45 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import math
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 
 from rlalpha.search.grpo.verl_config import assert_grpo_loss_controls, build_verl_grpo_config
-from rlalpha.search.grpo.verl_reward_adapter import VerlRLAlphaRewardBridge
 from rlalpha.search.grpo import verl_reward_function
 from rlalpha.search.grpo.verl_trainer import _install_torch_padding_fallback
 from rlalpha.utils.hashing import stable_hash
 
 
-def test_verl_reward_adapter_places_finite_rewards_and_preserves_frozen_state(tmp_path):
-    torch = pytest.importorskip("torch")
-
-    class Tokenizer:
-        def decode(self, ids, skip_special_tokens=True):
-            return " ".join(map(str, ids))
-
-    state = {"hash": "pool-v3"}
-    seen = []
-
-    def score(texts, info):
-        seen.extend(texts)
-        return [{"valid": True, "reason_code": "ok", "shaped_reward": 0.5}, {"valid": False, "reason_code": "bad", "shaped_reward": float("nan")}]
-
-    data = SimpleNamespace(
-        batch={"responses": torch.tensor([[4, 5, 0], [7, 0, 0]]), "response_mask": torch.tensor([[1, 1, 0], [1, 0, 0]])},
-        non_tensor_batch={"extra_info": np.asarray([{"pool_version": 3}, {"pool_version": 3}], dtype=object)},
-    )
-    bridge = VerlRLAlphaRewardBridge(Tokenizer(), score, lambda: state["hash"], archive_path=tmp_path / "archive.jsonl")
-    result = bridge(data, return_dict=True)
-    assert torch.equal(result["reward_tensor"], torch.tensor([[0.0, 0.5, 0.0], [-1.0, 0.0, 0.0]]))
-    assert result["reward_extra_info"]["reason_code"] == ["ok", "non_finite_reward"]
-    assert len((tmp_path / "archive.jsonl").read_text().splitlines()) == 2
-    assert seen == ["4 5", "7"]
-
-
-def test_verl_config_consumes_ratio_clip_reference_kl_and_qwen_padding(tmp_path):
+def test_verl_config_consumes_ratio_clip_reference_kl_and_qwen_padding(tmp_path, monkeypatch):
+    monkeypatch.setenv("RLALPHA_GRPO_MICROBATCH", "4")
     pytest.importorskip("omegaconf")
     root = tmp_path / "qe"
     (root / "configs").mkdir(parents=True)
@@ -69,6 +42,13 @@ def test_verl_config_consumes_ratio_clip_reference_kl_and_qwen_padding(tmp_path)
     assert config.actor_rollout_ref.rollout.load_format == "safetensors"
     assert config.data.train_batch_size == 1
     assert config.actor_rollout_ref.actor.ppo_mini_batch_size == 1
+    assert config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu == 4
+    assert config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu == 4
+    assert config.trainer.save_freq == 50
+    assert config.trainer.max_actor_ckpt_to_keep == 2
+    assert config.actor_rollout_ref.actor.checkpoint.save_lora_only is True
+    assert config.ray_kwargs.ray_init.num_cpus == 8
+    assert config.ray_kwargs.ray_init.object_store_memory == 8 * 1024**3
     config.actor_rollout_ref.actor.ppo_epochs = 1
     with pytest.raises(ValueError, match="rollout reuse"):
         assert_grpo_loss_controls(config)
@@ -161,8 +141,12 @@ def test_installed_verl_loss_graph_consumes_clip_and_reference_kl(monkeypatch):
     assert with_kl.item() > without_kl.item()
 
 
-def test_current_verl_reward_batch_is_frozen_and_marks_all_stage_duplicates(monkeypatch, tmp_path):
+def test_current_verl_reward_batch_reuses_intra_group_duplicates(monkeypatch, tmp_path):
     rng = np.random.default_rng(17)
+    verl_reward_function._PANELS.clear()
+    verl_reward_function._SIGNALS.clear()
+    verl_reward_function._OBJECTIVES.clear()
+    verl_reward_function._POOLS.clear()
 
     class Panel:
         label = rng.normal(size=(300, 120))
@@ -190,18 +174,25 @@ def test_current_verl_reward_batch_is_frozen_and_marks_all_stage_duplicates(monk
     monkeypatch.setattr(verl_reward_function, "PanelStore", Store)
     archive = tmp_path / "rollouts.jsonl"
     spec_payload = {
-        "schema_version": 1,
+        "schema_version": 4,
+        "reward_pool_semantics": "independent-availability-same-support-admission-v4",
         "stage": 0,
         "expected_samples": 3,
         "remaining_budget": 10,
         "invalid_penalty": -1.0,
         "reward": "r0",
+        "reward_config": {
+            "min_pool_valid_day_rate": 0.80,
+            "min_pool_observation_rate": 0.80,
+            "min_pool_valid_days": 252,
+        },
         "processed_root": "/processed",
         "train_start": None,
         "train_end": None,
         "pool_version": 0,
         "pool_capacity": 20,
         "min_delta": 1e-5,
+        "candidate_workers": 3,
         "pool_objective": 0.0,
         "pool_weights": [],
         "pool": [],
@@ -232,12 +223,58 @@ def test_current_verl_reward_batch_is_frozen_and_marks_all_stage_duplicates(monk
     records = verl_reward_function._score_batch_sync(
         [request("<expr>CSRank($return)</expr>", 0), request("<expr>CSRank($return)</expr>", 0), request("<expr>Mean($return,5)</expr>", 1)]
     )
-    assert [item["reason_code"] for item in records[:2]] == ["stage_duplicate", "stage_duplicate"]
+    assert records[0]["market_evaluated"]
+    assert records[1]["reason_code"] == "intra_group_duplicate_reused"
+    assert not records[1]["market_evaluated"]
+    assert records[0]["shaped_reward"] == records[1]["shaped_reward"]
     assert records[2]["market_evaluated"]
     assert len(archive.read_text(encoding="utf-8").splitlines()) == 3
+
+    cached_pool = next(iter(verl_reward_function._POOLS.values()))
+    cached_state = cached_pool.prepared_state()
+    verl_reward_function._score_batch_sync(
+        [request("<expr>CSRank($return)</expr>", 0), request("<expr>CSRank($return)</expr>", 0), request("<expr>Mean($return,5)</expr>", 1)]
+    )
+    assert next(iter(verl_reward_function._POOLS.values())) is cached_pool
+    assert cached_pool.prepared_state() is cached_state
 
     validation_requests = [request("<expr>CSRank($return)</expr>", group) for group in range(3)]
     for item in validation_requests:
         item["extra_info"]["split"] = "validation"
     with pytest.raises(RuntimeError, match="train split"):
         verl_reward_function._score_batch_sync(validation_requests)
+
+
+def test_verl_reward_transport_excludes_variable_length_diagnostics(monkeypatch):
+    # Verl concatenates one non-tensor reward dictionary from every agent
+    # worker. Variable-length diagnostics must stay in the durable archive;
+    # only the fixed-shape scalar score belongs in the training batch.
+    verl_reward_function._BATCHES.clear()
+    verl_reward_function._LOCKS.clear()
+
+    def score_batch(requests):
+        lengths = (21, 0, 7)
+        return [
+            {"shaped_reward": 0.25, "saliency": list(range(lengths[index]))}
+            for index in range(len(requests))
+        ]
+
+    monkeypatch.setattr(verl_reward_function, "_score_batch_sync", score_batch)
+
+    async def score_online_batch():
+        tasks = [
+            verl_reward_function.compute_score(
+                data_source="rlalpha/grpo/train",
+                solution_str=f"candidate-{index}",
+                ground_truth=None,
+                extra_info={"frozen_state_hash": "batch", "expected_stage_samples": 3},
+            )
+            for index in range(3)
+        ]
+        return await asyncio.wait_for(
+            asyncio.gather(*tasks),
+            timeout=5,
+        )
+
+    transported = asyncio.run(score_online_batch())
+    assert transported == [{"score": 0.25}] * 3
