@@ -128,7 +128,7 @@ def _load_spec(requests: list[dict[str, Any]]) -> dict[str, Any]:
     if stable_hash(hash_payload) != expected_hash:
         raise RuntimeError("frozen GRPO stage spec hash mismatch")
     spec["spec_hash"] = expected_hash
-    if spec.get("schema_version") != 5 or spec.get("reward_pool_semantics") != "fixed-universe-zero-fill-psd-gram-v5":
+    if spec.get("schema_version") != 6 or spec.get("reward_pool_semantics") != "fixed-universe-zero-fill-psd-gram-v6":
         raise RuntimeError("GRPO stage spec uses incompatible reward/pool semantics")
     if len(requests) != int(spec["expected_samples"]):
         raise RuntimeError("reward batch size does not match the frozen stage spec")

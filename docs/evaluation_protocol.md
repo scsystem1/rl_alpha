@@ -6,43 +6,49 @@ only. Test data may be opened per method after that method has a complete,
 correct-budget state, accepted artifacts, an exact current cell identity, and
 compatible panel/evaluator fingerprints.
 
-## Per-cell complete-case support
+## Fixed trade and metric support
 
 Before loading test, evaluation enumerates only the requested method cells.
-Each cell then freezes two masks from its own final pool:
+For every split it defines two factor-independent masks:
 
-- Cell fit: train + validation membership, explicit trade eligibility,
-  complete Balanced-22 exposure, finite label, and finite values for every
-  frozen expression.
-- Cell test trade: test membership, trade eligibility, complete exposure,
-  and finite values for every frozen expression. It deliberately excludes the
-  test label so portfolio formation cannot use label availability.
-- RNIC sample: cell test trade intersected with the finite test label. Every
-  signal and the label are projected on this exact same daily sample.
+- `trade_mask = membership & eligibility & finite(exposures)`. This mask is
+  label-free and does not require any frozen expression to be finite.
+- `metric_mask = trade_mask & finite(label)`, after the daily label transform.
 
-Metrics record valid days and observations for fit, test IC, and test trading.
-Different final pools may therefore have different sample sizes; those counts
-are descriptive and never block evaluation of another method.
+Each factor is transformed on its own finite subset of `trade_mask`. Missing
+transformed values are zero opinions when fitting moments or computing RNIC;
+they never shrink `metric_mask`. Portfolio formation uses the label-free
+deployment composite and excludes only names for which every nonzero-weight
+factor is unavailable. Primary RNIC retains those names as zero opinions. No
+secondary available-case RNIC is emitted.
+
+Metrics record fixed-universe fit/RNIC observations separately from executable
+portfolio observations. Counts are descriptive and never block another method.
 
 ## One fit/OOS transform
 
 `FactorTransformPipeline` is serialized into `combiner.json`. The order is:
 
-1. On each date, use the frozen common mask and intersect all factor values,
-   the label when evaluating IC, and all exposure columns.
-2. Winsorize each signal cross-section at 1%/99%, then cross-sectionally
-   z-score. These are explicitly per-date operations; there are no global
-   moments to re-estimate on test.
-3. Residualize every signal and the label jointly against the same Balanced-22
-   design and the same complete-case sample. Portfolio signal residualization
-   uses the label-free trade sample.
-4. Cross-sectionally z-score residuals once.
-5. Fit ridge-combination weights only on transformed train + validation. The
-   same frozen weights and pipeline are applied out of sample.
+1. On each date, independently winsorize every factor at 1%/99% and z-score it
+   on its own finite `trade_mask` support.
+2. For neutralized transforms, residualize each factor on that same label-free
+   support and apply a z-score only (without a second winsorization).
+3. Zero-fill the transformed factors on `metric_mask`. Standardize the label
+   once on `metric_mask`; for R1/R2, project every zero-filled factor column and
+   the label through the same Balanced-22 design. Search-time R0 keeps its
+   reward objective non-neutralized; final primary RNIC remains neutralized for
+   every selected pool.
+4. Estimate the day-equal PSD Gram and factor/label cross moment, then solve the
+   positive ridge system by Cholesky/solve. Pairwise-deletion correlations and
+   pseudoinverse fallback are not used.
+5. Apply the one frozen weight vector as `sum_j w_j z_j`, with no asset-wise
+   active-weight renormalization. The same pipeline and weights are applied out
+   of sample.
 
 Daily projection diagnostics retain observation count, design rank, condition
-number, status, and maximum residual exposure. Insufficient/singular dates
-remain missing rather than returning a plausible zero.
+number, status, and maximum residual exposure. Insufficient metric dates remain
+missing; an all-zero fixed-universe composite on an otherwise valid date has
+exactly zero IC rather than silently removing the date.
 
 ## Final factor statistics
 

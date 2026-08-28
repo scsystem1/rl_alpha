@@ -9,9 +9,12 @@ from .calculator import FactorCalculator
 from ..risk.neutralize import RiskNeutralizer
 
 
+FIXED_UNIVERSE_TRANSFORM_VERSION = "daily-cs-fixed-universe-zero-fill-v3"
+
+
 @dataclass(frozen=True)
 class TransformConfig:
-    version: str = "daily-cs-joint-mask-v1"
+    version: str = "daily-cs-joint-mask-v2"
     neutralize: bool = True
     post_residual_standardize: bool = True
 
@@ -98,8 +101,6 @@ def prepare_fixed_universe_inputs(
             })
         objective = residual_factors
         target = residual_target
-        # Keep every day equally scaled in the Gram/cross-moment average.
-        target = FactorCalculator(target, metric & np.isfinite(target)).standardize(target)
         metric &= np.isfinite(target)
 
     for factor in objective:
@@ -182,12 +183,12 @@ class FactorTransformPipeline:
                 diagnostics.append({**day_diagnostics[-1], "status": "ok", "joint_columns": len(columns)})
             prepared = residual_signals
             target = residual_target
-        if self.config.post_residual_standardize:
+        if self.config.neutralize and self.config.post_residual_standardize:
             post_label = np.zeros(common.shape) if target is None else target
             post = FactorCalculator(post_label, common)
-            prepared = [post.standardize(signal) for signal in prepared]
+            prepared = [post.zscore(signal) for signal in prepared]
             if target is not None:
-                target = post.standardize(target)
+                target = post.zscore(target)
             for signal in prepared:
                 common &= np.isfinite(signal)
             if target is not None:
@@ -253,7 +254,12 @@ class IndependentFactorTransformPipeline(FactorTransformPipeline):
     """
 
     def __init__(self, config: TransformConfig | None = None):
-        super().__init__(config or TransformConfig(version="daily-cs-fixed-universe-zero-fill-v2"))
+        resolved = config or TransformConfig(version=FIXED_UNIVERSE_TRANSFORM_VERSION)
+        if resolved.version != FIXED_UNIVERSE_TRANSFORM_VERSION:
+            raise ValueError(
+                "transform uses incompatible support semantics; refit the combiner"
+            )
+        super().__init__(resolved)
 
     @staticmethod
     def _standardize_one(values: np.ndarray, support: np.ndarray) -> np.ndarray:
@@ -305,9 +311,11 @@ class IndependentFactorTransformPipeline(FactorTransformPipeline):
                         })
             prepared = residual_signals
 
-        if self.config.post_residual_standardize:
+        if self.config.neutralize and self.config.post_residual_standardize:
             prepared = [
-                self._standardize_one(signal, base & np.isfinite(signal))
+                FactorCalculator(
+                    np.zeros(base.shape, dtype=float), base & np.isfinite(signal)
+                ).zscore(signal)
                 for signal in prepared
             ]
         availability = tuple(base & np.isfinite(signal) for signal in prepared)
@@ -345,16 +353,18 @@ def combine_fixed_signals(
         raise ValueError("weights must be one vector or a model-by-factor matrix")
     if values.shape[-1] != weights.shape[-1]:
         raise ValueError("signal and weight counts differ")
+    if not np.isfinite(weights).all():
+        raise ValueError("weights must be finite")
     finite = np.isfinite(values)
-    absolute = np.abs(weights)
+    nonzero = weights != 0.0
     zeroed = np.where(finite, values, 0.0)
     if weights.ndim == 1:
-        active_weight = np.sum(finite * absolute[None, None, :], axis=-1)
+        available = np.any(finite & nonzero[None, None, :], axis=-1)
         combined = np.sum(zeroed * weights[None, None, :], axis=-1)
     else:
-        active_weight = np.einsum(
-            "daf,kf->dak", finite.astype(float), absolute, optimize=True
-        )
+        available = np.einsum(
+            "daf,kf->dak", finite.astype(np.int32), nonzero.astype(np.int32),
+            optimize=True,
+        ) > 0
         combined = np.einsum("daf,kf->dak", zeroed, weights, optimize=True)
-    available = active_weight > 1e-15
     return combined, available

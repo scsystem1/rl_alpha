@@ -174,8 +174,8 @@ def test_current_verl_reward_batch_reuses_intra_group_duplicates(monkeypatch, tm
     monkeypatch.setattr(verl_reward_function, "PanelStore", Store)
     archive = tmp_path / "rollouts.jsonl"
     spec_payload = {
-        "schema_version": 4,
-        "reward_pool_semantics": "independent-availability-same-support-admission-v4",
+        "schema_version": 6,
+        "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v6",
         "stage": 0,
         "expected_samples": 3,
         "remaining_budget": 10,
@@ -243,6 +243,31 @@ def test_current_verl_reward_batch_reuses_intra_group_duplicates(monkeypatch, tm
         item["extra_info"]["split"] = "validation"
     with pytest.raises(RuntimeError, match="train split"):
         verl_reward_function._score_batch_sync(validation_requests)
+
+
+def test_old_grpo_stage_spec_is_rejected(tmp_path):
+    payload = {
+        "schema_version": 5,
+        "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v5",
+        "stage": 0,
+        "pool_version": 0,
+        "expected_samples": 1,
+    }
+    spec = {**payload, "spec_hash": stable_hash(payload)}
+    path = tmp_path / "legacy_stage_spec.json"
+    path.write_text(__import__("json").dumps(spec), encoding="utf-8")
+    request = {
+        "extra_info": {
+            "stage_spec_path": str(path),
+            "frozen_state_hash": spec["spec_hash"],
+            "split": "train",
+            "stage": 0,
+            "pool_version": 0,
+            "expected_stage_samples": 1,
+        }
+    }
+    with pytest.raises(RuntimeError, match="incompatible"):
+        verl_reward_function._load_spec([request])
 
 
 def test_verl_reward_transport_excludes_variable_length_diagnostics(monkeypatch):

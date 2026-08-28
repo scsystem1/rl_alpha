@@ -13,9 +13,9 @@ or resumed.
 | final CIZ/delisting policy, adjusted close/volume, label boundary | panel |
 | CCM stock-date interval and six-month/18-month accounting policy | risk panel |
 | same-window market residual volatility and audited Balanced-22 gates | risk panel |
-| joint signal/label RNIC sample and common complete-case pool reward | every search/pool |
+| fixed metric universe, zero-fill fixed weights, and PSD-Gram pool reward | every search/pool |
 | mean-absolute daily duplicate rule and non-finite penalty | every search/pool |
-| per-cell complete-case support and serialized transform | validation selection and final evaluation |
+| label-free deployment transform and fixed-universe primary RNIC | validation selection and final evaluation |
 | post-solve QP gate, missing-held-return invalidation, initial-wealth MDD | portfolio evaluation |
 | unified prompt hash and one-prompt/eight-answer protocol | Base-LLM and GRPO generation |
 | AlphaGen gplearn generation and frozen-pool-delta fitness | all GP results and checkpoints |

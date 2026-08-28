@@ -14,9 +14,11 @@ from ..dsl.parser import parse_expression
 from ..factors.calculator import FactorCalculator
 from ..factors.combiner import RidgeCombiner
 from ..factors.transform import (
+    FIXED_UNIVERSE_TRANSFORM_VERSION,
     IndependentFactorTransformPipeline,
     TransformConfig,
     combine_fixed_signals,
+    prepare_fixed_universe_inputs,
 )
 from ..utils.hashing import file_fingerprint, stable_hash
 from ..utils.io import write_json
@@ -254,7 +256,7 @@ def finalize_cell(
     expressions = list(selected.get("expressions", []))
     if not expressions:
         raise ValueError(f"selected pool is empty: {run_dir}")
-    input_hash = stable_hash({"schema_version": 10, "final_pool": file_fingerprint(final_pool_path), "panel": _panel_fingerprints(processed_root), "evaluation_code": _evaluation_code_fingerprints(), "evaluation_config": evaluation_config, "finalization_scope_hash": finalization_scope_hash, "support_policy": "fixed-universe-zero-fill-psd-gram-v5", "missing_return_policy": "zero-return-stale-value-v1"})
+    input_hash = stable_hash({"schema_version": 11, "final_pool": file_fingerprint(final_pool_path), "panel": _panel_fingerprints(processed_root), "evaluation_code": _evaluation_code_fingerprints(), "evaluation_config": evaluation_config, "finalization_scope_hash": finalization_scope_hash, "support_policy": "fixed-universe-zero-fill-psd-gram-v6", "missing_return_policy": "zero-return-stale-value-v1"})
     test_dir = run_dir / "test"
     test_dir.mkdir(parents=True, exist_ok=True)
     marker = test_dir / "finalization.json"
@@ -280,7 +282,7 @@ def finalize_cell(
         float(evaluation_config["ridge_lambda"]),
         IndependentFactorTransformPipeline(
             TransformConfig(
-                version="daily-cs-fixed-universe-zero-fill-v2",
+                version=FIXED_UNIVERSE_TRANSFORM_VERSION,
                 neutralize=True,
                 post_residual_standardize=True,
             )
@@ -300,11 +302,16 @@ def finalize_cell(
     test_exposures = test.target(test.exposures)
     test_signals = _signals(test, expressions)
     raw_label = test.target(test.label)
-    # Build the deployment composite without observing label availability,
-    # then introduce the fixed metric universe and joint projection.
-    combined_ic, transformed_label, ic_mask, ic_diagnostics = combiner.transform_metric_composite(
-        test_signals, raw_label, trade_mask, test_exposures
+    # Freeze the deployment composite exactly once without observing label
+    # availability. Portfolio and RNIC then consume that same frozen signal.
+    combined, portfolio_mask, portfolio_diagnostics = combiner.transform(
+        test_signals, trade_mask, test_exposures
     )
+    objective_composites, transformed_label, ic_mask, metric_diagnostics = prepare_fixed_universe_inputs(
+        (combined,), raw_label, trade_mask, test_exposures, neutralize=True
+    )
+    combined_ic = objective_composites[0]
+    ic_diagnostics = portfolio_diagnostics + metric_diagnostics
     combined_ic[~ic_mask] = np.nan
     pearson, rank = _daily_correlations(combined_ic, transformed_label, ic_mask)
     transformed_ic = combiner.pipeline.transform_ic(
@@ -312,9 +319,6 @@ def finalize_cell(
     )
     if transformed_ic.objective_signals is None:
         raise RuntimeError("IC transform did not produce objective factor signals")
-    combined, portfolio_mask, portfolio_diagnostics = combiner.transform(
-        test_signals, trade_mask, test_exposures
-    )
     raw_common = trade_mask & np.isfinite(raw_label)
     raw_prepared = [
         FactorCalculator(raw_label, trade_mask & np.isfinite(signal)).standardize(signal)
@@ -390,6 +394,7 @@ def finalize_cell(
     retention = abs(residual_mean) / abs(raw_mean) if np.isfinite(raw_mean) and abs(raw_mean) > 1e-12 else float("nan")
     metrics = {
         "input_hash": input_hash,
+        "evaluation_schema_version": 11,
         "pool_version": selected.get("pool_version"),
         "pool_size": len(expressions),
         "expressions": expressions,
@@ -399,8 +404,10 @@ def finalize_cell(
         "fit_valid_days": int(fit_transformed.metric_mask.any(axis=1).sum()) if fit_transformed.metric_mask is not None else 0,
         "test_ic_observations": int(ic_mask.sum()),
         "test_ic_valid_days": int(ic_mask.any(axis=1).sum()),
-        "test_trade_observations": int(portfolio_mask.sum()),
-        "test_trade_valid_days": int(portfolio_mask.any(axis=1).sum()),
+        "test_trade_observations": int(trade_mask.sum()),
+        "test_trade_valid_days": int(trade_mask.any(axis=1).sum()),
+        "test_portfolio_executable_observations": int(portfolio_mask.sum()),
+        "test_portfolio_executable_valid_days": int(portfolio_mask.any(axis=1).sum()),
         "average_pair_correlation": _average_pair_correlation(list(fit_transformed.signals)),
         "moment_diagnostics": combiner.moment_diagnostics_,
         "raw_ic_diagnostic": raw_summary,
@@ -411,6 +418,17 @@ def finalize_cell(
         "neutralization_retention": retention,
         "portfolios": portfolio_results,
         "evaluation_support_policy": "Factors are transformed independently on a label-free trade universe; missing transformed residuals are zero opinions; one fixed weight vector is applied without asset-wise renormalization; weights use a fixed-universe PSD Gram; primary RNIC jointly projects the deployment composite and label on the fixed metric universe.",
+        "evaluation_input_schema": {
+            "trade_mask": "membership & eligibility & finite(exposures); label- and factor-independent",
+            "metric_mask": "trade_mask & finite(transformed_label)",
+            "factor_null": "zero opinion for Gram, ridge composite, and primary RNIC",
+            "portfolio_executable_mask": "trade_mask & any finite factor with nonzero frozen weight",
+        },
+        "diagnostic_semantics": {
+            "test_trade_observations": "factor-independent label-free trade universe",
+            "test_ic_observations": "fixed primary RNIC metric universe",
+            "test_portfolio_executable_observations": "names eligible for portfolio selection after signal availability",
+        },
         "limitations": ["Historical borrow availability is unavailable; short eligibility assumes borrowability."],
         "neutralization_diagnostics": {
             "ic_days": len({item.get("date") for item in ic_diagnostics}),
@@ -472,7 +490,7 @@ def finalize_experiment(experiment_id: str, config: str | Path, methods: list[st
         cell = final_pool.parent
         key = str(cell.relative_to(root))
         try:
-            cell_scope_hash = stable_hash({"cell": key, "support": "fixed-universe-zero-fill-psd-gram-v5"})
+            cell_scope_hash = stable_hash({"cell": key, "support": "fixed-universe-zero-fill-psd-gram-v6"})
             results[key] = {"status": "complete", "metrics": finalize_cell(cell, paths.processed_root, finalization_scope_hash=cell_scope_hash, evaluation_config=evaluation_config)}
         except Exception as exc:
             results[key] = {"status": "failed", "error": str(exc)}

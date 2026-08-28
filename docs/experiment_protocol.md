@@ -35,11 +35,12 @@ must not be used to claim M0–M9 completion.
 - Test: may be opened independently for any requested method after that
   method's configured cells complete the correct budget and identities.
 
-Each cell uses its own final 20-factor complete-case train+validation fit
-support and label-free test trade support. Valid day/observation counts are
-reported for interpretation and do not block other methods. Detailed transforms,
-statistics, portfolio constraints, and missing-return behavior are in
-`docs/evaluation_protocol.md`.
+Each cell uses a factor-independent train+validation metric universe and a
+label-free test trade universe. Factor residual nulls are zero opinions for
+ridge/RNIC, so a sparse final expression cannot shrink the metric sample.
+Valid metric and executable portfolio counts are reported separately. Detailed
+transforms, statistics, portfolio constraints, and missing-return behavior are
+in `docs/evaluation_protocol.md`.
 
 ## Revision-v3 acceptance runs
 
@@ -61,7 +62,8 @@ Each cell identity covers the experiment/search/reward/data/evaluation/model
 configs, panel/risk/index strong hashes, repository commits and dirty patch
 hashes, and actual model files for LLM methods. Run identity additionally
 freezes the effective config and evaluator semantics. A checkpoint is readable
-only with a matching v3 semantics commit and checkpoint fingerprint. Matrix
+only with matching checkpoint schema 6, fixed-universe reward semantics, and
+checkpoint fingerprint. Matrix
 completion requires accepted train metrics, final pool, manifest, exact budget
 and current identity.
 

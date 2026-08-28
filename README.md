@@ -21,7 +21,8 @@ reproduction remain open.
   manual trace: passed.
 - Membership-aware NumPy/Torch DSL, NaN semantics, cache identity, point-in-
   time fundamentals/CCM, leakage sentinels: passed CPU tests.
-- Per-cell complete-case fit/test support, serialized transform, joint RNIC projection,
+- Fixed trade/metric universes, zero-fill fixed-weight combination, PSD-Gram ridge,
+  serialized label-free deployment transforms, joint RNIC projection,
   per-factor HAC/bootstrap/BH-FDR, QP post-solve gates, lineage and formal
   report refusal rules: passed unit tests and Random/GP real-data smoke.
 - GP dispatch uses AlphaGen's repository-local modified `gplearn` engine. One

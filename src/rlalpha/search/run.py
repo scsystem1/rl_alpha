@@ -418,7 +418,7 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, bud
     write_json(run_dir / "train_metrics.json", train_metrics)
     write_json(run_dir / "validation_metrics.json", selected.get("validation", {}))
     prompt = prompt_contract() if method in {"base_llm", "grpo_llm"} else None
-    manifest = build_manifest(paths, list(discover_data_files(paths.raw_data_root).values()), effective_config=effective_config, model_config=model_config.get("model") if model_config else None, prompt=prompt, reward_version=f"{reward}:fixed-universe-zero-fill-psd-gram-v5", evaluator_version=EVALUATOR_SEMANTICS_VERSION)
+    manifest = build_manifest(paths, list(discover_data_files(paths.raw_data_root).values()), effective_config=effective_config, model_config=model_config.get("model") if model_config else None, prompt=prompt, reward_version=f"{reward}:fixed-universe-zero-fill-psd-gram-v6", evaluator_version=EVALUATOR_SEMANTICS_VERSION)
     manifest.update({"experiment_id": experiment_id, "method": method, "reward": reward, "seed": seed, "budget": coordinator.ledger.state_dict(), "model": model_config.get("model") if model_config else None, "splits": {name: {"start": str(split.start.date()), "end": str(split.end.date())} for name, split in __import__("rlalpha.data.splits", fromlist=["SPLITS"]).SPLITS.items()}, "conventions": {"label": "20 trading-day next-close total return", "signal": "formed after t close", "execution": "next trading-day close", "pnl_start": "trading day after execution"}})
     manifest.pop("manifest_hash", None)
     manifest["manifest_hash"] = stable_hash(manifest)

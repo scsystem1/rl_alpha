@@ -78,7 +78,7 @@ def _factor_moments_batched(
 
 @dataclass(frozen=True)
 class PreparedPoolState:
-    """Reusable sufficient state for scoring one frozen complete-case pool."""
+    """Reusable sufficient state for scoring one fixed-universe pool."""
 
     raw_signals: tuple[np.ndarray, ...]
     raw_common_mask: np.ndarray
@@ -108,7 +108,7 @@ class _PreparedNeutralizationSupport:
 
 
 class RewardObjective(ABC):
-    """Train-only objective with reusable, exact complete-case score state."""
+    """Train-only objective with reusable, exact fixed-universe score state."""
 
     def __init__(
         self,
@@ -204,7 +204,7 @@ class RewardObjective(ABC):
                 for signal_support, values in zip(supports, standardized, strict=True)
             ]
             standardized = [
-                FactorCalculator(self.label, signal_support).standardize(values)
+                FactorCalculator(self.label, signal_support).zscore(values)
                 for values, signal_support in zip(standardized, supports, strict=True)
             ]
         for values, signal_support in zip(standardized, supports, strict=True):

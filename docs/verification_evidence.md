@@ -18,7 +18,7 @@ repository root `/home/sunyuxiang/rl_alpha/ours`.
 
 The suite includes golden adjustment/label/CCM/market-model tests, NumPy/Torch
 DSL parity, cache and resume identity, end-to-end leakage mutation,
-complete-case reward, serialized transforms, zero-variance handling, QP hard
+fixed-universe PSD-Gram reward, serialized label-free transforms, zero-opinion handling, QP hard
 acceptance, missing-return/MDD behavior, HAC/BH, lineage referential integrity,
 matrix failure/recovery, and incomplete-report refusal.
 

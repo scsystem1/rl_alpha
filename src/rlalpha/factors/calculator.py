@@ -38,6 +38,21 @@ class FactorCalculator:
         result[~self.mask | ~np.isfinite(result) | (std <= 1e-12)[:, None]] = np.nan
         return result
 
+    def zscore(self, signal: np.ndarray) -> np.ndarray:
+        """Daily cross-sectional z-score without a second winsorization."""
+
+        signal = np.asarray(signal, dtype=float)
+        if signal.shape != self.mask.shape:
+            raise ValueError("signal shape differs from calculator panel")
+        values = np.where(self.mask & np.isfinite(signal), signal, np.nan)
+        with np.errstate(all="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            mean = np.nanmean(values, axis=1)
+            std = np.nanstd(values, axis=1)
+            result = (values - mean[:, None]) / std[:, None]
+        result[~self.mask | ~np.isfinite(result) | (std <= 1e-12)[:, None]] = np.nan
+        return result
+
     def ic_series(self, signal: np.ndarray, label: np.ndarray | None = None) -> np.ndarray:
         standardized = self.standardize(signal)
         target = self.label if label is None else np.asarray(label, dtype=float)

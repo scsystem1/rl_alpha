@@ -134,6 +134,133 @@ def test_evaluation_drops_only_observations_with_no_available_weight():
     assert np.allclose(combined[0], 0.0)
     assert available[1].all()
     assert np.allclose(combined[1], second[1] * 2.0)
+    _, tiny_available = combine_fixed_signals((second,), np.array([1e-20]))
+    assert np.array_equal(tiny_available, np.isfinite(second))
+
+
+def test_fixed_universe_moments_match_hand_calculation_and_are_psd():
+    first = np.array([[1.0, np.nan, 2.0, -1.0], [0.5, 1.5, np.nan, -0.5]])
+    second = np.array([[0.0, 2.0, np.nan, 1.0], [1.0, -1.0, 2.0, np.nan]])
+    label = np.array([[1.0, -1.0, 0.5, 2.0], [0.0, 1.0, -2.0, 0.5]])
+    metric = np.array([[True, True, True, True], [True, True, True, False]])
+
+    moments = fixed_universe_moments([first, second], label, metric)
+    daily_gram = []
+    daily_predictive = []
+    for day in range(len(metric)):
+        support = metric[day]
+        matrix = np.column_stack([
+            np.where(np.isfinite(first[day, support]), first[day, support], 0.0),
+            np.where(np.isfinite(second[day, support]), second[day, support], 0.0),
+        ])
+        target = label[day, support]
+        daily_gram.append(matrix.T @ matrix / support.sum())
+        daily_predictive.append(matrix.T @ target / support.sum())
+
+    assert np.allclose(moments.gram, np.mean(daily_gram, axis=0))
+    assert np.allclose(moments.predictive, np.mean(daily_predictive, axis=0))
+    assert np.linalg.eigvalsh(moments.gram).min() >= -1e-12
+
+
+def test_label_missingness_does_not_change_label_free_factor_transform():
+    rng = np.random.default_rng(811)
+    shape = (5, 48)
+    exposures = np.stack([
+        np.column_stack([np.ones(shape[1]), np.linspace(-1, 1, shape[1])])
+        for _ in range(shape[0])
+    ])
+    signals = [rng.normal(size=shape), rng.normal(size=shape)]
+    signals[0][1, :9] = np.nan
+    mask = np.ones(shape, dtype=bool)
+    complete_label = rng.normal(size=shape)
+    missing_label = complete_label.copy()
+    missing_label[2:, ::3] = np.nan
+
+    complete = IndependentFactorTransformPipeline().fit_transform(
+        signals, complete_label, mask, exposures
+    )
+    missing = IndependentFactorTransformPipeline().fit_transform(
+        signals, missing_label, mask, exposures
+    )
+
+    assert np.array_equal(complete.trade_mask, missing.trade_mask)
+    for left, right in zip(complete.signals, missing.signals, strict=True):
+        assert np.allclose(left, right, equal_nan=True, atol=1e-12)
+    weights = np.array([0.7, -0.2])
+    complete_composite, _ = combine_fixed_signals(complete.signals, weights)
+    missing_composite, _ = combine_fixed_signals(missing.signals, weights)
+    assert np.allclose(complete_composite, missing_composite, equal_nan=True, atol=1e-12)
+
+
+def test_fixed_metric_projection_leaves_factors_and_label_neutral():
+    rng = np.random.default_rng(812)
+    shape = (6, 60)
+    style = np.linspace(-1, 1, shape[1])
+    exposures = np.stack([
+        np.column_stack([np.ones(shape[1]), style, rng.normal(size=shape[1])])
+        for _ in range(shape[0])
+    ])
+    signals = [
+        2.0 * exposures[:, :, 1] + rng.normal(size=shape),
+        -1.5 * exposures[:, :, 2] + rng.normal(size=shape),
+    ]
+    signals[0][1, :7] = np.nan
+    label = 3.0 * exposures[:, :, 1] + rng.normal(size=shape)
+    label[3, -8:] = np.nan
+    transformed = IndependentFactorTransformPipeline().fit_transform(
+        signals, label, np.ones(shape, dtype=bool), exposures
+    )
+    assert transformed.objective_signals is not None
+    assert transformed.label is not None
+    assert transformed.metric_mask is not None
+
+    for values, availability in zip(
+        transformed.signals, transformed.factor_available, strict=True
+    ):
+        for day in range(shape[0]):
+            support = availability[day]
+            residual_exposure = exposures[day, support].T @ values[day, support]
+            assert np.max(np.abs(residual_exposure)) < 1e-8
+
+    for values in (*transformed.objective_signals, transformed.label):
+        for day in range(shape[0]):
+            support = transformed.metric_mask[day]
+            residual_exposure = exposures[day, support].T @ values[day, support]
+            assert np.max(np.abs(residual_exposure)) < 1e-8
+
+
+@pytest.mark.parametrize("objective_type,neutralize", [(R0Objective, False), (R1Objective, True), (R2LCBObjective, True)])
+def test_reward_and_final_combiner_share_fixed_universe_rnic(objective_type, neutralize):
+    rng = np.random.default_rng(813)
+    shape = (24, 54)
+    exposures = np.stack([
+        np.column_stack([np.ones(shape[1]), np.linspace(-1, 1, shape[1])])
+        for _ in range(shape[0])
+    ])
+    signals = [rng.standard_t(3, size=shape), rng.normal(size=shape)]
+    signals[0][2:5, :10] = np.nan
+    label = 0.3 * np.nan_to_num(signals[0]) - 0.2 * signals[1] + rng.normal(size=shape)
+    label[7, -6:] = np.nan
+    mask = np.ones(shape, dtype=bool)
+    kwargs = {"exposures": exposures} if neutralize else {}
+    if objective_type is R2LCBObjective:
+        kwargs["hac_lag"] = 3
+    state = objective_type(label, mask, ridge=1e-3, **kwargs).prepare_pool(signals)
+    pipeline = IndependentFactorTransformPipeline(TransformConfig(
+        version="daily-cs-fixed-universe-zero-fill-v3",
+        neutralize=neutralize,
+        post_residual_standardize=True,
+    ))
+    combiner = RidgeCombiner(1e-3, pipeline)
+    weights = combiner.fit(signals, label, mask, exposures if neutralize else None)
+    composite, target, metric, _ = combiner.transform_metric_composite(
+        signals, label, mask, exposures if neutralize else None
+    )
+    expected = daily_corr(composite, target, metric)
+
+    assert np.array_equal(metric, state.common_mask)
+    assert np.allclose(weights, state.score.weights, atol=1e-11)
+    assert np.allclose(expected, state.score.daily_ic, equal_nan=True, atol=1e-11)
 
 
 def test_independent_evaluation_combiner_round_trip_keeps_support_policy():
@@ -158,6 +285,18 @@ def test_independent_evaluation_combiner_round_trip_keeps_support_policy():
     assert np.array_equal(actual_mask, expected_mask)
     assert np.allclose(actual, expected, equal_nan=True)
     assert actual_mask[2].all()
+
+
+def test_combiner_rejects_legacy_transform_semantics():
+    pipeline = IndependentFactorTransformPipeline()
+    pipeline.fitted = True
+    pipeline.n_factors = 1
+    combiner = RidgeCombiner(1e-3, pipeline)
+    combiner.weights_ = np.array([1.0])
+    serialized = combiner.to_dict()
+    serialized["pipeline"]["config"]["version"] = "daily-cs-fixed-universe-zero-fill-v2"
+    with pytest.raises(ValueError, match="incompatible support semantics"):
+        RidgeCombiner.from_dict(serialized)
 
 
 class _SumObjective:
@@ -292,7 +431,7 @@ def test_sparse_replacement_is_scored_on_all_fixed_universe_dates():
     # PoolManager assumes the coordinator's existing 80% candidate coverage
     # gate has already run; this direct unit call intentionally bypasses it.
     assert admission.admitted
-    assert pool.entries[0].expr_hash == "broad"
+    assert pool.entries[0].expr_hash == "sparse"
 
 
 def test_r2_counts_missing_factor_dates_as_zero_ic():

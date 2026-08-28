@@ -175,6 +175,21 @@ def test_checkpoint_hash_mismatch_refuses_resume(tmp_path):
         resumed.load_checkpoint()
 
 
+def test_checkpoint_with_old_reward_semantics_refuses_resume(tmp_path):
+    base = np.arange(300 * 120, dtype=float).reshape(300, 120)
+    coordinator = SearchCoordinator(RandomSearcher(5), PoolManager(_Objective()), lambda node: base, np.ones_like(base, dtype=bool), 8, tmp_path)
+    coordinator.run_group(8)
+    commit_path = tmp_path / "checkpoint_commit.json"
+    commit = __import__("json").loads(commit_path.read_text(encoding="utf-8"))
+    commit["schema_version"] = 5
+    commit["reward_pool_semantics"] = "fixed-universe-zero-fill-psd-gram-v5"
+    commit_path.write_text(__import__("json").dumps(commit), encoding="utf-8")
+
+    resumed = SearchCoordinator(RandomSearcher(5), PoolManager(_Objective()), lambda node: base, np.ones_like(base, dtype=bool), 8, tmp_path)
+    with pytest.raises(RuntimeError, match="incompatible"):
+        resumed.load_checkpoint()
+
+
 def test_lineage_artifacts_preserve_proposal_admission_and_final_factor_ids(tmp_path):
     base = np.arange(300 * 120, dtype=float).reshape(300, 120)
     searcher = RandomSearcher(7)

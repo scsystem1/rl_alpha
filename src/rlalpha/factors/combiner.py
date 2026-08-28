@@ -4,6 +4,7 @@ import numpy as np
 
 from .moments import fixed_universe_moments, solve_psd_ridge
 from .transform import (
+    FIXED_UNIVERSE_TRANSFORM_VERSION,
     FactorTransformPipeline,
     IndependentFactorTransformPipeline,
     TransformConfig,
@@ -17,7 +18,7 @@ class RidgeCombiner:
         self.ridge = ridge
         self.pipeline = pipeline or IndependentFactorTransformPipeline(
             TransformConfig(
-                version="daily-cs-fixed-universe-zero-fill-v2",
+                version=FIXED_UNIVERSE_TRANSFORM_VERSION,
                 neutralize=False,
             )
         )
