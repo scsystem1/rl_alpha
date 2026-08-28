@@ -51,7 +51,7 @@ def _loop_lock() -> asyncio.Lock:
 def _objective(name: str, panel, config: dict[str, Any] | None = None):
     config = config or {}
     label = panel.target(panel.label)
-    mask = panel.target(panel.common_mask) & pd.notna(label)
+    mask = panel.target(panel.common_mask)
     support = {
         "min_pool_valid_day_rate": float(config.get("min_pool_valid_day_rate", 0.80)),
         "min_pool_observation_rate": float(config.get("min_pool_observation_rate", 0.80)),
@@ -128,7 +128,7 @@ def _load_spec(requests: list[dict[str, Any]]) -> dict[str, Any]:
     if stable_hash(hash_payload) != expected_hash:
         raise RuntimeError("frozen GRPO stage spec hash mismatch")
     spec["spec_hash"] = expected_hash
-    if spec.get("schema_version") != 4 or spec.get("reward_pool_semantics") != "independent-availability-same-support-admission-v4":
+    if spec.get("schema_version") != 5 or spec.get("reward_pool_semantics") != "fixed-universe-zero-fill-psd-gram-v5":
         raise RuntimeError("GRPO stage spec uses incompatible reward/pool semantics")
     if len(requests) != int(spec["expected_samples"]):
         raise RuntimeError("reward batch size does not match the frozen stage spec")

@@ -16,7 +16,7 @@ from ..factors.combiner import RidgeCombiner
 from ..factors.transform import (
     IndependentFactorTransformPipeline,
     TransformConfig,
-    combine_available_signals,
+    combine_fixed_signals,
 )
 from ..utils.hashing import file_fingerprint, stable_hash
 from ..utils.io import write_json
@@ -52,6 +52,14 @@ def _daily_correlations(signal: np.ndarray, label: np.ndarray, mask: np.ndarray)
         if common.sum() < 3:
             continue
         left, right = signal[day, common], label[day, common]
+        if np.var(right) <= 1e-24:
+            continue
+        if np.var(left) <= 1e-24:
+            # A fixed-universe all-zero opinion is no predictive information,
+            # not an opportunity to remove this date from the metric.
+            pearson[day] = 0.0
+            rank[day] = 0.0
+            continue
         pearson[day] = np.corrcoef(left, right)[0, 1]
         rank[day] = np.corrcoef(rankdata(left), rankdata(right))[0, 1]
     return pearson, rank
@@ -246,7 +254,7 @@ def finalize_cell(
     expressions = list(selected.get("expressions", []))
     if not expressions:
         raise ValueError(f"selected pool is empty: {run_dir}")
-    input_hash = stable_hash({"schema_version": 9, "final_pool": file_fingerprint(final_pool_path), "panel": _panel_fingerprints(processed_root), "evaluation_code": _evaluation_code_fingerprints(), "evaluation_config": evaluation_config, "finalization_scope_hash": finalization_scope_hash, "support_policy": "independent-factor-availability-v1", "missing_return_policy": "zero-return-stale-value-v1"})
+    input_hash = stable_hash({"schema_version": 10, "final_pool": file_fingerprint(final_pool_path), "panel": _panel_fingerprints(processed_root), "evaluation_code": _evaluation_code_fingerprints(), "evaluation_config": evaluation_config, "finalization_scope_hash": finalization_scope_hash, "support_policy": "fixed-universe-zero-fill-psd-gram-v5", "missing_return_policy": "zero-return-stale-value-v1"})
     test_dir = run_dir / "test"
     test_dir.mkdir(parents=True, exist_ok=True)
     marker = test_dir / "finalization.json"
@@ -272,7 +280,7 @@ def finalize_cell(
         float(evaluation_config["ridge_lambda"]),
         IndependentFactorTransformPipeline(
             TransformConfig(
-                version="daily-cs-independent-availability-v1",
+                version="daily-cs-fixed-universe-zero-fill-v2",
                 neutralize=True,
                 post_residual_standardize=True,
             )
@@ -292,26 +300,35 @@ def finalize_cell(
     test_exposures = test.target(test.exposures)
     test_signals = _signals(test, expressions)
     raw_label = test.target(test.label)
-    transformed_ic = combiner.pipeline.transform_ic(test_signals, raw_label, trade_mask, test_exposures)
-    assert transformed_ic.label is not None
-    combined_ic, ic_available = combine_available_signals(transformed_ic.signals, weights)
-    ic_mask = transformed_ic.mask & ic_available
+    # Build the deployment composite without observing label availability,
+    # then introduce the fixed metric universe and joint projection.
+    combined_ic, transformed_label, ic_mask, ic_diagnostics = combiner.transform_metric_composite(
+        test_signals, raw_label, trade_mask, test_exposures
+    )
     combined_ic[~ic_mask] = np.nan
-    pearson, rank = _daily_correlations(combined_ic, transformed_ic.label, ic_mask)
-    transformed_portfolio = combiner.pipeline.transform_portfolio(test_signals, trade_mask, test_exposures)
-    combined, portfolio_available = combine_available_signals(transformed_portfolio.signals, weights)
-    portfolio_mask = transformed_portfolio.mask & portfolio_available
-    combined[~portfolio_mask] = np.nan
-    portfolio_diagnostics = transformed_portfolio.diagnostics
+    pearson, rank = _daily_correlations(combined_ic, transformed_label, ic_mask)
+    transformed_ic = combiner.pipeline.transform_ic(
+        test_signals, raw_label, trade_mask, test_exposures
+    )
+    if transformed_ic.objective_signals is None:
+        raise RuntimeError("IC transform did not produce objective factor signals")
+    combined, portfolio_mask, portfolio_diagnostics = combiner.transform(
+        test_signals, trade_mask, test_exposures
+    )
     raw_common = trade_mask & np.isfinite(raw_label)
-    raw_calculator = FactorCalculator(raw_label, raw_common)
-    raw_prepared = [raw_calculator.standardize(signal) for signal in test_signals]
-    raw_combined, raw_available = combine_available_signals(raw_prepared, weights)
-    raw_common &= raw_available
+    raw_prepared = [
+        FactorCalculator(raw_label, trade_mask & np.isfinite(signal)).standardize(signal)
+        for signal in test_signals
+    ]
+    raw_combined, _ = combine_fixed_signals(raw_prepared, weights)
     raw_combined[~raw_common] = np.nan
     raw_pearson, raw_rank = _daily_correlations(raw_combined, raw_label, raw_common)
     pd.DataFrame({"date": test.target_dates, "raw_ic": raw_pearson, "raw_rank_ic": raw_rank, "rnic": pearson, "rank_rnic": rank}).to_parquet(test_dir / "rnic_daily.parquet", index=False)
-    _write_factor_statistics(test_dir, run_dir, selected, expressions, weights, test.target_dates, test_signals, raw_label, transformed_ic.signals, transformed_ic.label, ic_mask, transformed_ic.diagnostics, evaluation_config)
+    _write_factor_statistics(
+        test_dir, run_dir, selected, expressions, weights, test.target_dates,
+        test_signals, raw_label, transformed_ic.objective_signals,
+        transformed_label, ic_mask, ic_diagnostics, evaluation_config,
+    )
 
     backtester = PortfolioBacktester(int(evaluation_config["rebalance_days"]), int(evaluation_config["holding_days"]))
     returns = test.target(test.daily_return)
@@ -378,13 +395,14 @@ def finalize_cell(
         "expressions": expressions,
         "ridge_weights": weights.tolist(),
         "transform_pipeline": combiner.pipeline.to_dict(),
-        "fit_observations": int(fit_transformed.mask.sum()),
-        "fit_valid_days": int(fit_transformed.mask.any(axis=1).sum()),
+        "fit_observations": int(fit_transformed.metric_mask.sum()) if fit_transformed.metric_mask is not None else 0,
+        "fit_valid_days": int(fit_transformed.metric_mask.any(axis=1).sum()) if fit_transformed.metric_mask is not None else 0,
         "test_ic_observations": int(ic_mask.sum()),
         "test_ic_valid_days": int(ic_mask.any(axis=1).sum()),
         "test_trade_observations": int(portfolio_mask.sum()),
         "test_trade_valid_days": int(portfolio_mask.any(axis=1).sum()),
         "average_pair_correlation": _average_pair_correlation(list(fit_transformed.signals)),
+        "moment_diagnostics": combiner.moment_diagnostics_,
         "raw_ic_diagnostic": raw_summary,
         "primary_pearson_rnic": rnic_summary,
         "raw_ic": raw_summary,
@@ -392,9 +410,12 @@ def finalize_cell(
         "rank_rnic": series_summary(rank, bootstrap_samples=bootstrap_samples),
         "neutralization_retention": retention,
         "portfolios": portfolio_results,
-        "evaluation_support_policy": "Each factor is transformed on its own daily support; unavailable factors are omitted and active weights are renormalized. A constant factor never invalidates the rest of the pool.",
+        "evaluation_support_policy": "Factors are transformed independently on a label-free trade universe; missing transformed residuals are zero opinions; one fixed weight vector is applied without asset-wise renormalization; weights use a fixed-universe PSD Gram; primary RNIC jointly projects the deployment composite and label on the fixed metric universe.",
         "limitations": ["Historical borrow availability is unavailable; short eligibility assumes borrowability."],
-        "neutralization_diagnostics": {"ic_days": len(transformed_ic.diagnostics), "portfolio_days": len(portfolio_diagnostics)},
+        "neutralization_diagnostics": {
+            "ic_days": len({item.get("date") for item in ic_diagnostics}),
+            "portfolio_days": len({item.get("date") for item in portfolio_diagnostics}),
+        },
     }
     write_json(test_dir / "metrics.json", metrics)
     write_json(marker, {"status": "complete", "input_hash": input_hash, "metrics_hash": stable_hash(metrics)})
@@ -451,12 +472,12 @@ def finalize_experiment(experiment_id: str, config: str | Path, methods: list[st
         cell = final_pool.parent
         key = str(cell.relative_to(root))
         try:
-            cell_scope_hash = stable_hash({"cell": key, "support": "cell-final-pool-complete-case-v1"})
+            cell_scope_hash = stable_hash({"cell": key, "support": "fixed-universe-zero-fill-psd-gram-v5"})
             results[key] = {"status": "complete", "metrics": finalize_cell(cell, paths.processed_root, finalization_scope_hash=cell_scope_hash, evaluation_config=evaluation_config)}
         except Exception as exc:
             results[key] = {"status": "failed", "error": str(exc)}
     write_json(summary_path, results)
     status = "complete" if all(item["status"] == "complete" for item in results.values()) else "failed"
-    write_json(transaction_path, {"status": status, "scope_input_hash": scope_input_hash, "support_policy": "each cell final pool complete-case; sample counts are descriptive", "completed_cells": sum(item["status"] == "complete" for item in results.values()), "failed_cells": sum(item["status"] == "failed" for item in results.values())})
+    write_json(transaction_path, {"status": status, "scope_input_hash": scope_input_hash, "support_policy": "common fixed metric universe; factor residual nulls are zero opinions; no asset-wise weight renormalization", "completed_cells": sum(item["status"] == "complete" for item in results.values()), "failed_cells": sum(item["status"] == "failed" for item in results.values())})
     append_event(root / "experiment.log", "evaluation_finished", status=status, completed=sum(item["status"] == "complete" for item in results.values()), failed=sum(item["status"] == "failed" for item in results.values()))
     return results

@@ -8,11 +8,10 @@ import hashlib
 import threading
 
 import numpy as np
-from numba import njit, prange
-
 from ..factors.calculator import FactorCalculator, daily_corr
+from ..factors.moments import fixed_universe_moments, solve_psd_ridge
 from ..factors.records import PoolScore
-from ..factors.transform import combine_available_signals
+from ..factors.transform import combine_fixed_signals, prepare_fixed_universe_inputs
 from ..risk.neutralize import PreparedRiskSolve, RiskNeutralizer
 
 
@@ -50,60 +49,21 @@ def _daily_corr_columns(
     return result
 
 
-@njit(cache=True, inline="always")
-def _masked_corr_one_day(
-    left: np.ndarray,
-    right: np.ndarray,
-    mask: np.ndarray,
-) -> float:
-    count = 0
-    sx = 0.0
-    sy = 0.0
-    cross = 0.0
-    square_x = 0.0
-    square_y = 0.0
-    for asset in range(len(mask)):
-        x = left[asset]
-        y = right[asset]
-        if mask[asset] and np.isfinite(x) and np.isfinite(y):
-            count += 1
-            sx += x
-            sy += y
-            cross += x * y
-            square_x += x * x
-            square_y += y * y
-    if count < 3:
-        return np.nan
-    covariance = cross - sx * sy / count
-    variance_x = square_x - sx * sx / count
-    variance_y = square_y - sy * sy / count
-    if variance_x <= 1e-24 or variance_y <= 1e-24:
-        return np.nan
-    return covariance / np.sqrt(variance_x * variance_y)
-
-
-@njit(cache=True, parallel=True, nogil=True)
-def _daily_factor_moments_kernel(
-    matrix: np.ndarray,
+def _fixed_universe_daily_corr(
+    signal: np.ndarray,
     label: np.ndarray,
     mask: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    days, _, factors = matrix.shape
-    predictive = np.full((days, factors), np.nan, dtype=np.float64)
-    pairwise = np.full((days, factors, factors), np.nan, dtype=np.float64)
-    for day in prange(days):
-        for left in range(factors):
-            predictive[day, left] = _masked_corr_one_day(
-                matrix[day, :, left], label[day], mask[day]
-            )
-            pairwise[day, left, left] = 1.0
-            for right in range(left + 1, factors):
-                value = _masked_corr_one_day(
-                    matrix[day, :, left], matrix[day, :, right], mask[day]
-                )
-                pairwise[day, left, right] = value
-                pairwise[day, right, left] = value
-    return predictive, pairwise
+) -> np.ndarray:
+    """Daily Pearson IC where an all-zero opinion has exactly zero IC."""
+
+    result = daily_corr(signal, label, mask)
+    for day in np.flatnonzero(~np.isfinite(result)):
+        common = mask[day] & np.isfinite(signal[day]) & np.isfinite(label[day])
+        if common.sum() < 3:
+            continue
+        if np.var(label[day, common]) > 1e-24 and np.var(signal[day, common]) <= 1e-24:
+            result[day] = 0.0
+    return result
 
 
 def _factor_moments_batched(
@@ -111,32 +71,9 @@ def _factor_moments_batched(
     label: np.ndarray,
     mask: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Mean daily factor/label and factor/factor correlations in one panel pass.
-
-    The old implementation invoked ``daily_corr`` once per factor pair.  For a
-    20-factor pool that meant 210 NumPy allocations and complete panel scans.
-    This fused Numba kernel walks each day once and parallelizes days without
-    launching hundreds of nested parallel regions.
-    """
-    count = len(signals)
-    correlation = np.eye(count, dtype=float)
-    predictive = np.zeros(count, dtype=float)
-    if not count:
-        return correlation, predictive
-    label = np.asarray(label, dtype=float)
-    mask = np.asarray(mask, dtype=bool)
-    matrix = np.ascontiguousarray(np.stack(signals, axis=-1), dtype=np.float64)
-    predictive_daily, pair_daily = _daily_factor_moments_kernel(
-        matrix, label, mask
-    )
-    with np.errstate(all="ignore"):
-        predictive_means = np.nanmean(predictive_daily, axis=0)
-        pair_means = np.nanmean(pair_daily, axis=0)
-    predictive[:] = np.where(np.isfinite(predictive_means), predictive_means, 0.0)
-    pair_means = np.where(np.isfinite(pair_means), pair_means, 0.0)
-    off_diagonal = ~np.eye(count, dtype=bool)
-    correlation[off_diagonal] = pair_means[off_diagonal]
-    return correlation, predictive
+    """Day-equal PSD Gram and factor/label cross moments on one support."""
+    moments = fixed_universe_moments(signals, label, mask)
+    return moments.gram, moments.predictive
 
 
 @dataclass(frozen=True)
@@ -148,7 +85,7 @@ class PreparedPoolState:
     common_mask: np.ndarray
     prepared_signals: tuple[np.ndarray, ...]
     prepared_label: np.ndarray
-    factor_correlation: np.ndarray
+    factor_gram: np.ndarray
     predictive: np.ndarray
     system_inverse: np.ndarray
     score: PoolScore
@@ -212,15 +149,10 @@ class RewardObjective(ABC):
             raise ValueError("min_pool_valid_days must be positive")
 
     def _base_support(self) -> np.ndarray:
-        support = self.mask & np.isfinite(self.label)
+        support = self.mask.copy()
         if self.exposures is not None:
             support &= np.isfinite(self.exposures).all(axis=2)
         return support
-
-    def _independent_label(self, support: np.ndarray) -> np.ndarray:
-        if self.exposures is None:
-            return self.label
-        return self._prepared_neutralization_support(support).residual_label
 
     def _independent_signal(self, signal: np.ndarray, support: np.ndarray) -> np.ndarray:
         return self._independent_signals([signal], support)[0]
@@ -235,10 +167,9 @@ class RewardObjective(ABC):
         for values in arrays:
             if values.shape != self.label.shape:
                 raise ValueError("signal panel shape mismatch")
-        standardized = [
-            FactorCalculator(self.label, support & np.isfinite(values)).standardize(values)
-            for values in arrays
-        ]
+        standardized = [FactorCalculator(
+            np.zeros(self.label.shape, dtype=float), support & np.isfinite(values)
+        ).standardize(values) for values in arrays]
         supports = [support & np.isfinite(values) for values in standardized]
         if self.exposures is not None:
             groups: dict[bytes, tuple[np.ndarray, list[int]]] = {}
@@ -252,10 +183,19 @@ class RewardObjective(ABC):
                 else:  # pragma: no cover - exact fixed-shape packbits key
                     raise RuntimeError("packed independent-factor support collision")
             residuals: list[np.ndarray | None] = [None] * len(standardized)
+            neutralizer = RiskNeutralizer()
             for signal_support, indices in groups.values():
-                transformed, _ = self._neutralize_prestandardized(
-                    [standardized[index] for index in indices], signal_support
-                )
+                transformed = [np.full_like(self.label, np.nan, dtype=float) for _ in indices]
+                for day in range(self.label.shape[0]):
+                    day_mask = signal_support[day]
+                    if day_mask.sum() <= self.exposures.shape[2]:
+                        continue
+                    matrix = np.column_stack([standardized[index][day] for index in indices])
+                    residual, _ = neutralizer.residualize_matrix(
+                        day, matrix, self.exposures[day], day_mask
+                    )
+                    for column in range(len(indices)):
+                        transformed[column][day] = residual[:, column]
                 for index, residual in zip(indices, transformed, strict=True):
                     residuals[index] = residual
             standardized = [np.asarray(value) for value in residuals]
@@ -272,7 +212,7 @@ class RewardObjective(ABC):
         return standardized
 
     def support_diagnostics(self, state: PreparedPoolState) -> dict[str, float | int | bool]:
-        base = state.raw_common_mask
+        base = state.raw_common_mask & np.isfinite(self.label)
         base_days = int((base.sum(axis=1) >= 3).sum())
         valid_days = state.valid_days
         base_observations = int(base.sum())
@@ -298,7 +238,7 @@ class RewardObjective(ABC):
         }
 
     def required_valid_days(self) -> int:
-        base = self._base_support()
+        base = self._base_support() & np.isfinite(self.label)
         base_days = int((base.sum(axis=1) >= 3).sum())
         return min(
             base_days,
@@ -463,11 +403,11 @@ class RewardObjective(ABC):
         if not np.array_equal(common, initial_common):
             calculator = FactorCalculator(objective_label, common)
             prepared = self._standardize_many(calculator, objective_signals)
-        correlation, predictive = _factor_moments_batched(
+        gram, predictive = _factor_moments_batched(
             prepared, objective_label, common
         )
         return self._state_from_moments(
-            raw_signals, raw_common, common, prepared, objective_label, correlation, predictive
+            raw_signals, raw_common, common, prepared, objective_label, gram, predictive
         )
 
     def _build_independent_state(
@@ -476,18 +416,24 @@ class RewardObjective(ABC):
         reference_mask: np.ndarray,
         prepared_signals: list[np.ndarray] | None = None,
     ) -> PreparedPoolState:
-        prepared_label = self._independent_label(reference_mask)
-        prepared = prepared_signals or self._independent_signals(raw_signals, reference_mask)
-        correlation, predictive = _factor_moments_batched(
-            prepared, prepared_label, reference_mask
+        deployment = prepared_signals or self._independent_signals(raw_signals, reference_mask)
+        prepared, prepared_label, metric_mask, _ = prepare_fixed_universe_inputs(
+            deployment,
+            self.label,
+            reference_mask,
+            self.exposures,
+            neutralize=self.exposures is not None,
+        )
+        gram, predictive = _factor_moments_batched(
+            list(prepared), prepared_label, metric_mask
         )
         return self._state_from_moments(
             raw_signals,
             reference_mask,
-            reference_mask,
-            prepared,
+            metric_mask,
+            list(prepared),
             prepared_label,
-            correlation,
+            gram,
             predictive,
         )
 
@@ -497,9 +443,16 @@ class RewardObjective(ABC):
         raw = [np.asarray(signal, dtype=float) for signal in signals]
         raw_common = self._base_support()
         if not raw:
+            _, prepared_label, metric_mask, _ = prepare_fixed_universe_inputs(
+                tuple(), self.label, raw_common, self.exposures,
+                neutralize=self.exposures is not None,
+            )
             score = PoolScore(0.0, 0.0, tuple(), tuple(), 0.0)
             empty = np.empty((0, 0), dtype=float)
-            return PreparedPoolState(tuple(), raw_common, raw_common, tuple(), self.label, empty, np.empty(0), empty, score)
+            return PreparedPoolState(
+                tuple(), raw_common, metric_mask, tuple(), prepared_label,
+                empty, np.empty(0), empty, score,
+            )
         return self._build_independent_state(raw, raw_common)
 
     def prepare_pool_cached(self, signals: list[np.ndarray]) -> PreparedPoolState:
@@ -567,88 +520,37 @@ class RewardObjective(ABC):
             raise ValueError("candidate and prepared-candidate counts differ")
         if not candidates:
             return []
+        objective_candidates, prepared_label, metric_mask, _ = prepare_fixed_universe_inputs(
+            prepared_candidates,
+            self.label,
+            base.raw_common_mask,
+            self.exposures,
+            neutralize=self.exposures is not None,
+        )
+        if not np.array_equal(metric_mask, base.common_mask):
+            raise RuntimeError("fixed metric universe changed while adding candidates")
+        if not np.allclose(prepared_label, base.prepared_label, equal_nan=True):
+            raise RuntimeError("fixed metric label changed while adding candidates")
+
+        all_prepared = list(base.prepared_signals) + list(objective_candidates)
+        all_moments = fixed_universe_moments(
+            all_prepared, base.prepared_label, base.common_mask
+        )
         base_count = len(base.prepared_signals)
-        candidate_count = len(candidates)
-        base_matrix = np.stack(base.prepared_signals, axis=-1)
-        candidate_matrix = np.stack(prepared_candidates, axis=-1)
-        label_matrix = np.asarray(base.prepared_label)[..., None]
-
-        predictive_daily = _daily_corr_columns(
-            candidate_matrix, label_matrix, base.common_mask
-        )[:, :, 0]
-        with np.errstate(all="ignore"):
-            candidate_predictive = np.nanmean(predictive_daily, axis=0)
-        candidate_predictive = np.where(
-            np.isfinite(candidate_predictive), candidate_predictive, 0.0
-        )
-        pair_daily = _daily_corr_columns(
-            base_matrix, candidate_matrix, base.common_mask
-        )
-        with np.errstate(all="ignore"):
-            pair_means = np.nanmean(pair_daily, axis=0)
-        pair_means = np.where(np.isfinite(pair_means), pair_means, 0.0)
-
-        correlations: list[np.ndarray] = []
-        inverses: list[np.ndarray] = []
-        weights = np.empty((candidate_count, base_count + 1), dtype=float)
-        predictives: list[np.ndarray] = []
-        for candidate_index in range(candidate_count):
-            correlation = np.eye(base_count + 1, dtype=float)
-            correlation[:-1, :-1] = base.factor_correlation
-            correlation[:-1, -1] = pair_means[:, candidate_index]
-            correlation[-1, :-1] = pair_means[:, candidate_index]
-            predictive = np.empty(base_count + 1, dtype=float)
-            predictive[:-1] = base.predictive
-            predictive[-1] = candidate_predictive[candidate_index]
-            system = correlation + self.ridge * np.eye(base_count + 1)
-            try:
-                inverse = np.linalg.inv(system)
-            except np.linalg.LinAlgError:
-                inverse = np.linalg.pinv(system)
-            correlations.append(correlation)
-            predictives.append(predictive)
-            inverses.append(inverse)
-            weights[candidate_index] = inverse @ predictive
-
-        base_finite = np.isfinite(base_matrix)
-        candidate_finite = np.isfinite(candidate_matrix)
-        combined = np.einsum(
-            "daf,cf->dac",
-            np.where(base_finite, base_matrix, 0.0),
-            weights[:, :base_count],
-            optimize=True,
-        )
-        combined += np.where(candidate_finite, candidate_matrix, 0.0) * weights[:, base_count][None, None, :]
-        active_weight = np.einsum(
-            "daf,cf->dac", base_finite.astype(float), np.abs(weights[:, :base_count]), optimize=True
-        )
-        active_weight += candidate_finite * np.abs(weights[:, base_count])[None, None, :]
-        total_weight = np.abs(weights).sum(axis=1)
-        available = active_weight > 1e-15
-        with np.errstate(divide="ignore", invalid="ignore"):
-            combined *= total_weight[None, None, :] / active_weight
-        available &= base.common_mask[..., None]
-        combined[~available] = np.nan
-        combined_daily = _daily_corr_columns(
-            combined, label_matrix, base.common_mask
-        )[:, :, 0]
-
-        states = []
+        states: list[PreparedPoolState] = []
         for candidate_index, candidate in enumerate(candidates):
-            candidate_weights = weights[candidate_index]
-            score = self._score_from_daily(
-                combined_daily[:, candidate_index], candidate_weights
-            )
-            states.append(PreparedPoolState(
-                tuple(list(base.raw_signals) + [candidate]),
+            selected = np.asarray(list(range(base_count)) + [base_count + candidate_index])
+            gram = all_moments.gram[np.ix_(selected, selected)]
+            predictive = all_moments.predictive[selected]
+            prepared = list(base.prepared_signals) + [objective_candidates[candidate_index]]
+            states.append(self._state_from_moments(
+                list(base.raw_signals) + [candidate],
                 base.raw_common_mask,
-                available[..., candidate_index],
-                tuple(list(base.prepared_signals) + [prepared_candidates[candidate_index]]),
+                base.common_mask,
+                prepared,
                 base.prepared_label,
-                correlations[candidate_index],
-                predictives[candidate_index],
-                inverses[candidate_index],
-                score,
+                gram,
+                predictive,
             ))
         return states
 
@@ -658,33 +560,9 @@ class RewardObjective(ABC):
         candidate: np.ndarray,
         prepared_candidate: np.ndarray,
     ) -> PreparedPoolState:
-        prepared = list(base.prepared_signals) + [prepared_candidate]
-        count = len(prepared)
-        correlation = np.eye(count, dtype=float)
-        correlation[:-1, :-1] = base.factor_correlation
-        predictive = np.empty(count, dtype=float)
-        predictive[:-1] = base.predictive
-        candidate_daily = daily_corr(
-            prepared_candidate, base.prepared_label, base.common_mask
-        )
-        predictive[-1] = (
-            float(np.nanmean(candidate_daily))
-            if np.isfinite(candidate_daily).any()
-            else 0.0
-        )
-        for index, existing in enumerate(base.prepared_signals):
-            values = daily_corr(existing, prepared_candidate, base.common_mask)
-            value = float(np.nanmean(values)) if np.isfinite(values).any() else 0.0
-            correlation[index, -1] = correlation[-1, index] = value
-        return self._state_from_moments(
-            list(base.raw_signals) + [candidate],
-            base.common_mask,
-            base.common_mask,
-            prepared,
-            base.prepared_label,
-            correlation,
-            predictive,
-        )
+        return self._prepare_add_many_from_prepared_candidates(
+            base, [candidate], [prepared_candidate]
+        )[0]
 
     def _state_from_moments(
         self,
@@ -693,22 +571,17 @@ class RewardObjective(ABC):
         common: np.ndarray,
         prepared: list[np.ndarray],
         label: np.ndarray,
-        correlation: np.ndarray,
+        gram: np.ndarray,
         predictive: np.ndarray,
     ) -> PreparedPoolState:
-        system = correlation + self.ridge * np.eye(len(prepared))
-        try:
-            inverse = np.linalg.inv(system)
-        except np.linalg.LinAlgError:
-            inverse = np.linalg.pinv(system)
-        weights = inverse @ predictive
-        combined, available = combine_available_signals(prepared, weights)
-        result_mask = common & available & np.isfinite(label)
+        weights, inverse = solve_psd_ridge(gram, predictive, self.ridge)
+        combined, _ = combine_fixed_signals(prepared, weights)
+        result_mask = common & np.isfinite(label)
         combined[~result_mask] = np.nan
-        daily = daily_corr(combined, label, result_mask)
+        daily = _fixed_universe_daily_corr(combined, label, result_mask)
         return PreparedPoolState(
             tuple(raw_signals), raw_common, result_mask, tuple(prepared), label,
-            correlation, predictive, inverse, self._score_from_daily(daily, weights),
+            gram, predictive, inverse, self._score_from_daily(daily, weights),
         )
 
     def prepare_subset(
@@ -723,16 +596,16 @@ class RewardObjective(ABC):
             score = PoolScore(0.0, 0.0, tuple(), tuple(), 0.0)
             return PreparedPoolState(tuple(), state.raw_common_mask, state.common_mask, tuple(), state.prepared_label, empty, np.empty(0), empty, score)
         selected = np.asarray(indices, dtype=int)
-        correlation = state.factor_correlation[np.ix_(selected, selected)]
+        gram = state.factor_gram[np.ix_(selected, selected)]
         predictive = state.predictive[selected]
         prepared = [state.prepared_signals[index] for index in selected]
         return self._state_from_moments(
             [state.raw_signals[index] for index in selected],
             state.raw_common_mask,
-            state.raw_common_mask if natural_support else state.common_mask,
+            state.common_mask,
             prepared,
             state.prepared_label,
-            correlation,
+            gram,
             predictive,
         )
 
@@ -760,13 +633,9 @@ class RewardObjective(ABC):
                 normalized.append(selected)
                 weights.append(np.empty(0, dtype=float))
                 continue
-            correlation = state.factor_correlation[np.ix_(selected, selected)]
+            gram = state.factor_gram[np.ix_(selected, selected)]
             predictive = state.predictive[selected]
-            system = correlation + self.ridge * np.eye(len(selected))
-            try:
-                subset_weights = np.linalg.inv(system) @ predictive
-            except np.linalg.LinAlgError:
-                subset_weights = np.linalg.pinv(system) @ predictive
+            subset_weights, _ = solve_psd_ridge(gram, predictive, self.ridge)
             normalized.append(selected)
             weights.append(subset_weights)
         factor_count = len(state.prepared_signals)
@@ -776,31 +645,18 @@ class RewardObjective(ABC):
             zip(normalized, weights, strict=True)
         ):
             full_weights[alternative, selected] = subset_weights
-        signal_matrix = np.stack(state.prepared_signals, axis=-1)
-        finite = np.isfinite(signal_matrix)
-        combined = np.einsum(
-            "daf,kf->dak",
-            np.where(finite, signal_matrix, 0.0),
-            full_weights,
-            optimize=True,
-        )
-        active_weight = np.einsum(
-            "daf,kf->dak",
-            finite.astype(float),
-            np.abs(full_weights),
-            optimize=True,
-        )
-        total_weight = np.abs(full_weights).sum(axis=1)
-        available = active_weight > 1e-15
-        with np.errstate(divide="ignore", invalid="ignore"):
-            combined *= total_weight[None, None, :] / active_weight
-        available &= state.common_mask[..., None]
-        combined[~available] = np.nan
+        combined, _ = combine_fixed_signals(state.prepared_signals, full_weights)
+        combined = np.where(state.common_mask[..., None], combined, np.nan)
         daily = _daily_corr_columns(
             combined,
             np.asarray(state.prepared_label)[..., None],
             state.common_mask,
         )[:, :, 0]
+        for alternative in range(alternative_count):
+            fixed = _fixed_universe_daily_corr(
+                combined[:, :, alternative], state.prepared_label, state.common_mask
+            )
+            daily[:, alternative] = fixed
         return [
             self._score_from_daily(daily[:, alternative], subset_weights)
             for alternative, subset_weights in enumerate(weights)
@@ -811,25 +667,22 @@ class RewardObjective(ABC):
         old_state: PreparedPoolState,
         new_state: PreparedPoolState,
     ) -> tuple[PoolScore, PoolScore, PreparedPoolState]:
-        """Reuse prepared transforms unless the actual support changed."""
-        if np.array_equal(old_state.common_mask, new_state.common_mask):
-            return old_state.score, new_state.score, new_state
-        return self.compare_pools(
-            list(old_state.raw_signals), list(new_state.raw_signals)
-        )
+        """Fixed metric support makes natural and shared comparisons identical."""
+        if not np.array_equal(old_state.common_mask, new_state.common_mask):
+            raise RuntimeError("fixed metric universe changed across prepared pools")
+        return old_state.score, new_state.score, new_state
 
     def compare_pools(
         self,
         old_signals: list[np.ndarray],
         new_signals: list[np.ndarray],
     ) -> tuple[PoolScore, PoolScore, PreparedPoolState]:
-        """Compare a transition on one exact support and return natural new state."""
+        """Compare a transition on the factor-independent metric universe."""
         old_natural = self.prepare_pool_cached(old_signals)
         new_natural = self.prepare_pool_cached(new_signals)
-        shared = old_natural.common_mask & new_natural.common_mask
-        old_shared = self._build_independent_state(old_signals, shared)
-        new_shared = self._build_independent_state(new_signals, shared)
-        return old_shared.score, new_shared.score, new_natural
+        if not np.array_equal(old_natural.common_mask, new_natural.common_mask):
+            raise RuntimeError("fixed metric universe changed across pools")
+        return old_natural.score, new_natural.score, new_natural
 
     def _daily_ic(self, signals: list[np.ndarray], label: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if label is self.label:

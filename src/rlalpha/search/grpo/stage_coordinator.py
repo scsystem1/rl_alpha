@@ -98,8 +98,8 @@ class VerlGRPOStageCoordinator:
     def _stage_spec(self, archive_path: Path, expected_samples: int) -> dict[str, Any]:
         score = self.pool.score
         spec = {
-            "schema_version": 4,
-            "reward_pool_semantics": "independent-availability-same-support-admission-v4",
+            "schema_version": 5,
+            "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v5",
             "stage": self.stage,
             "expected_samples": int(expected_samples),
             "remaining_budget": self.ledger.remaining,
@@ -527,8 +527,8 @@ class VerlGRPOStageCoordinator:
         if self.checkpoint is not None and not (self.checkpoint / "actor").is_dir():
             raise RuntimeError("paired Verl actor checkpoint is missing")
         state = {
-            "schema_version": 4,
-            "reward_pool_semantics": "independent-availability-same-support-admission-v4",
+            "schema_version": 5,
+            "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v5",
             "paired_optimizer_step": self.updates,
             "ledger": self.ledger.state_dict(),
             "seen": sorted(self.seen),
@@ -560,8 +560,8 @@ class VerlGRPOStageCoordinator:
         write_json(
             self.run_dir / "checkpoint_commit.json",
             {
-                "schema_version": 4,
-                "reward_pool_semantics": "independent-availability-same-support-admission-v4",
+                "schema_version": 5,
+                "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v5",
                 "paired_optimizer_step": self.updates,
                 "checkpoint": file_fingerprint(checkpoint_path),
                 "verl_checkpoint": self.checkpoint_fingerprint,
@@ -575,12 +575,12 @@ class VerlGRPOStageCoordinator:
         if not commit_path.exists():
             raise RuntimeError("GRPO checkpoint is uncommitted and cannot be resumed")
         commit = json.loads(commit_path.read_text(encoding="utf-8"))
-        if commit.get("schema_version") != 4 or commit.get("reward_pool_semantics") != "independent-availability-same-support-admission-v4":
+        if commit.get("schema_version") != 5 or commit.get("reward_pool_semantics") != "fixed-universe-zero-fill-psd-gram-v5":
             raise RuntimeError("GRPO checkpoint uses incompatible reward/pool semantics")
         if file_fingerprint(state_path)["sha256"] != commit["checkpoint"]["sha256"]:
             raise RuntimeError("GRPO checkpoint hash mismatch")
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        if state.get("schema_version") != 4 or state.get("reward_pool_semantics") != "independent-availability-same-support-admission-v4":
+        if state.get("schema_version") != 5 or state.get("reward_pool_semantics") != "fixed-universe-zero-fill-psd-gram-v5":
             raise RuntimeError("GRPO state uses incompatible reward/pool semantics")
         if int(state["paired_optimizer_step"]) != int(commit["paired_optimizer_step"]):
             raise RuntimeError("model/domain checkpoint step mismatch")

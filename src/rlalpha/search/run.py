@@ -172,7 +172,9 @@ def _write_lineage(run_dir: Path, coordinator: SearchCoordinator, snapshots: lis
 def objective_for(reward: str, panel: SplitPanel, reward_config: dict[str, Any] | None = None):
     reward_config = reward_config or {}
     label = panel.target(panel.label)
-    mask = panel.target(panel.common_mask) & pd.notna(label)
+    # Reward transforms factors on the label-free trade universe.  Label
+    # availability is introduced only by RewardObjective's metric mask.
+    mask = panel.target(panel.common_mask)
     support = {
         "min_pool_valid_day_rate": float(reward_config.get("min_pool_valid_day_rate", 0.80)),
         "min_pool_observation_rate": float(reward_config.get("min_pool_observation_rate", 0.80)),
@@ -416,7 +418,7 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, bud
     write_json(run_dir / "train_metrics.json", train_metrics)
     write_json(run_dir / "validation_metrics.json", selected.get("validation", {}))
     prompt = prompt_contract() if method in {"base_llm", "grpo_llm"} else None
-    manifest = build_manifest(paths, list(discover_data_files(paths.raw_data_root).values()), effective_config=effective_config, model_config=model_config.get("model") if model_config else None, prompt=prompt, reward_version=f"{reward}:independent-availability-same-support-admission-v4", evaluator_version=EVALUATOR_SEMANTICS_VERSION)
+    manifest = build_manifest(paths, list(discover_data_files(paths.raw_data_root).values()), effective_config=effective_config, model_config=model_config.get("model") if model_config else None, prompt=prompt, reward_version=f"{reward}:fixed-universe-zero-fill-psd-gram-v5", evaluator_version=EVALUATOR_SEMANTICS_VERSION)
     manifest.update({"experiment_id": experiment_id, "method": method, "reward": reward, "seed": seed, "budget": coordinator.ledger.state_dict(), "model": model_config.get("model") if model_config else None, "splits": {name: {"start": str(split.start.date()), "end": str(split.end.date())} for name, split in __import__("rlalpha.data.splits", fromlist=["SPLITS"]).SPLITS.items()}, "conventions": {"label": "20 trading-day next-close total return", "signal": "formed after t close", "execution": "next trading-day close", "pnl_start": "trading day after execution"}})
     manifest.pop("manifest_hash", None)
     manifest["manifest_hash"] = stable_hash(manifest)

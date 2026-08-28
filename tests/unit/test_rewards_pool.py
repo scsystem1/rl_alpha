@@ -10,8 +10,9 @@ from rlalpha.factors.transform import (
     FactorTransformPipeline,
     IndependentFactorTransformPipeline,
     TransformConfig,
-    combine_available_signals,
+    combine_fixed_signals,
 )
+from rlalpha.factors.moments import fixed_universe_moments
 from rlalpha.factors.calculator import FactorCalculator, daily_corr
 from rlalpha.factors.pool import PoolManager
 from rlalpha.factors.records import PoolEntry, PoolScore
@@ -59,10 +60,9 @@ def test_pool_scoring_matches_explicit_independent_availability_combination():
     signals[1][5:10, :7] = np.nan
     objective = R0Objective(label, mask)
     score = objective.score_pool(signals)
-    common = mask & np.isfinite(label)
-    prepared = [FactorCalculator(label, common & np.isfinite(signal)).standardize(signal) for signal in signals]
-    combined, available = combine_available_signals(prepared, np.asarray(score.weights))
-    expected = daily_corr(combined, label, common & available)
+    state = objective.prepare_pool(signals)
+    combined, _ = combine_fixed_signals(state.prepared_signals, np.asarray(score.weights))
+    expected = daily_corr(combined, state.prepared_label, state.common_mask)
     assert np.allclose(score.daily_ic, expected, equal_nan=True, atol=1e-12)
     assert np.isfinite(np.asarray(score.daily_ic)[5:10]).all()
 
@@ -93,7 +93,7 @@ def test_zero_variance_standardized_day_is_removed_before_neutralization():
     label = rng.normal(size=(days, assets))
     pipeline = FactorTransformPipeline(TransformConfig(neutralize=True))
     transformed = pipeline.fit_transform([signal], label, np.ones_like(label, bool), exposures)
-    assert not transformed.mask[1].any()
+    assert not transformed.metric_mask[1].any()
     objective = R2LCBObjective(label, np.ones_like(label, bool), exposures, hac_lag=1)
     residual_signals, residual_label = objective._neutralized_inputs([signal])
     assert np.isnan(residual_signals[0][1]).all()
@@ -114,14 +114,14 @@ def test_evaluation_keeps_day_when_only_one_factor_is_constant():
     transformed = pipeline.fit_transform(
         [constant_one_day, available], label, np.ones_like(label, bool), exposures
     )
-    combined, combined_available = combine_available_signals(transformed.signals, np.array([0.5, 0.5]))
+    combined, combined_available = combine_fixed_signals(transformed.signals, np.array([0.5, 0.5]))
 
     assert np.isnan(transformed.signals[0][1]).all()
     assert np.isfinite(transformed.signals[1][1]).all()
-    assert transformed.mask[1].all()
+    assert transformed.trade_mask[1].all()
     assert combined_available[1].all()
     assert np.isfinite(combined[1]).all()
-    assert np.allclose(combined[1], transformed.signals[1][1])
+    assert np.allclose(combined[1], 0.5 * transformed.signals[1][1])
 
 
 def test_evaluation_drops_only_observations_with_no_available_weight():
@@ -129,11 +129,11 @@ def test_evaluation_drops_only_observations_with_no_available_weight():
     first = np.full(shape, np.nan)
     second = np.arange(10, dtype=float).reshape(shape)
     second[0] = np.nan
-    combined, available = combine_available_signals((first, second), np.array([1.0, 2.0]))
+    combined, available = combine_fixed_signals((first, second), np.array([1.0, 2.0]))
     assert not available[0].any()
-    assert np.isnan(combined[0]).all()
+    assert np.allclose(combined[0], 0.0)
     assert available[1].all()
-    assert np.allclose(combined[1], second[1] * 3.0)
+    assert np.allclose(combined[1], second[1] * 2.0)
 
 
 def test_independent_evaluation_combiner_round_trip_keeps_support_policy():
@@ -274,7 +274,7 @@ def test_constant_factor_does_not_remove_pool_days_from_reward():
     assert np.isfinite(np.asarray(state.score.daily_ic)[50:150]).all()
 
 
-def test_sparse_replacement_cannot_enter_by_inflating_small_sample_ic():
+def test_sparse_replacement_is_scored_on_all_fixed_universe_dates():
     rng = np.random.default_rng(2028)
     shape = (300, 120)
     label = rng.normal(size=shape)
@@ -285,14 +285,17 @@ def test_sparse_replacement_cannot_enter_by_inflating_small_sample_ic():
     pool = PoolManager(objective, capacity=1)
     pool.entries = [PoolEntry("broad", "broad", broad)]
     scored = pool.score_candidates([PoolEntry("sparse", "sparse", sparse)])[0]
-    assert not scored.valid
-    assert scored.reason == "insufficient_pool_support"
+    assert scored.valid
+    assert np.isclose(scored.pool_score.mean_ic, 20.0 / 300.0, atol=1e-12)
+    assert scored.pool_score.mean_ic < 0.1
     admission = pool.consider_group([PoolEntry("sparse", "sparse", sparse)], [scored])
-    assert not admission.admitted
+    # PoolManager assumes the coordinator's existing 80% candidate coverage
+    # gate has already run; this direct unit call intentionally bypasses it.
+    assert admission.admitted
     assert pool.entries[0].expr_hash == "broad"
 
 
-def test_r2_rejects_tiny_daily_sample_even_when_values_are_stable():
+def test_r2_counts_missing_factor_dates_as_zero_ic():
     rng = np.random.default_rng(2029)
     shape = (300, 120)
     label = rng.normal(size=shape)
@@ -303,7 +306,9 @@ def test_r2_rejects_tiny_daily_sample_even_when_values_are_stable():
         for _ in range(shape[0])
     ])
     score = R2LCBObjective(label, np.ones(shape, dtype=bool), exposures).score_pool([sparse])
-    assert score.objective == float("-inf")
+    assert np.isfinite(score.objective)
+    assert np.isclose(score.mean_ic, 2.0 / 300.0, atol=1e-6)
+    assert np.count_nonzero(np.asarray(score.daily_ic) == 0.0) == 298
 
 
 def test_full_pool_group_caches_baseline_and_bounds_formal_rechecks():
@@ -401,8 +406,8 @@ def test_batched_add_matches_individual_add_with_different_candidate_supports(ob
         assert np.array_equal(left.common_mask, right.common_mask)
         assert np.allclose(left.predictive, right.predictive, equal_nan=True, atol=1e-12)
         assert np.allclose(
-            left.factor_correlation,
-            right.factor_correlation,
+            left.factor_gram,
+            right.factor_gram,
             equal_nan=True,
             atol=1e-12,
         )
@@ -429,8 +434,8 @@ def test_add_reward_freezes_base_support_but_formal_subset_recovers_natural_supp
         add, [1], natural_support=True
     )
 
-    assert add.valid_days == base.valid_days
-    assert natural_candidate.valid_days > add.valid_days
+    assert np.array_equal(add.common_mask, base.common_mask)
+    assert natural_candidate.valid_days == add.valid_days
     assert natural_candidate.valid_days == shape[0]
 
 

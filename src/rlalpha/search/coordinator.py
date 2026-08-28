@@ -20,8 +20,8 @@ from .models import BudgetLedger, CandidateOutcome, SearchContext
 
 
 class SearchCoordinator:
-    CHECKPOINT_SCHEMA_VERSION = 4
-    REWARD_POOL_SEMANTICS = "independent-availability-same-support-admission-v4"
+    CHECKPOINT_SCHEMA_VERSION = 5
+    REWARD_POOL_SEMANTICS = "fixed-universe-zero-fill-psd-gram-v5"
 
     def __init__(self, searcher: Searcher, pool: PoolManager, evaluator: Callable[[object], np.ndarray], membership: np.ndarray, budget: int, run_dir: str | Path | None = None):
         self.searcher = searcher
