@@ -133,6 +133,7 @@ class VerlGRPOStageCoordinator:
         return {
             **spec,
             "archive_path": str(archive_path.resolve()),
+            "signal_cache_root": str(self.signal_cache.root.resolve()),
             "spec_hash": stable_hash(spec),
         }
 
@@ -612,6 +613,10 @@ class VerlGRPOStageCoordinator:
         self.pool.version = int(state["pool_version"])
         self.pool.history = list(state["pool_history"])
         self.pool.invalidate_cache()
+        # A crash may leave at most one reward batch of atomically published
+        # but not yet admitted signals.  Only checkpointed pool members are
+        # resumable, so discard those bounded transient files now.
+        self.signal_cache.prune(self.pool.hashes)
         all_records = [json.loads(line) for line in candidates_path.read_text(encoding="utf-8").splitlines() if line.strip()] if candidates_path.exists() else []
         self.records = all_records[: int(state.get("record_count", len(all_records)))]
         self._persisted_record_count = len(all_records)

@@ -15,7 +15,8 @@ import pandas as pd
 
 from rlalpha.data.store import PanelStore
 from rlalpha.dsl.parser import parse_expression, parse_llm_response
-from rlalpha.dsl.validity import validate_signal
+from rlalpha.dsl.validity import validate_signal, validate_signals
+from rlalpha.factors.cache import SignalCache
 from rlalpha.factors.pool import PoolManager
 from rlalpha.factors.records import PoolEntry
 from rlalpha.rewards.r0 import R0Objective
@@ -122,9 +123,12 @@ def _load_spec(requests: list[dict[str, Any]]) -> dict[str, Any]:
     path = Path(paths.pop())
     spec = json.loads(path.read_text(encoding="utf-8"))
     expected_hash = spec.pop("spec_hash")
-    # ``archive_path`` is deliberately excluded: it is a process-local output
-    # address and must not make identical fresh/resume frozen states differ.
-    hash_payload = {key: value for key, value in spec.items() if key != "archive_path"}
+    # Process-local output/cache addresses must not make identical fresh/resume
+    # frozen semantic states differ.
+    hash_payload = {
+        key: value for key, value in spec.items()
+        if key not in {"archive_path", "signal_cache_root"}
+    }
     if stable_hash(hash_payload) != expected_hash:
         raise RuntimeError("frozen GRPO stage spec hash mismatch")
     spec["spec_hash"] = expected_hash
@@ -299,7 +303,25 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ) as executor:
             validation_results = list(executor.map(validate_one, pending_validation))
     else:
-        validation_results = [validate_one(item) for item in pending_validation]
+        try:
+            batched_validity = validate_signals(
+                [item[2] for item in pending_validation],
+                panel.target(panel.common_mask),
+                pool_signals,
+            )
+            validation_results = [
+                (index, node, signal, validity, None)
+                for (index, node, signal), validity in zip(
+                    pending_validation, batched_validity, strict=True
+                )
+            ]
+        except Exception as exc:
+            # Preserve the existing per-candidate error records if a malformed
+            # array reaches validation; ordinary valid batches never take this
+            # diagnostic fallback.
+            validation_results = [validate_one(item) for item in pending_validation]
+            if validation_results and all(item[-1] is None for item in validation_results):
+                raise exc
 
     for index, node, signal, validity, error in validation_results:
         record = parsed[index][1]
@@ -388,6 +410,18 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for key in list(_SIGNALS):
         if key[0] == panel_key and key[1] not in retained:
             _SIGNALS.pop(key, None)
+
+    # The reward worker and stage coordinator are separate processes.  Commit
+    # each market-evaluated signal atomically before publishing the archive so
+    # the coordinator can mmap the exact evaluator output instead of evaluating
+    # the same AST a second time.  Prune any failed retry first; the coordinator
+    # prunes this batch again after admission, bounding storage throughout.
+    cache_root = spec.get("signal_cache_root")
+    if cache_root:
+        shared_cache = SignalCache(cache_root)
+        shared_cache.prune(pool.hashes | {entry.expr_hash for entry in scored_entries})
+        for entry in scored_entries:
+            shared_cache.put(entry.expr_hash, entry.signal, permanent=True)
 
     records = [record for _, record in parsed]
     archive = Path(spec["archive_path"])

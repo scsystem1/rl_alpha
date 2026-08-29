@@ -8,7 +8,7 @@ import pytest
 from rlalpha.dsl.evaluator import evaluate
 from rlalpha.dsl.grammar import sample_ast
 from rlalpha.dsl.parser import ExpressionSyntaxError, parse_expression, parse_llm_response
-from rlalpha.dsl.validity import validate_signal
+from rlalpha.dsl.validity import validate_signal, validate_signals
 from rlalpha.factors.cache import SignalCache
 from rlalpha.utils.numerics import finite_corr
 
@@ -229,6 +229,47 @@ def test_numba_rank_correlation_matches_scipy_with_ties_and_missing_values():
             expected[day] = finite_corr(rankdata(signal[day, common]), rankdata(pool[day, common]))
     assert np.allclose(actual, expected, equal_nan=True, atol=1e-12)
     assert np.allclose(serial, expected, equal_nan=True, atol=1e-12)
+
+
+def test_batched_validity_is_exactly_equal_with_pair_specific_missing_supports():
+    rng = np.random.default_rng(914)
+    membership = rng.random((310, 130)) > 0.04
+    signals = [np.round(rng.normal(size=membership.shape), 1) for _ in range(4)]
+    pools = [np.round(rng.normal(size=membership.shape), 1) for _ in range(5)]
+    # Some pairs share support and some do not.  This exercises both the exact
+    # rank-cache path and the legacy pairwise fallback in one batch.
+    signals[0][5:12, :9] = np.nan
+    signals[1][5:12, :9] = np.nan
+    signals[2][20:27, 15:26] = np.nan
+    pools[0][40:46, 2:8] = np.nan
+    pools[1][40:46, 2:8] = np.nan
+    pools[3][60:67, 30:39] = np.nan
+    expected = [validate_signal(signal, membership, pools) for signal in signals]
+    actual = validate_signals(signals, membership, pools)
+    assert actual == expected
+
+
+def test_batched_validity_ranks_each_side_once_on_identical_support(monkeypatch):
+    import rlalpha.dsl.validity as validity
+
+    rng = np.random.default_rng(915)
+    membership = np.ones((300, 120), dtype=bool)
+    signals = [rng.normal(size=membership.shape) for _ in range(3)]
+    pools = [rng.normal(size=membership.shape) for _ in range(4)]
+    original = validity._daily_ranks_exact
+    calls = 0
+
+    def counted(values, support):
+        nonlocal calls
+        calls += 1
+        return original(values, support)
+
+    monkeypatch.setattr(validity, "_daily_ranks_exact", counted)
+    actual = validity.validate_signals(signals, membership, pools)
+    expected = [validity.validate_signal(signal, membership, pools) for signal in signals]
+    assert actual == expected
+    # Three candidate ranks are cached; four pool ranks are streamed once.
+    assert calls == 7
 
 
 def test_intrinsic_validity_failure_skips_pool_redundancy(monkeypatch):

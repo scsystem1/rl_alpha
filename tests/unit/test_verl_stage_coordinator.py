@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from omegaconf import OmegaConf
 
+from rlalpha.dsl.parser import parse_expression
 from rlalpha.factors.pool import PoolManager
 from rlalpha.factors.records import PoolScore
 from rlalpha.search.grpo.stage_coordinator import VerlGRPOStageCoordinator
@@ -119,10 +120,70 @@ def test_dynamically_loaded_online_dataset_shares_callback_and_stop_signal():
     assert module.OnlinePoolDataset._process_multi_modal_info(messages, 14, {}) == (None, None, None)
 
 
+def test_reward_worker_signal_cache_prevents_parent_reevaluation(tmp_path):
+    coordinator = _coordinator(tmp_path / "run")
+    node = parse_expression("CSRank($return)")
+    signal = np.arange(300 * 120, dtype=float).reshape(300, 120)
+    coordinator.signal_cache.put(node.expr_hash, signal, permanent=True)
+
+    def unexpected_evaluation(_):
+        raise AssertionError("shared reward-worker signal should be reused")
+
+    coordinator.evaluator = unexpected_evaluation
+    record = {
+        "stage": 0,
+        "prompt_group": 0,
+        "rollout_index": 0,
+        "raw_text": f"<expr>{node.canonical()}</expr>",
+        "expression": node.canonical(),
+        "expr_hash": node.expr_hash,
+        "valid": True,
+        "reason_code": "ok",
+        "market_evaluated": True,
+        "delta_objective": 0.01,
+        "shaped_reward": 1.0,
+        "delta_add": 0.01,
+        "replaced_hash": None,
+        "saliency": [],
+        "eviction_candidates": [],
+        "post_prune_delta": 0.01,
+        "self_evicted": False,
+        "formally_rechecked": True,
+        "pool_score": {
+            "objective": 0.01,
+            "mean_ic": 0.01,
+            "daily_ic": [],
+            "weights": [1.0],
+            "standard_error": 0.0,
+        },
+        "reward_valid_days": 300,
+        "reward_valid_observations": int(signal.size),
+        "reward_valid_day_rate": 1.0,
+        "reward_observation_rate": 1.0,
+    }
+    entries, scores = coordinator._consume_records([record])
+    assert len(entries) == len(scores) == 1
+    assert np.array_equal(entries[0].signal, signal)
+
+
+def test_stage_io_paths_do_not_change_frozen_semantic_hash(tmp_path):
+    first = _coordinator(tmp_path / "first")
+    second = _coordinator(tmp_path / "second")
+    left = first._stage_spec(tmp_path / "left.jsonl", 8)
+    right = second._stage_spec(tmp_path / "right.jsonl", 8)
+    assert left["archive_path"] != right["archive_path"]
+    assert left["signal_cache_root"] != right["signal_cache_root"]
+    assert left["spec_hash"] == right["spec_hash"]
+
+
 def test_resume_ignores_unpaired_journal_and_rejects_old_semantics(monkeypatch, tmp_path):
     coordinator = _coordinator(tmp_path / "run", budget=2)
     _install_fake_persistent_verl(monkeypatch, coordinator)
     coordinator.run_cell()
+    orphan_hash = "reward_worker_orphan"
+    coordinator.signal_cache.put(orphan_hash, np.ones((3, 2)), permanent=True)
+    orphan_path = coordinator.signal_cache.root / f"{orphan_hash}.npy"
+    assert orphan_path.exists()
     journal = coordinator.run_dir / "checkpoints/domain_journal.jsonl"
     journal.parent.mkdir(parents=True, exist_ok=True)
     journal.write_text(json.dumps({"optimizer_update": 999, "unpaired": True}) + "\n", encoding="utf-8")
@@ -131,6 +192,7 @@ def test_resume_ignores_unpaired_journal_and_rejects_old_semantics(monkeypatch, 
     resumed.load_checkpoint()
     assert resumed.updates == 2
     assert resumed.ledger.valid_unique_evaluations == 2
+    assert not orphan_path.exists()
 
     commit = json.loads((coordinator.run_dir / "checkpoint_commit.json").read_text(encoding="utf-8"))
     commit["reward_pool_semantics"] = "legacy"

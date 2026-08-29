@@ -8,6 +8,7 @@ import pytest
 from rlalpha.search.grpo.verl_config import assert_grpo_loss_controls, build_verl_grpo_config
 from rlalpha.search.grpo import verl_reward_function
 from rlalpha.search.grpo.verl_trainer import _install_torch_padding_fallback
+from rlalpha.factors.cache import SignalCache
 from rlalpha.utils.hashing import stable_hash
 
 
@@ -173,6 +174,7 @@ def test_current_verl_reward_batch_reuses_intra_group_duplicates(monkeypatch, tm
 
     monkeypatch.setattr(verl_reward_function, "PanelStore", Store)
     archive = tmp_path / "rollouts.jsonl"
+    signal_cache_root = tmp_path / "signals"
     spec_payload = {
         "schema_version": 6,
         "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v6",
@@ -198,13 +200,18 @@ def test_current_verl_reward_batch_reuses_intra_group_duplicates(monkeypatch, tm
         "pool": [],
         "seen_hashes": [],
         "archive_path": str(archive),
+        "signal_cache_root": str(signal_cache_root),
     }
     spec = {
         **spec_payload,
-        "spec_hash": stable_hash({key: value for key, value in spec_payload.items() if key != "archive_path"}),
+        "spec_hash": stable_hash({
+            key: value for key, value in spec_payload.items()
+            if key not in {"archive_path", "signal_cache_root"}
+        }),
     }
     spec_path = tmp_path / "spec.json"
     spec_path.write_text(__import__("json").dumps(spec), encoding="utf-8")
+    SignalCache(signal_cache_root).put("stale_retry_signal", np.ones((2, 2)), permanent=True)
 
     def request(text, group):
         return {
@@ -229,6 +236,13 @@ def test_current_verl_reward_batch_reuses_intra_group_duplicates(monkeypatch, tm
     assert records[0]["shaped_reward"] == records[1]["shaped_reward"]
     assert records[2]["market_evaluated"]
     assert len(archive.read_text(encoding="utf-8").splitlines()) == 3
+    cached_files = sorted(signal_cache_root.glob("*.npy"))
+    assert len(cached_files) == 2
+    for record in (records[0], records[2]):
+        restored = SignalCache(signal_cache_root).get(record["expr_hash"])
+        expected = Panel.evaluate(__import__("rlalpha.dsl.parser", fromlist=["parse_expression"]).parse_expression(record["expression"]))
+        assert restored is not None
+        assert np.array_equal(restored, expected)
 
     cached_pool = next(iter(verl_reward_function._POOLS.values()))
     cached_state = cached_pool.prepared_state()
