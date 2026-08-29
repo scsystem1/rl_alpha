@@ -47,7 +47,7 @@ class ExperimentConfig(StrictModel):
     rewards: list[RewardName] | None = None
     cells: list[tuple[SearchMethod, RewardName]] | None = None
     seeds: list[int]
-    valid_unique_budget: int = Field(gt=0)
+    search_steps: int = Field(default=250, gt=0)
     proposal_group_size: int = Field(default=8, gt=0)
     pool_capacity: int = Field(default=20, gt=0)
     max_cpu_jobs: int = Field(default=4, gt=0)

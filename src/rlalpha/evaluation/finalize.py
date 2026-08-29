@@ -127,7 +127,7 @@ def _assert_experiment_frozen(config: str | Path, paths: Any, root: Path, experi
     missing = sorted(expected - set(actual))
     if missing:
         raise RuntimeError(f"test opening refused: missing_cells={missing}")
-    budget = int(experiment["valid_unique_budget"])
+    search_steps = int(experiment.get("search_steps", 250))
     comparability = set()
     for method, reward, seed in sorted(expected):
         directory = root / method / reward / f"seed_{seed}"
@@ -135,10 +135,10 @@ def _assert_experiment_frozen(config: str | Path, paths: Any, root: Path, experi
         if not state_path.exists():
             raise RuntimeError(f"test opening refused: cell state missing for {(method, reward, seed)}")
         state = _read_json(state_path)
-        identity = _expected_cell_identity(Path(config).resolve(), paths, method, reward, seed, budget)
-        if state.get("status") != "complete" or int(state.get("budget", -1)) != budget or state.get("cell_identity") != identity:
+        identity = _expected_cell_identity(Path(config).resolve(), paths, method, reward, seed, search_steps)
+        if state.get("status") != "complete" or int(state.get("search_steps", -1)) != search_steps or state.get("cell_identity") != identity:
             raise RuntimeError(f"test opening refused: incomplete or incompatible state for {(method, reward, seed)}")
-        accepted, reason = _cell_acceptance(directory, budget)
+        accepted, reason = _cell_acceptance(directory, search_steps)
         if not accepted:
             raise RuntimeError(f"test opening refused: {(method, reward, seed)}: {reason}")
         import yaml
@@ -449,7 +449,7 @@ def finalize_cell(
         method=str(result.get("method", identity["method"])),
         reward=str(result.get("reward", identity["reward"])),
         seed=int(result.get("seed", identity["seed"])),
-        budget=int(result.get("budget", ledger.get("limit", ledger.get("valid_unique_evaluations", 0)))),
+        search_steps=int(result.get("search_steps", ledger.get("search_steps", ledger.get("completed_steps", 0)))),
         ledger=ledger,
         pool_version=int(selected.get("pool_version", 0)),
         train_objective=result.get("train_objective"),

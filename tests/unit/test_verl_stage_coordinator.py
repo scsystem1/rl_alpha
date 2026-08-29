@@ -21,7 +21,7 @@ class _Objective:
         return PoolScore(value, value, tuple(), tuple(1.0 for _ in signals))
 
 
-def _coordinator(path: Path, budget: int = 3) -> VerlGRPOStageCoordinator:
+def _coordinator(path: Path, steps: int = 3) -> VerlGRPOStageCoordinator:
     effective = {
         "search": {"group_size": 8},
         "rollout": {"n": 8},
@@ -33,13 +33,14 @@ def _coordinator(path: Path, budget: int = 3) -> VerlGRPOStageCoordinator:
         PoolManager(_Objective()),
         lambda node: np.ones((300, 120)),
         np.ones((300, 120), dtype=bool),
-        budget,
+        steps * 8,
         path,
         effective,
         "/qe",
         "/processed",
         "r0",
         4,
+        max_training_steps=steps,
     )
 
 
@@ -48,7 +49,7 @@ def _install_fake_persistent_verl(monkeypatch, coordinator):
 
     def build(root, effective, train, validation, run_dir, **kwargs):
         assert kwargs["online_dataset"] is True
-        assert kwargs["total_training_steps"] > coordinator.ledger.limit
+        assert kwargs["total_training_steps"] > coordinator.max_training_steps
         return OmegaConf.create({
             "data": {"train_files": [str(train)]},
             "trainer": {"default_local_dir": str(Path(run_dir) / "checkpoints/verl")},
@@ -68,7 +69,7 @@ def _install_fake_persistent_verl(monkeypatch, coordinator):
             "valid_unique_evaluations": self.ledger.valid_unique_evaluations,
             "optimizer_update": self.updates,
         })
-        if self.ledger.exhausted:
+        if self.updates >= self.max_training_steps:
             return None
         return self._prepare_online_stage(session_dir)
 
@@ -193,7 +194,7 @@ def test_domain_metrics_audit_reward_scale_and_valid_saturation():
 
 
 def test_resume_ignores_unpaired_journal_and_rejects_old_semantics(monkeypatch, tmp_path):
-    coordinator = _coordinator(tmp_path / "run", budget=2)
+    coordinator = _coordinator(tmp_path / "run", steps=2)
     _install_fake_persistent_verl(monkeypatch, coordinator)
     coordinator.run_cell()
     orphan_hash = "reward_worker_orphan"
@@ -204,7 +205,7 @@ def test_resume_ignores_unpaired_journal_and_rejects_old_semantics(monkeypatch, 
     journal.parent.mkdir(parents=True, exist_ok=True)
     journal.write_text(json.dumps({"optimizer_update": 999, "unpaired": True}) + "\n", encoding="utf-8")
 
-    resumed = _coordinator(tmp_path / "run", budget=2)
+    resumed = _coordinator(tmp_path / "run", steps=2)
     resumed.load_checkpoint()
     assert resumed.updates == 2
     assert resumed.ledger.valid_unique_evaluations == 2
@@ -214,4 +215,4 @@ def test_resume_ignores_unpaired_journal_and_rejects_old_semantics(monkeypatch, 
     commit["reward_pool_semantics"] = "legacy"
     (coordinator.run_dir / "checkpoint_commit.json").write_text(json.dumps(commit), encoding="utf-8")
     with pytest.raises(RuntimeError, match="incompatible"):
-        _coordinator(tmp_path / "run", budget=2).load_checkpoint()
+        _coordinator(tmp_path / "run", steps=2).load_checkpoint()

@@ -14,7 +14,7 @@ def test_result_writers_do_not_leave_lock_files(tmp_path):
         method="base_llm",
         reward="r0",
         seed=0,
-        budget=8,
+        search_steps=1,
         ledger={"raw_proposals": 8, "valid_unique_evaluations": 8},
         pool_version=1,
         train_objective=0.1,

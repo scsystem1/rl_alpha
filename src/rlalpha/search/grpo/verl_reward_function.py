@@ -450,7 +450,7 @@ async def compute_score(
 
     Verl invokes the hook per completion.  A single reward worker is configured;
     this coroutine forms an explicit barrier over the complete GRPO rollout batch
-    so duplicate handling and valid-unique budgeting are deterministic.
+    so duplicate handling and valid-unique accounting are deterministic.
     """
     del data_source, ground_truth
     key = str(extra_info["frozen_state_hash"])

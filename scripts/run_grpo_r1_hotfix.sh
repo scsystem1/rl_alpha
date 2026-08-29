@@ -26,7 +26,7 @@ python -u -m rlalpha.cli search run \
   --method grpo_llm \
   --reward r1 \
   --seed 0 \
-  --budget 1000
+  --steps 250
 
 # A direct cell launch deliberately bypasses the matrix lock while the three
 # already-running R1 methods remain managed by the original matrix process.
@@ -39,10 +39,10 @@ from rlalpha.utils.experiment_log import update_progress
 config = Path("configs/experiment/revision_v3_full_1000_reward_staged.yaml").resolve()
 paths = load_paths(config)
 cell = _cell_dir(paths.runs_root / "'"${experiment_id}"'", "grpo_llm", "r1", 0)
-accepted, error = _cell_acceptance(cell, 1000)
+accepted, error = _cell_acceptance(cell, 250)
 if not accepted:
     raise RuntimeError(error)
-identity = _expected_cell_identity(config, paths, "grpo_llm", "r1", 0, 1000)
-update_progress(cell / "progress.json", status="complete", method="grpo_llm", reward="r1", seed=0, budget=1000, cell_identity=identity)
+identity = _expected_cell_identity(config, paths, "grpo_llm", "r1", 0, 250)
+update_progress(cell / "progress.json", status="complete", method="grpo_llm", reward="r1", seed=0, search_steps=250, cell_identity=identity)
 '
 echo "$(date -Iseconds) Repaired GRPO R1 completed and passed matrix acceptance"

@@ -109,6 +109,7 @@ def build_report(experiment_id: str, config: str | Path, methods: list[str] | No
         admitted = sum(bool(item.get("admitted")) for item in checkpoint.get("pool_history", []))
         search_rows.append({
             "method": method, "reward": reward, "seed": seed,
+            "search_steps": train.get("completed_steps"),
             "raw_proposals": train.get("raw_proposals"), "valid": valid,
             "unique": train.get("valid_unique_evaluations"), "admitted": admitted,
             "pool_size": metrics.get("pool_size"), "tokens": train.get("tokens", 0),
@@ -164,16 +165,16 @@ def build_report(experiment_id: str, config: str | Path, methods: list[str] | No
         transaction = _read_json(root / ("test_finalization.json" if scope_name == "all" else f"test_finalization_{scope_name}.json"))
         if transaction.get("status") != "complete":
             raise RuntimeError("formal aggregate refused: experiment test finalization is not complete")
-        budget = int(experiment["valid_unique_budget"])
+        search_steps = int(experiment.get("search_steps", 250))
         comparability = set()
         for key, cell in cells.items():
             state = _read_json(cell / "progress.json")
             train = _read_json(cell / "train_metrics.json")
             marker = _read_json(cell / "test/finalization.json")
-            if state.get("status") != "complete" or int(state.get("budget", -1)) != budget:
-                raise RuntimeError(f"formal aggregate refused: incomplete or wrong-budget state for {key}")
-            if int(train.get("valid_unique_evaluations", -1)) < budget:
-                raise RuntimeError(f"formal aggregate refused: budget not met for {key}")
+            if state.get("status") != "complete" or int(state.get("search_steps", -1)) != search_steps:
+                raise RuntimeError(f"formal aggregate refused: incomplete or wrong-step state for {key}")
+            if int(train.get("completed_steps", -1)) < search_steps:
+                raise RuntimeError(f"formal aggregate refused: search steps not completed for {key}")
             if marker.get("status") != "complete":
                 raise RuntimeError(f"formal aggregate refused: cell finalization incomplete for {key}")
             import yaml

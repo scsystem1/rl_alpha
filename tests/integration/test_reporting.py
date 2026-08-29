@@ -53,7 +53,7 @@ def test_formal_report_refuses_missing_matrix_cells(tmp_path: Path) -> None:
     config = tmp_path / "config.yaml"
     config.write_text(yaml.safe_dump({
         "paths": {"code_root": str(tmp_path), "raw_data_root": str(tmp_path), "processed_root": str(tmp_path), "cache_root": str(tmp_path), "runs_root": str(runs), "model_search_root": str(tmp_path), "alphagen_root": str(tmp_path), "quantevolver_root": str(tmp_path)},
-        "experiment": {"cells": [["random", "r0"], ["gp", "r0"]], "seeds": [0], "valid_unique_budget": 8},
+        "experiment": {"cells": [["random", "r0"], ["gp", "r0"]], "seeds": [0], "search_steps": 1},
     }), encoding="utf-8")
     with pytest.raises(RuntimeError, match="missing_cells"):
         build_report("incomplete", config)

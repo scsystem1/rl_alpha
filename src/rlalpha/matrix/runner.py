@@ -92,7 +92,7 @@ def _contains_cuda_oom(text: str) -> bool:
     return "cuda out of memory" in lowered or "torch.outofmemoryerror" in lowered or "cublas_status_alloc_failed" in lowered
 
 
-def _expected_cell_identity(config: Path, paths: Any, method: str, reward: str, seed: int, budget: int) -> str:
+def _expected_cell_identity(config: Path, paths: Any, method: str, reward: str, seed: int, steps: int) -> str:
     referenced = [
         config,
         Path(paths.code_root) / f"configs/search/{method}.yaml",
@@ -128,7 +128,7 @@ def _expected_cell_identity(config: Path, paths: Any, method: str, reward: str, 
                     model_runtime.append({"path": str(candidate.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "declared_sha256": model_config["fingerprint"]["weights_sha256"]})
                 else:
                     model_runtime.append(_cached_file_identity(str(candidate.resolve()), stat.st_size, stat.st_mtime_ns))
-    return stable_hash({"schema_version": 2, "method": method, "reward": reward, "seed": seed, "budget": budget, "inputs": records, "repositories": repositories, "model_runtime": model_runtime})
+    return stable_hash({"schema_version": 3, "method": method, "reward": reward, "seed": seed, "search_steps": steps, "inputs": records, "repositories": repositories, "model_runtime": model_runtime})
 
 
 def _pid_alive(pid: int | None) -> bool:
@@ -141,7 +141,7 @@ def _pid_alive(pid: int | None) -> bool:
         return False
 
 
-def _cell_acceptance(directory: Path, budget: int) -> tuple[bool, str | None]:
+def _cell_acceptance(directory: Path, steps: int) -> tuple[bool, str | None]:
     metrics_path = directory / "train_metrics.json"
     manifest_path = directory / "manifest.yaml"
     final_pool_path = directory / "final_pool.json"
@@ -151,16 +151,16 @@ def _cell_acceptance(directory: Path, budget: int) -> tuple[bool, str | None]:
         metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
     except Exception as exc:
         return False, f"invalid train metrics: {exc}"
-    if int(metrics.get("valid_unique_evaluations", -1)) < budget:
-        return False, "valid-unique budget was not met"
+    if int(metrics.get("completed_steps", -1)) < steps:
+        return False, "fixed search-step budget was not met"
     try:
         import yaml
 
         manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
     except Exception as exc:
         return False, f"invalid manifest: {exc}"
-    if int((manifest.get("budget") or {}).get("valid_unique_evaluations", -1)) < budget:
-        return False, "manifest does not record the completed valid-unique budget"
+    if int(manifest.get("completed_steps", -1)) < steps or int(manifest.get("search_steps", -1)) != steps:
+        return False, "manifest does not record the completed fixed search-step budget"
     if not manifest.get("manifest_hash") or not manifest.get("panel_artifacts") or not manifest.get("evaluator_version"):
         return False, "manifest is missing required identity fields"
     return True, None
@@ -197,8 +197,8 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
             raise RuntimeError(f"--no-resume refuses existing cell directories: {occupied}; use a new experiment ID")
     if any(method in {"base_llm", "grpo_llm"} for method, _, _ in cells) and not bool(experiment.get("auto_start_expensive_jobs", False)):
         raise RuntimeError("expensive Base-LLM/GRPO cells are disabled by experiment.auto_start_expensive_jobs=false")
-    budget = int(experiment["valid_unique_budget"])
-    append_event(root / "experiment.log", "matrix_started", experiment_id=experiment_id, cells=len(cells), budget=budget)
+    steps = int(experiment.get("search_steps", 250))
+    append_event(root / "experiment.log", "matrix_started", experiment_id=experiment_id, cells=len(cells), search_steps=steps, candidates_per_step=int(experiment.get("proposal_group_size", 8)))
     gpu_thresholds = {
         **GPU_THRESHOLDS_MIB,
         **{int(device): int(value) for device, value in experiment.get("gpu_min_free_mib", {}).items()},
@@ -213,8 +213,8 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
         cell = _cell_dir(root, method, reward, int(seed))
         state_path = cell / "progress.json"
         state = json.loads(state_path.read_text(encoding="utf-8")) if resume and state_path.exists() else {}
-        identity = _expected_cell_identity(config, paths, method, reward, int(seed), budget)
-        if state.get("status") == "complete" and state.get("cell_identity") == identity and int(state.get("budget", -1)) == budget:
+        identity = _expected_cell_identity(config, paths, method, reward, int(seed), steps)
+        if state.get("status") == "complete" and state.get("cell_identity") == identity and int(state.get("search_steps", -1)) == steps:
             continue
         if state.get("status") == "running" and _pid_alive(state.get("pid")):
             external[(method, reward, int(seed))] = state
@@ -258,9 +258,9 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
             directory = _cell_dir(root, method, reward, seed)
             directory.mkdir(parents=True, exist_ok=True)
             state_path = directory / "progress.json"
-            cell_identity = _expected_cell_identity(config, paths, method, reward, seed, budget)
-            update_progress(state_path, status="running", method=method, reward=reward, seed=seed, budget=budget, cell_identity=cell_identity, gpu=gpu, attempt=attempt, rollout_microbatch=microbatch, started_at=time.time(), gpu_free_mib=free.get(gpu) if gpu is not None else None)
-            append_event(directory / "experiment.log", "cell_started", method=method, reward=reward, seed=seed, budget=budget, gpu=gpu, attempt=attempt)
+            cell_identity = _expected_cell_identity(config, paths, method, reward, seed, steps)
+            update_progress(state_path, status="running", method=method, reward=reward, seed=seed, search_steps=steps, cell_identity=cell_identity, gpu=gpu, attempt=attempt, rollout_microbatch=microbatch, started_at=time.time(), gpu_free_mib=free.get(gpu) if gpu is not None else None)
+            append_event(directory / "experiment.log", "cell_started", method=method, reward=reward, seed=seed, search_steps=steps, gpu=gpu, attempt=attempt)
             append_event(root / "experiment.log", "cell_started", cell=f"{method}/{reward}/seed_{seed}", gpu=gpu, attempt=attempt)
             runtime_dir = directory / "details"
             runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -276,9 +276,9 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
                 env[variable] = str(thread_count)
             if method == "grpo_llm":
                 env["RLALPHA_GRPO_MICROBATCH"] = str(microbatch)
-            command = [sys.executable, "-m", "rlalpha.cli", "search", "run", "--method", method, "--reward", reward, "--seed", str(seed), "--budget", str(budget), "--experiment-id", experiment_id, "--config", str(config)]
+            command = [sys.executable, "-m", "rlalpha.cli", "search", "run", "--method", method, "--reward", reward, "--seed", str(seed), "--steps", str(steps), "--experiment-id", experiment_id, "--config", str(config)]
             process = subprocess.Popen(command, cwd=paths.code_root, env=env, stdout=log_handle, stderr=subprocess.STDOUT, text=True)
-            update_progress(state_path, status="running", method=method, reward=reward, seed=seed, budget=budget, cell_identity=cell_identity, gpu=gpu, pid=process.pid, attempt=attempt, rollout_microbatch=microbatch, started_at=time.time(), gpu_free_mib=free.get(gpu) if gpu is not None else None)
+            update_progress(state_path, status="running", method=method, reward=reward, seed=seed, search_steps=steps, cell_identity=cell_identity, gpu=gpu, pid=process.pid, attempt=attempt, rollout_microbatch=microbatch, started_at=time.time(), gpu_free_mib=free.get(gpu) if gpu is not None else None)
             running[process] = (method, reward, seed, time.time(), log_handle, gpu, attempt, microbatch, log_offset)
             pending.remove(cell)
             busy_gpus.add(gpu)
@@ -300,11 +300,11 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
                 attempt_log = handle.read()
             state_path = _cell_dir(root, method, reward, seed) / "progress.json"
             oom_retry = returncode != 0 and method == "grpo_llm" and _contains_cuda_oom(attempt_log) and microbatch > 1
-            accepted, acceptance_error = _cell_acceptance(_cell_dir(root, method, reward, seed), budget) if returncode == 0 else (False, None)
+            accepted, acceptance_error = _cell_acceptance(_cell_dir(root, method, reward, seed), steps) if returncode == 0 else (False, None)
             status = "retrying_after_oom" if oom_retry else ("complete" if returncode == 0 and accepted else "failed")
             next_microbatch = max(1, microbatch // 2) if oom_retry else microbatch
-            cell_identity = _expected_cell_identity(config, paths, method, reward, seed, budget)
-            update_progress(state_path, status=status, method=method, reward=reward, seed=seed, budget=budget, cell_identity=cell_identity, gpu=gpu, returncode=returncode, attempt=attempt, rollout_microbatch=next_microbatch, started_at=started, finished_at=time.time(), wall_seconds=time.time() - started, acceptance_error=acceptance_error, error_tail=attempt_log[-4000:] if returncode else None)
+            cell_identity = _expected_cell_identity(config, paths, method, reward, seed, steps)
+            update_progress(state_path, status=status, method=method, reward=reward, seed=seed, search_steps=steps, cell_identity=cell_identity, gpu=gpu, returncode=returncode, attempt=attempt, rollout_microbatch=next_microbatch, started_at=started, finished_at=time.time(), wall_seconds=time.time() - started, acceptance_error=acceptance_error, error_tail=attempt_log[-4000:] if returncode else None)
             append_event(_cell_dir(root, method, reward, seed) / "experiment.log", "cell_finished", status=status, returncode=returncode, wall_seconds=round(time.time() - started, 3))
             append_event(root / "experiment.log", "cell_finished", cell=f"{method}/{reward}/seed_{seed}", status=status, returncode=returncode)
             if oom_retry:
@@ -318,8 +318,8 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
             directory = _cell_dir(root, method, reward, seed)
             metrics_path = directory / "train_metrics.json"
             metrics = json.loads(metrics_path.read_text(encoding="utf-8")) if metrics_path.exists() else {}
-            expected_identity = _expected_cell_identity(config, paths, method, reward, seed, budget)
-            if int(metrics.get("valid_unique_evaluations", -1)) >= budget and state.get("cell_identity") == expected_identity:
+            expected_identity = _expected_cell_identity(config, paths, method, reward, seed, steps)
+            if int(metrics.get("completed_steps", -1)) >= steps and state.get("cell_identity") == expected_identity:
                 update_progress(directory / "progress.json", **{**state, "status": "complete", "recovered_after_runner_restart": True, "finished_at": time.time()})
             else:
                 pending.append((method, reward, seed, int(state.get("attempt", 0)) + 1, int(state.get("rollout_microbatch", 8))))

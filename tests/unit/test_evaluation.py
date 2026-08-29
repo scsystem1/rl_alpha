@@ -132,7 +132,7 @@ def test_factor_significance_and_bh_fdr_boundaries() -> None:
 
 def test_test_opening_refuses_an_incomplete_configured_matrix(tmp_path) -> None:
     config = tmp_path / "experiment.yaml"
-    experiment = {"methods": ["random"], "rewards": ["r0"], "seeds": [0], "valid_unique_budget": 8}
+    experiment = {"methods": ["random"], "rewards": ["r0"], "seeds": [0], "search_steps": 1}
     config.write_text(yaml.safe_dump({"experiment": experiment}), encoding="utf-8")
     paths = PathsConfig(code_root=tmp_path, runs_root=tmp_path / "runs", processed_root=tmp_path / "processed")
     with pytest.raises(RuntimeError, match="missing_cells"):

@@ -104,7 +104,7 @@ class OnlinePoolDataset(RLHFDataset):
         callback = _CALLBACKS[self.callback_key]
         next_row = callback({"batch": batch})
         if next_row is None:
-            raise OnlineTrainingComplete("valid-unique budget exhausted")
+            raise OnlineTrainingComplete("fixed search-step budget exhausted")
         self._completed_batches += 1
         if self._completed_batches >= len(self._rows):
             raise OnlineTrainingComplete("online dataset capacity exhausted")

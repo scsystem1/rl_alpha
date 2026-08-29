@@ -13,7 +13,7 @@ from rlalpha.search.coordinator import SearchCoordinator
 from rlalpha.search.models import CandidateOutcome, SearchContext
 from rlalpha.search.random_search import RandomSearcher
 from rlalpha.search.run import _select_snapshot, _snapshot_record, _write_lineage
-from rlalpha.matrix.runner import _contains_cuda_oom, _gpu_candidates, _gpu_for, _pid_alive, run_matrix
+from rlalpha.matrix.runner import _cell_acceptance, _contains_cuda_oom, _gpu_candidates, _gpu_for, _pid_alive, run_matrix
 from rlalpha.config import load_yaml
 
 
@@ -259,6 +259,32 @@ def test_unknown_config_fields_fail_instead_of_being_ignored(tmp_path):
         load_yaml(config)
 
 
+def test_experiment_defaults_to_250_eight_candidate_steps(tmp_path):
+    config = tmp_path / "experiment.yaml"
+    config.write_text("experiment:\n  methods: [random]\n  rewards: [r0]\n  seeds: [0]\n", encoding="utf-8")
+    experiment = load_yaml(config)["experiment"]
+    from rlalpha.config import ExperimentConfig
+
+    resolved = ExperimentConfig.model_validate(experiment)
+    assert resolved.search_steps == 250
+    assert resolved.proposal_group_size == 8
+
+
+def test_cell_completion_depends_on_steps_not_valid_factor_count(tmp_path):
+    import json
+
+    (tmp_path / "train_metrics.json").write_text(
+        json.dumps({"completed_steps": 2, "candidates_per_step": 8, "valid_unique_evaluations": 1}),
+        encoding="utf-8",
+    )
+    (tmp_path / "manifest.yaml").write_text(
+        "search_steps: 2\ncompleted_steps: 2\ncandidates_per_step: 8\nmanifest_hash: test\npanel_artifacts: [panel]\nevaluator_version: v1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "final_pool.json").write_text("{}", encoding="utf-8")
+    assert _cell_acceptance(tmp_path, 2) == (True, None)
+
+
 def test_formal_gp_config_requires_eight_candidates_and_complete_probabilities(tmp_path):
     wrong_population = tmp_path / "wrong_population.yaml"
     wrong_population.write_text("search:\n  method: gp\n  population_size: 16\n", encoding="utf-8")
@@ -281,7 +307,7 @@ def test_matrix_failure_isolated_and_resume_only_restarts_failed_cell(tmp_path, 
     config = tmp_path / "matrix.yaml"
     config.write_text(yaml.safe_dump({
         "paths": {"code_root": str(tmp_path), "raw_data_root": str(tmp_path), "processed_root": str(tmp_path), "cache_root": str(tmp_path), "runs_root": str(tmp_path / "runs"), "model_search_root": str(tmp_path), "alphagen_root": str(tmp_path), "quantevolver_root": str(tmp_path)},
-        "experiment": {"cells": [["random", "r0"], ["gp", "r0"]], "seeds": [0], "valid_unique_budget": 8, "max_cpu_jobs": 2},
+        "experiment": {"cells": [["random", "r0"], ["gp", "r0"]], "seeds": [0], "search_steps": 1, "max_cpu_jobs": 2},
     }), encoding="utf-8")
     failed_methods = {"gp"}
     calls = []
@@ -317,7 +343,7 @@ def test_matrix_method_filter_never_launches_other_methods(tmp_path, monkeypatch
     config = tmp_path / "matrix.yaml"
     config.write_text(yaml.safe_dump({
         "paths": {"code_root": str(tmp_path), "raw_data_root": str(tmp_path), "processed_root": str(tmp_path), "cache_root": str(tmp_path), "runs_root": str(tmp_path / "runs"), "model_search_root": str(tmp_path), "alphagen_root": str(tmp_path), "quantevolver_root": str(tmp_path)},
-        "experiment": {"cells": [["random", "r0"], ["gp", "r0"]], "seeds": [0], "valid_unique_budget": 8, "max_cpu_jobs": 2},
+        "experiment": {"cells": [["random", "r0"], ["gp", "r0"]], "seeds": [0], "search_steps": 1, "max_cpu_jobs": 2},
     }), encoding="utf-8")
     calls = []
 
@@ -343,7 +369,7 @@ def test_matrix_reward_filter_never_launches_other_rewards(tmp_path, monkeypatch
     config = tmp_path / "matrix.yaml"
     config.write_text(yaml.safe_dump({
         "paths": {"code_root": str(tmp_path), "raw_data_root": str(tmp_path), "processed_root": str(tmp_path), "cache_root": str(tmp_path), "runs_root": str(tmp_path / "runs"), "model_search_root": str(tmp_path), "alphagen_root": str(tmp_path), "quantevolver_root": str(tmp_path)},
-        "experiment": {"cells": [["random", "r1"], ["random", "r0"]], "seeds": [0], "valid_unique_budget": 8, "max_cpu_jobs": 2},
+        "experiment": {"cells": [["random", "r1"], ["random", "r0"]], "seeds": [0], "search_steps": 1, "max_cpu_jobs": 2},
     }), encoding="utf-8")
     calls = []
 

@@ -3,8 +3,10 @@
 The formal design crosses search method (`random`, `gp`, `base_llm`,
 `grpo_llm`) with reward (`r0`, `r1`, `r2_lcb`). Every proposal group has eight
 candidates, is scored against one frozen train-only pool, and admits at most
-one candidate. Pool capacity is 20 and budget means valid unique
-market-evaluated formulas, not raw generations.
+one candidate. Pool capacity is 20. Every method runs the same fixed number of
+search steps (250 by default), so each formal cell receives exactly 2,000 raw
+candidate proposals. Valid unique market-evaluated formulas remain an outcome
+metric and no longer control stopping.
 
 GP uses AlphaGen's modified `gplearn` implementation. Its entire population is
 one eight-candidate generation. AlphaGen performs tournament selection,
@@ -33,7 +35,7 @@ must not be used to claim M0–M9 completion.
 - Validation: selection among already frozen pool snapshots using the
   predeclared reward objective. It never updates model or pool.
 - Test: may be opened independently for any requested method after that
-  method's configured cells complete the correct budget and identities.
+  method's configured cells complete the configured steps and identities.
 
 Each cell uses a factor-independent train+validation metric universe and a
 label-free test trade universe. Factor residual nulls are zero opinions for
@@ -44,16 +46,16 @@ in `docs/evaluation_protocol.md`.
 
 ## Revision-v3 acceptance runs
 
-`revision_v3_cpu_smoke.yaml` contains Random-R0 and GP-R0, seed 0, budget 8. It
-exists to exercise real data, lineage, final evaluation, and formal report
+`revision_v3_cpu_smoke.yaml` contains Random-R0 and GP-R0, seed 0, for one
+eight-candidate step. It exists to exercise real data, lineage, final evaluation, and formal report
 gates cheaply. The accepted run `revision_v3_cpu_smoke_final` completed both
 cells; this is engineering evidence, not a method comparison with useful
 power.
 
 `revision_v3_full_smoke.yaml` declares 12 cells (four methods × three rewards),
-seed 0, budget 64. Expensive jobs are disabled. It may run only after the
+seed 0, for eight steps. Expensive jobs are disabled. It may run only after the
 remaining prompt/resume gates in the compliance matrix are closed. A later confirmatory
-configuration must use predeclared cells/seeds/budgets and a new experiment
+configuration must use predeclared cells/seeds/steps and a new experiment
 family; it must not resume the legacy screen.
 
 ## Identity, resume, and reporting
@@ -64,7 +66,7 @@ hashes, and actual model files for LLM methods. Run identity additionally
 freezes the effective config and evaluator semantics. A checkpoint is readable
 only with matching checkpoint schema 7, fixed-universe reward semantics, and
 checkpoint fingerprint. Matrix
-completion requires accepted train metrics, final pool, manifest, exact budget
+completion requires accepted train metrics, final pool, manifest, exact step count
 and current identity.
 
 Method-specific reports require only that method's requested cells and test

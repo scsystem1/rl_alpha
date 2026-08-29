@@ -451,23 +451,22 @@ class VerlGRPOStageCoordinator:
             }
             self.pool_snapshots[-1]["checkpoint"] = str(paired)
             self.save_checkpoint()
-        if self.ledger.exhausted:
+        if self.updates >= self.max_training_steps:
             return None
         return self._prepare_online_stage(session_dir)
 
     def run_cell(self) -> dict[str, Any]:
         """Run all GRPO updates with one Ray/Verl/vLLM lifetime."""
-        if self.ledger.exhausted:
+        if self.updates >= self.max_training_steps:
             raise RuntimeError("cannot run a completed GRPO cell")
         from .online_dataset import register_online_callback, unregister_online_callback
 
         session_dir = self.run_dir / "grpo_session"
         session_dir.mkdir(parents=True, exist_ok=True)
         initial_row = self._prepare_online_stage(session_dir)
-        # One valid representative per update is the conservative upper bound.
-        # Keep dataset length stable across paired-checkpoint resume so Verl's
-        # StatefulDataLoader sampler offset remains valid.
-        max_updates = min(self.max_training_steps, max(2, self.ledger.limit + 1))
+        # One optimizer update is one search step.  The extra row lets the
+        # online callback stop cleanly immediately after the final update.
+        max_updates = max(2, self.max_training_steps + 1)
         train_file = session_dir / "online_train.parquet"
         validation_file = session_dir / "validation.parquet"
         pd.DataFrame([initial_row for _ in range(max_updates)]).to_parquet(train_file, index=False)
@@ -506,8 +505,8 @@ class VerlGRPOStageCoordinator:
             trainer_result = run_quant_evolver_verl_trainer(config, expected_global_step=None)
         finally:
             unregister_online_callback(train_file)
-        if not self.ledger.exhausted:
-            raise RuntimeError("GRPO online dataset reached its safety limit before exhausting the valid-unique budget")
+        if self.updates < self.max_training_steps:
+            raise RuntimeError("GRPO online dataset stopped before completing the fixed search-step budget")
         self.checkpoint = Path(trainer_result["checkpoint"])
         self.checkpoint_fingerprint = {
             "global_step": int(trainer_result["global_step"]),

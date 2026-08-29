@@ -11,7 +11,7 @@ experiment:
   cells:
     - [alphasage, r0]
   seeds: [0]
-  valid_unique_budget: 298
+  search_steps: 250
   proposal_group_size: 1
   pool_capacity: 20
   auto_start_expensive_jobs: false

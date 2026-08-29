@@ -16,7 +16,7 @@ experiment:
     - [grpo_llm, r1]
     - [grpo_llm, r2_lcb]
   seeds: [0, 1, 2]
-  valid_unique_budget: 20000
+  search_steps: 250
   proposal_group_size: 8
   pool_capacity: 20
   max_cpu_jobs: 4

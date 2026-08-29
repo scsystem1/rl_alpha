@@ -37,6 +37,7 @@ def _record_round(
     admission: dict[str, Any],
     coordinator: Any,
     pool: PoolManager,
+    search_steps: int,
 ) -> None:
     normalized = [item.to_dict() if hasattr(item, "to_dict") else dict(item) for item in records]
     selected_hash = admission.get("candidate_hash")
@@ -53,7 +54,7 @@ def _record_round(
         "pool_version": pool.version,
         "pool_size": len(pool.entries),
         "pool_objective": float(score.objective),
-        "budget": f"{coordinator.ledger.valid_unique_evaluations}/{coordinator.ledger.limit}",
+        "steps": f"{round_number}/{search_steps}",
     }
     append_event(run_dir / "experiment.log", "round_complete", **fields)
     update_progress(
@@ -61,9 +62,10 @@ def _record_round(
         status="running",
         method=method,
         round=round_number,
+        completed_steps=round_number,
+        search_steps=search_steps,
         last_round=fields,
         valid_unique_evaluations=coordinator.ledger.valid_unique_evaluations,
-        valid_unique_budget=coordinator.ledger.limit,
         pool_version=pool.version,
         pool_size=len(pool.entries),
     )
@@ -266,23 +268,29 @@ def _select_snapshot(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
     ) if eligible else {"pool_version": 0, "expressions": [], "factors": [], "train": {}, "validation": {}}
 
 
-def run_search(config_path: str | Path, method: str, reward: str, seed: int, budget: int, experiment_id: str, resume: bool = True) -> dict[str, Any]:
+def run_search(config_path: str | Path, method: str, reward: str, seed: int, steps: int, experiment_id: str, resume: bool = True) -> dict[str, Any]:
+    if steps <= 0:
+        raise ValueError(f"search steps must be positive, got {steps}")
     raw_config = load_yaml(config_path)
+    group_size = int(raw_config.get("experiment", {}).get("proposal_group_size", 8))
+    if method in {"random", "gp", "base_llm", "grpo_llm"} and group_size != 8:
+        raise ValueError(f"{method} fairness protocol requires proposal_group_size=8, got {group_size}")
+    candidate_limit = int(steps) * group_size
     paths = load_paths(config_path)
     method_config = load_yaml(paths.code_root / f"configs/search/{method}.yaml").get("search", {})
     model_config = load_yaml(paths.code_root / "configs/model/qwen3_5_2b.yaml") if method in {"base_llm", "grpo_llm"} else {}
     reward_config = load_yaml(paths.code_root / f"configs/reward/{reward}.yaml")
     data_config = load_yaml(paths.code_root / "configs/data/sp500.yaml").get("data", {})
     evaluation_config = load_yaml(paths.code_root / "configs/eval/preliminary.yaml").get("evaluation", {})
-    merged_config = {**method_config, **model_config, "method": method, "reward": reward, "seed": seed, "budget": budget}
+    merged_config = {**method_config, **model_config, "method": method, "reward": reward, "seed": seed, "search_steps": steps}
     run_dir = paths.runs_root / experiment_id / method / reward / f"seed_{seed}"
     if not resume and run_dir.exists() and any(run_dir.iterdir()):
         raise RuntimeError(
             f"--no-resume refuses non-empty cell directory {run_dir}; use a new experiment ID or an empty directory"
         )
     run_dir.mkdir(parents=True, exist_ok=True)
-    append_event(run_dir / "experiment.log", "search_started", experiment_id=experiment_id, method=method, reward=reward, seed=seed, budget=budget, resume=resume)
-    update_progress(run_dir / "progress.json", status="initializing", method=method, reward=reward, seed=seed, budget=budget)
+    append_event(run_dir / "experiment.log", "search_started", experiment_id=experiment_id, method=method, reward=reward, seed=seed, search_steps=steps, candidates_per_step=group_size, resume=resume)
+    update_progress(run_dir / "progress.json", status="initializing", method=method, reward=reward, seed=seed, search_steps=steps, candidates_per_step=group_size)
     environment_dir = run_dir / "environment"
     environment_dir.mkdir(parents=True, exist_ok=True)
     freeze = subprocess.run([__import__("sys").executable, "-m", "pip", "freeze"], capture_output=True, text=True, check=False)
@@ -290,7 +298,7 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, bud
     gpu_start = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.used,memory.free,utilization.gpu", "--format=csv,noheader,nounits"], capture_output=True, text=True, check=False)
     atomic_write_text(environment_dir / "gpu-start.csv", gpu_start.stdout or gpu_start.stderr)
     merged_config["run_dir"] = str(run_dir)
-    effective_config = {"paths": paths.model_dump(mode="json"), "data": data_config, "experiment": raw_config.get("experiment", {}), "search": method_config, **model_config, **reward_config, "evaluation": evaluation_config, "invocation": {"experiment_id": experiment_id, "method": method, "reward": reward, "seed": seed, "budget": budget}}
+    effective_config = {"paths": paths.model_dump(mode="json"), "data": data_config, "experiment": raw_config.get("experiment", {}), "search": method_config, **model_config, **reward_config, "evaluation": evaluation_config, "invocation": {"experiment_id": experiment_id, "method": method, "reward": reward, "seed": seed, "search_steps": steps, "candidates_per_step": group_size}}
     if method == "grpo_llm":
         from .base_llm import resolve_model_path
 
@@ -339,22 +347,23 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, bud
             pool,
             train.evaluate,
             train.target(train.common_mask),
-            budget,
+            candidate_limit,
             run_dir,
             effective_config,
             paths.quantevolver_root,
             paths.processed_root,
             reward,
             seed,
+            max_training_steps=steps,
         )
         searcher = coordinator.searcher
     else:
         searcher = searcher_for(method, seed, merged_config, paths.alphagen_root)
-        coordinator = SearchCoordinator(searcher, pool, train.evaluate, train.target(train.common_mask), budget, run_dir)
+        coordinator = SearchCoordinator(searcher, pool, train.evaluate, train.target(train.common_mask), candidate_limit, run_dir)
     checkpoint = run_dir / "checkpoint.json"
     if resume and checkpoint.exists():
         coordinator.load_checkpoint()
-        coordinator.ledger.limit = budget
+        coordinator.ledger.limit = candidate_limit
     snapshots_path = run_dir / "checkpoints/snapshots.jsonl"
     snapshots: list[dict[str, Any]] = []
     if snapshots_path.exists():
@@ -367,9 +376,6 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, bud
             handle.write(json.dumps(snapshot, sort_keys=True, default=str) + "\n")
             handle.flush()
     started = time.monotonic()
-    group_size = int(raw_config.get("experiment", {}).get("proposal_group_size", 8))
-    if method in {"random", "gp", "base_llm", "grpo_llm"} and group_size != 8:
-        raise ValueError(f"{method} fairness protocol requires proposal_group_size=8, got {group_size}")
     if method == "grpo_llm":
         cell_result = coordinator.run_cell()
         for snapshot in cell_result["pool_snapshots"]:
@@ -388,11 +394,11 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, bud
         )
     else:
         last_version = pool.version
-        while not coordinator.ledger.exhausted:
+        while coordinator.group_index < steps:
             history_before = len(pool.history)
             outcomes = coordinator.run_group(group_size)
             admission = pool.history[-1] if len(pool.history) > history_before else {"admitted": False, "reason": "deferred"}
-            _record_round(run_dir, method, int(coordinator.group_index), outcomes, admission, coordinator, pool)
+            _record_round(run_dir, method, int(coordinator.group_index), outcomes, admission, coordinator, pool, steps)
             if pool.version != last_version:
                 expressions = [entry.expression for entry in pool.entries]
                 validation_score = _score_validation(expressions, validation, reward, validation_signal_cache, reward_options)
@@ -414,12 +420,13 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, bud
     selected = _select_snapshot(snapshots)
     selected = _write_lineage(run_dir, coordinator, snapshots, selected, method, reward, seed, experiment_id)
     write_json(run_dir / "final_pool.json", selected)
-    train_metrics = {**coordinator.ledger.state_dict(), "pool_size": len(pool.entries), "pool_version": pool.version, "wall_seconds": time.monotonic() - started}
+    completed_steps = int(coordinator.updates if method == "grpo_llm" else coordinator.group_index)
+    train_metrics = {**coordinator.ledger.state_dict(), "search_steps": int(steps), "completed_steps": completed_steps, "candidates_per_step": group_size, "pool_size": len(pool.entries), "pool_version": pool.version, "wall_seconds": time.monotonic() - started}
     write_json(run_dir / "train_metrics.json", train_metrics)
     write_json(run_dir / "validation_metrics.json", selected.get("validation", {}))
     prompt = prompt_contract() if method in {"base_llm", "grpo_llm"} else None
     manifest = build_manifest(paths, list(discover_data_files(paths.raw_data_root).values()), effective_config=effective_config, model_config=model_config.get("model") if model_config else None, prompt=prompt, reward_version=f"{reward}:fixed-universe-zero-fill-psd-gram-v7", evaluator_version=EVALUATOR_SEMANTICS_VERSION)
-    manifest.update({"experiment_id": experiment_id, "method": method, "reward": reward, "seed": seed, "budget": coordinator.ledger.state_dict(), "model": model_config.get("model") if model_config else None, "splits": {name: {"start": str(split.start.date()), "end": str(split.end.date())} for name, split in __import__("rlalpha.data.splits", fromlist=["SPLITS"]).SPLITS.items()}, "conventions": {"label": "20 trading-day next-close total return", "signal": "formed after t close", "execution": "next trading-day close", "pnl_start": "trading day after execution"}})
+    manifest.update({"experiment_id": experiment_id, "method": method, "reward": reward, "seed": seed, "search_steps": int(steps), "completed_steps": completed_steps, "candidates_per_step": group_size, "search_accounting": coordinator.ledger.state_dict(), "model": model_config.get("model") if model_config else None, "splits": {name: {"start": str(split.start.date()), "end": str(split.end.date())} for name, split in __import__("rlalpha.data.splits", fromlist=["SPLITS"]).SPLITS.items()}, "conventions": {"label": "20 trading-day next-close total return", "signal": "formed after t close", "execution": "next trading-day close", "pnl_start": "trading day after execution"}})
     manifest.pop("manifest_hash", None)
     manifest["manifest_hash"] = stable_hash(manifest)
     write_yaml(run_dir / "manifest.yaml", manifest)
@@ -429,7 +436,8 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, bud
         "method": method,
         "reward": reward,
         "seed": seed,
-        "budget": budget,
+        "search_steps": int(steps),
+        "candidates_per_step": group_size,
         "search": train_metrics,
         "selected_pool_version": selected.get("pool_version"),
         "train_objective": selected.get("train", {}).get("objective"),
@@ -443,15 +451,15 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, bud
         method=method,
         reward=reward,
         seed=seed,
-        budget=budget,
-        ledger=coordinator.ledger.state_dict(),
+        search_steps=steps,
+        ledger=train_metrics,
         pool_version=int(selected.get("pool_version", 0)),
         train_objective=selected.get("train", {}).get("objective"),
         validation_objective=selected.get("validation", {}).get("objective"),
         expressions=selected.get("expressions", []),
     )
-    update_progress(run_dir / "progress.json", status="search_complete", valid_unique_evaluations=coordinator.ledger.valid_unique_evaluations, valid_unique_budget=budget, pool_version=pool.version, pool_size=len(pool.entries))
-    append_event(run_dir / "experiment.log", "search_finished", valid_unique=coordinator.ledger.valid_unique_evaluations, raw_proposals=coordinator.ledger.raw_proposals, pool_version=pool.version, pool_size=len(pool.entries))
+    update_progress(run_dir / "progress.json", status="search_complete", completed_steps=completed_steps, search_steps=steps, candidates_per_step=group_size, valid_unique_evaluations=coordinator.ledger.valid_unique_evaluations, pool_version=pool.version, pool_size=len(pool.entries))
+    append_event(run_dir / "experiment.log", "search_finished", completed_steps=completed_steps, valid_unique=coordinator.ledger.valid_unique_evaluations, raw_proposals=coordinator.ledger.raw_proposals, pool_version=pool.version, pool_size=len(pool.entries))
     gpu_end = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.used,memory.free,utilization.gpu", "--format=csv,noheader,nounits"], capture_output=True, text=True, check=False)
     atomic_write_text(environment_dir / "gpu-end.csv", gpu_end.stdout or gpu_end.stderr)
-    return {"run_dir": str(run_dir), "selected_pool_version": selected["pool_version"], **coordinator.ledger.state_dict()}
+    return {"run_dir": str(run_dir), "selected_pool_version": selected["pool_version"], **train_metrics}
