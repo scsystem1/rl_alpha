@@ -34,6 +34,7 @@ class CandidateScore:
     reward_valid_observations: int = 0
     reward_valid_day_rate: float = 0.0
     reward_observation_rate: float = 0.0
+    reward_scale: float | None = None
 
     def __post_init__(self) -> None:
         if self.delta_add is None:

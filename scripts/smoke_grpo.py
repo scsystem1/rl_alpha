@@ -178,6 +178,9 @@ def main() -> None:
         "actor/lr",
         "critic/advantages/mean",
         "domain/advantage_std",
+        "domain/reward_scale",
+        "domain/valid_reward_saturation_rate",
+        "domain/zero_variance_groups",
     )
     if not all(all(math.isfinite(float(item[key])) for key in required_finite) for item in metrics):
         raise RuntimeError("formal-GRPO smoke emitted a missing/non-finite loss metric")
@@ -185,6 +188,10 @@ def main() -> None:
         raise RuntimeError("old/current-policy importance ratio stayed identically one")
     if not any(float(item["actor/kl_loss"]) > 0 for item in metrics):
         raise RuntimeError("reference-policy KL loss never activated")
+    if any(float(item["domain/valid_reward_saturation_rate"]) >= 0.10 for item in metrics):
+        raise RuntimeError("valid shaped rewards exceeded the 10% saturation gate")
+    if any(int(item["domain/zero_variance_groups"]) != 0 for item in metrics):
+        raise RuntimeError("at least one GRPO reward group had zero variance")
     checkpoint_sizes = []
     for checkpoint in latest:
         actor_files = [path.name for path in (checkpoint / "actor").rglob("*") if path.is_file()]
@@ -224,6 +231,9 @@ def main() -> None:
                     "domain/unique_rate",
                     "domain/reward_mean",
                     "domain/reward_std",
+                    "domain/reward_scale",
+                    "domain/valid_reward_saturation_rate",
+                    "domain/zero_variance_groups",
                 )
             }
             for item in metrics

@@ -13,7 +13,7 @@ coordinator supplies the add-only common-support candidate delta as fitness. Inv
 DSL trees and already generated expressions are rejected before the formal
 proposal group, so every recorded GP round contains eight new typed formulas.
 
-Base-LLM and GRPO use the identical `unified_compact_v1` prompt. Base-LLM
+Base-LLM and GRPO use the identical `unified_compact_v7` prompt. Base-LLM
 samples that one prompt eight times. GRPO uses one prompt row with eight
 rollouts, learns from those eight rewards in one optimizer update, and then
 admits at most one of the same eight candidates. There are no per-answer hint
@@ -62,7 +62,7 @@ Each cell identity covers the experiment/search/reward/data/evaluation/model
 configs, panel/risk/index strong hashes, repository commits and dirty patch
 hashes, and actual model files for LLM methods. Run identity additionally
 freezes the effective config and evaluator semantics. A checkpoint is readable
-only with matching checkpoint schema 6, fixed-universe reward semantics, and
+only with matching checkpoint schema 7, fixed-universe reward semantics, and
 checkpoint fingerprint. Matrix
 completion requires accepted train metrics, final pool, manifest, exact budget
 and current identity.

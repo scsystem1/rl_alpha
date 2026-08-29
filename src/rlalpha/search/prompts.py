@@ -1,29 +1,74 @@
 from __future__ import annotations
 
-from ..dsl.operators import CONSTANTS, FEATURES, OPERATORS, WINDOWS
+from collections.abc import Iterable
+
+from ..dsl.operators import (
+    BINARY,
+    CONSTANTS,
+    CROSS_SECTIONAL,
+    FEATURES,
+    OPERATORS,
+    PAIR_ROLLING,
+    ROLLING,
+    UNARY,
+    WINDOWS,
+)
 from ..leakage.guards import assert_train_only_context
 from ..utils.hashing import stable_hash
 from .models import SearchContext
 
 
-PROMPT_VERSION = "unified_compact_v1"
+PROMPT_VERSION = "unified_compact_v7"
 SYSTEM_PROMPT = "Propose one alpha factor. Return exactly one <expr>...</expr> block and no explanation."
 
-# This grammar is enforced by structured decoding.  It is part of the prompt
-# contract/hash, but repeating the full production rules in natural language
-# only wastes the 2B model's context window.
-DSL_GRAMMAR = r'''
-root ::= "<expr>" expr "</expr>"
-expr ::= feature | constant | unary | binary | rolling | pair_rolling | cross_sectional
-feature ::= "$open" | "$high" | "$low" | "$close" | "$volume" | "$return"
-constant ::= "-2.0" | "-1.0" | "-0.5" | "-0.01" | "0.01" | "0.5" | "1.0" | "2.0"
-window ::= "1" | "5" | "10" | "20" | "40" | "60" | "120" | "252"
-unary ::= ("Abs" | "Sign" | "Log") "(" expr ")"
-binary ::= ("Add" | "Sub" | "Mul" | "Div" | "Greater" | "Less") "(" expr "," expr ")"
-rolling ::= ("Ref" | "Mean" | "Sum" | "Std" | "Var" | "Max" | "Min" | "Med" | "Mad" | "Delta" | "WMA" | "EMA" | "TSRank") "(" expr "," window ")"
-pair_rolling ::= ("Cov" | "Corr") "(" expr "," expr "," window ")"
-cross_sectional ::= ("CSRank" | "CSZScore") "(" expr ")"
-'''.strip()
+MAX_FACTOR_DEPTH = 6
+
+
+def _grammar_alternatives(values: Iterable[object]) -> str:
+    return " | ".join(f'"{value}"' for value in values)
+
+
+def _build_dsl_grammar(max_depth: int = MAX_FACTOR_DEPTH) -> str:
+    """Build a finite-depth grammar whose every expression contains a feature."""
+    if max_depth < 1:
+        raise ValueError("max_depth must be positive")
+    lines = [
+        f'root ::= "<expr>" factor_{max_depth} "</expr>"',
+        f"feature ::= {_grammar_alternatives(sorted(FEATURES))}",
+        f"constant ::= {_grammar_alternatives(CONSTANTS)}",
+        f"window ::= {_grammar_alternatives(WINDOWS)}",
+        f"unary_operator ::= {_grammar_alternatives(sorted(UNARY))}",
+        f"binary_operator ::= {_grammar_alternatives(sorted(BINARY))}",
+        f"rolling_operator ::= {_grammar_alternatives(sorted(ROLLING))}",
+        f"pair_rolling_operator ::= {_grammar_alternatives(sorted(PAIR_ROLLING))}",
+        f"cross_sectional_operator ::= {_grammar_alternatives(sorted(CROSS_SECTIONAL))}",
+        "factor_1 ::= feature",
+        "value_1 ::= factor_1 | constant",
+    ]
+    for depth in range(2, max_depth + 1):
+        child = depth - 1
+        lines.extend(
+            [
+                (
+                    f"factor_{depth} ::= feature"
+                    f' | unary_operator "(" factor_{child} ")"'
+                    f' | binary_operator "(" factor_{child} "," value_{child} ")"'
+                    f' | binary_operator "(" constant "," factor_{child} ")"'
+                    f' | rolling_operator "(" factor_{child} "," window ")"'
+                    f' | pair_rolling_operator "(" factor_{child} "," value_{child} "," window ")"'
+                    f' | pair_rolling_operator "(" constant "," factor_{child} "," window ")"'
+                    f' | cross_sectional_operator "(" factor_{child} ")"'
+                ),
+                f"value_{depth} ::= factor_{depth} | constant",
+            ]
+        )
+    return "\n".join(lines)
+
+
+# Structured decoding consumes this grammar separately from the chat prompt.
+# Generating it from the typed operator registry keeps Base-LLM and GRPO in
+# lockstep without spending the 2B model's natural-language context window.
+DSL_GRAMMAR = _build_dsl_grammar()
 
 
 def _pool_lines(context: SearchContext) -> str:
@@ -49,7 +94,7 @@ windows: {', '.join(map(str, WINDOWS))}
 constants: {', '.join(map(str, CONSTANTS))}
 
 Goal: create one valid, non-duplicate factor that best complements and improves the current pool on training data.
-Hints: consider momentum, mean reversion, volatility, price-volume interaction, multi-horizon structure, and cross-sectional ranking; combine signals when useful and never use future information. Keep depth<=6, nodes<=21, lookback<=252.
+Hints: consider momentum, mean reversion, volatility, price-volume interaction, multi-horizon structure, and cross-sectional ranking; combine signals when useful and never use future information. Keep nodes<=21. Along each path, cumulative lookback must be <=252: Ref/Delta add w; other rolling operators add w-1.
 
 Output: <expr>FORMULA</expr>"""
     assert_train_only_context({"system": SYSTEM_PROMPT, "user": user})

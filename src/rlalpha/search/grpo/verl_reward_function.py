@@ -111,6 +111,7 @@ def _empty_record(request: dict[str, Any]) -> dict[str, Any]:
         "reward_valid_observations": None,
         "reward_valid_day_rate": None,
         "reward_observation_rate": None,
+        "reward_scale": None,
         "evaluation_error": None,
         "frozen_state_hash": str(request["extra_info"]["frozen_state_hash"]),
     }
@@ -132,7 +133,7 @@ def _load_spec(requests: list[dict[str, Any]]) -> dict[str, Any]:
     if stable_hash(hash_payload) != expected_hash:
         raise RuntimeError("frozen GRPO stage spec hash mismatch")
     spec["spec_hash"] = expected_hash
-    if spec.get("schema_version") != 6 or spec.get("reward_pool_semantics") != "fixed-universe-zero-fill-psd-gram-v6":
+    if spec.get("schema_version") != 7 or spec.get("reward_pool_semantics") != "fixed-universe-zero-fill-psd-gram-v7":
         raise RuntimeError("GRPO stage spec uses incompatible reward/pool semantics")
     if len(requests) != int(spec["expected_samples"]):
         raise RuntimeError("reward batch size does not match the frozen stage spec")
@@ -363,6 +364,12 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
             scored_entries,
             max_workers=score_workers,
         )
+    reward_scale = next(
+        (score.reward_scale for score in candidate_scores if score.reward_scale is not None),
+        None,
+    )
+    for _, record in parsed:
+        record["reward_scale"] = reward_scale
     for index, candidate_score in zip(scored_indices, candidate_scores, strict=True):
         record = parsed[index][1]
         record.update(
@@ -385,6 +392,7 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "reward_valid_observations": int(candidate_score.reward_valid_observations),
                 "reward_valid_day_rate": float(candidate_score.reward_valid_day_rate),
                 "reward_observation_rate": float(candidate_score.reward_observation_rate),
+                "reward_scale": candidate_score.reward_scale,
             }
         )
 
@@ -398,6 +406,7 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "pool_score",
         "reward_valid_days", "reward_valid_observations",
         "reward_valid_day_rate", "reward_observation_rate",
+        "reward_scale",
     )
     for alias_index, representative_index in duplicate_aliases:
         alias = parsed[alias_index][1]

@@ -196,7 +196,9 @@ class PoolManager:
         delta_add = float(add_score.objective - add_baseline.objective)
         if not np.isfinite(delta_add):
             return self._invalid(candidate, add_score, "non_finite_delta")
-        shaped = float(np.clip(100.0 * delta_add, -1.0, 1.0))
+        # Valid rewards are shaped only after every frozen-pool candidate has
+        # an add-only delta, so one robust scale is shared by the whole group.
+        shaped = 0.0
 
         if len(self.entries) < self.capacity:
             # Add reward and admission use the same frozen base support.
@@ -420,12 +422,56 @@ class PoolManager:
                         formally_rechecked=True,
                         valid=bool(plan.score.valid and formal_valid),
                         reason=plan.score.reason if formal_valid else "insufficient_pool_support",
+                        shaped_reward=plan.score.shaped_reward if formal_valid else -1.0,
                         positive_not_admitted=bool(
                             plan.score.delta_add > 0 and (not formal_valid or formal_delta <= self.min_delta)
                         ),
                     ),
                     plan.delete_index,
                 )
+        valid_delta_by_hash: dict[str, float] = {}
+        for plan in plans:
+            if plan.score.valid and self._finite_delta(plan.score.delta_add):
+                valid_delta_by_hash.setdefault(
+                    plan.score.candidate_hash, float(plan.score.delta_add)
+                )
+        valid_deltas = np.asarray(list(valid_delta_by_hash.values()), dtype=float)
+        reward_scale = (
+            max(float(np.median(np.abs(valid_deltas))), self.min_delta, 1e-5)
+            if len(valid_deltas)
+            else None
+        )
+        if reward_scale is not None:
+            shaped_plans = []
+            for plan in plans:
+                score = plan.score
+                shaped_reward = score.shaped_reward
+                if score.valid and self._finite_delta(score.delta_add):
+                    delta_add = float(score.delta_add)
+                    shaped_reward = (
+                        0.0
+                        if delta_add == 0.0
+                        else float(
+                            np.copysign(
+                                min(
+                                    1.0 / (1.0 + reward_scale / abs(delta_add)),
+                                    float(np.nextafter(1.0, 0.0)),
+                                ),
+                                delta_add,
+                            )
+                        )
+                    )
+                shaped_plans.append(
+                    replace(
+                        plan,
+                        score=replace(
+                            score,
+                            shaped_reward=float(shaped_reward),
+                            reward_scale=float(reward_scale),
+                        ),
+                    )
+                )
+            plans = shaped_plans
         return [plan.score for plan in plans]
 
     def consider_group(

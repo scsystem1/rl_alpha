@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import string
 
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ from rlalpha.dsl.grammar import sample_ast
 from rlalpha.dsl.parser import ExpressionSyntaxError, parse_expression, parse_llm_response
 from rlalpha.dsl.validity import validate_signal, validate_signals
 from rlalpha.factors.cache import SignalCache
+from rlalpha.search.prompts import DSL_GRAMMAR
 from rlalpha.utils.numerics import finite_corr
 
 
@@ -129,6 +131,33 @@ def test_typed_grammar_generates_ten_thousand_bounded_asts():
         assert node.depth <= 6
         assert node.nodes <= 21
         assert node.lookback <= 252
+
+
+def test_structured_grammar_is_bounded_featureful_and_parser_compatible():
+    xgrammar = pytest.importorskip("xgrammar")
+    tokenizer = xgrammar.TokenizerInfo(list(string.printable))
+    compiled = xgrammar.GrammarCompiler(tokenizer).compile_grammar(
+        xgrammar.Grammar.from_ebnf(DSL_GRAMMAR)
+    )
+
+    def accepts(text: str) -> bool:
+        matcher = xgrammar.GrammarMatcher(compiled, terminate_without_stop_token=True)
+        return bool(matcher.accept_string(text) and matcher.is_completed())
+
+    accepted = (
+        "<expr>Add($return,0.5)</expr>",
+        "<expr>Sub(1.0,$return)</expr>",
+        "<expr>Corr($return,1.0,5)</expr>",
+        "<expr>Log(Abs(Sign(CSRank(Mean($return,5)))))</expr>",
+    )
+    for text in accepted:
+        assert accepts(text)
+        node = parse_llm_response(text)
+        assert node.depth <= 6
+
+    assert not accepts("<expr>1.0</expr>")
+    assert not accepts("<expr>Log(1.0)</expr>")
+    assert not accepts("<expr>Log(Log(Abs(Sign(CSRank(Mean($return,5))))))</expr>")
 
 
 def test_numpy_and_torch_evaluators_match_when_torch_is_available():

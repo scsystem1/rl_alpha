@@ -306,6 +306,67 @@ class _SumObjective:
         return PoolScore(score, score, tuple(), tuple(values))
 
 
+def test_group_reward_uses_median_softsign_without_changing_raw_deltas():
+    pool = PoolManager(_SumObjective(), min_delta=1e-5)
+    candidates = [
+        PoolEntry("small", "small", 1e-5),
+        PoolEntry("medium", "medium", 2e-5),
+        PoolEntry("negative", "negative", -4e-5),
+    ]
+    scored = pool.score_candidates(candidates)
+
+    assert [item.delta_add for item in scored] == [1e-5, 2e-5, -4e-5]
+    assert [item.post_prune_delta for item in scored] == [1e-5, 2e-5, -4e-5]
+    assert all(item.reward_scale == 2e-5 for item in scored)
+    np.testing.assert_allclose(
+        [item.shaped_reward for item in scored],
+        [1 / 3, 1 / 2, -2 / 3],
+    )
+
+
+@pytest.mark.parametrize(
+    ("delta", "expected_scale", "expected_reward"),
+    [(5e-5, 5e-5, 0.5), (1e-6, 1e-5, 1 / 11)],
+)
+def test_single_candidate_reward_respects_dynamic_scale_floor(
+    delta, expected_scale, expected_reward
+):
+    score = PoolManager(_SumObjective()).score_candidates(
+        [PoolEntry("candidate", "candidate", delta)]
+    )[0]
+    assert score.reward_scale == expected_scale
+    assert np.isclose(score.shaped_reward, expected_reward)
+
+
+def test_invalid_candidates_do_not_set_scale_but_share_a_valid_group_scale():
+    pool = PoolManager(_SumObjective())
+    pool.entries = [PoolEntry("existing", "existing", 1.0)]
+
+    invalid_only = pool.score_candidates([PoolEntry("duplicate", "existing", 1.0)])[0]
+    assert invalid_only.shaped_reward == -0.5
+    assert invalid_only.reward_scale is None
+
+    invalid, valid = pool.score_candidates(
+        [PoolEntry("duplicate", "existing", 1.0), PoolEntry("new", "new", 2.0)]
+    )
+    assert not invalid.valid and invalid.shaped_reward == -0.5
+    assert valid.valid and valid.shaped_reward == 0.5
+    assert invalid.reward_scale == valid.reward_scale == 2.0
+
+
+def test_softsign_reward_stays_finite_for_extreme_delta():
+    scored = PoolManager(_SumObjective()).score_candidates(
+        [
+            PoolEntry("small", "small", 1e-5),
+            PoolEntry("medium", "medium", 2e-5),
+            PoolEntry("extreme", "extreme", 1e300),
+        ]
+    )
+    assert all(np.isfinite(item.shaped_reward) for item in scored)
+    assert all(-1.0 < item.shaped_reward < 1.0 for item in scored)
+    assert scored[-1].shaped_reward > scored[1].shaped_reward > scored[0].shaped_reward
+
+
 def test_pool_exact_replacement_and_one_admission_per_group():
     pool = PoolManager(_SumObjective(), capacity=2, min_delta=1e-5)
     pool.consider_group([PoolEntry("a", "a", 1.0), PoolEntry("b", "b", 2.0)])

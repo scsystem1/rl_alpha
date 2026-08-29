@@ -176,8 +176,8 @@ def test_current_verl_reward_batch_reuses_intra_group_duplicates(monkeypatch, tm
     archive = tmp_path / "rollouts.jsonl"
     signal_cache_root = tmp_path / "signals"
     spec_payload = {
-        "schema_version": 6,
-        "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v6",
+        "schema_version": 7,
+        "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v7",
         "stage": 0,
         "expected_samples": 3,
         "remaining_budget": 10,
@@ -234,6 +234,8 @@ def test_current_verl_reward_batch_reuses_intra_group_duplicates(monkeypatch, tm
     assert records[1]["reason_code"] == "intra_group_duplicate_reused"
     assert not records[1]["market_evaluated"]
     assert records[0]["shaped_reward"] == records[1]["shaped_reward"]
+    assert records[0]["reward_scale"] == records[1]["reward_scale"]
+    assert records[0]["reward_scale"] == records[2]["reward_scale"]
     assert records[2]["market_evaluated"]
     assert len(archive.read_text(encoding="utf-8").splitlines()) == 3
     cached_files = sorted(signal_cache_root.glob("*.npy"))
@@ -261,8 +263,8 @@ def test_current_verl_reward_batch_reuses_intra_group_duplicates(monkeypatch, tm
 
 def test_old_grpo_stage_spec_is_rejected(tmp_path):
     payload = {
-        "schema_version": 5,
-        "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v5",
+        "schema_version": 6,
+        "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v6",
         "stage": 0,
         "pool_version": 0,
         "expected_samples": 1,

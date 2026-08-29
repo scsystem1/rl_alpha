@@ -22,6 +22,8 @@ def test_one_compact_prompt_contains_all_elements_and_hints_without_pool_weights
     assert "multi-horizon" in rendered
     assert "$open" in rendered and "$return" in rendered
     assert "csrank" in rendered and "corr" in rendered
+    assert "factor_6" not in rendered
+    assert "ref/delta add w" in rendered
     assert "w=" not in rendered
     assert "objective=" not in rendered
     contract = prompt_contract()

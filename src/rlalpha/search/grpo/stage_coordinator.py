@@ -98,8 +98,8 @@ class VerlGRPOStageCoordinator:
     def _stage_spec(self, archive_path: Path, expected_samples: int) -> dict[str, Any]:
         score = self.pool.score
         spec = {
-            "schema_version": 6,
-            "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v6",
+            "schema_version": 7,
+            "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v7",
             "stage": self.stage,
             "expected_samples": int(expected_samples),
             "remaining_budget": self.ledger.remaining,
@@ -219,6 +219,14 @@ class VerlGRPOStageCoordinator:
                 normalized.extend(((array - array.mean()) / (array.std() + 1e-6)).tolist())
         valid = sum(bool(item["valid"]) for item in records)
         unique = sum(bool(item["market_evaluated"]) for item in records)
+        valid_rewards = np.asarray(
+            [float(item["shaped_reward"]) for item in records if bool(item["valid"])],
+            dtype=float,
+        )
+        reward_scales = np.asarray(
+            [float(item["reward_scale"]) for item in records if item.get("reward_scale") is not None],
+            dtype=float,
+        )
         return {
             "domain/invalid_rate": 1.0 - valid / max(1, len(records)),
             "domain/unique_rate": unique / max(1, len(records)),
@@ -226,6 +234,10 @@ class VerlGRPOStageCoordinator:
             "domain/reward_std": float(rewards.std()),
             "domain/reward_min": float(rewards.min()),
             "domain/reward_max": float(rewards.max()),
+            "domain/reward_scale": float(np.median(reward_scales)) if len(reward_scales) else 0.0,
+            "domain/valid_reward_saturation_rate": (
+                float(np.mean(np.abs(valid_rewards) > 0.95)) if len(valid_rewards) else 0.0
+            ),
             "domain/advantage_mean": float(np.mean(normalized)) if normalized else 0.0,
             "domain/advantage_std": float(np.std(normalized)) if normalized else 0.0,
             "domain/zero_variance_groups": zero,
@@ -315,6 +327,7 @@ class VerlGRPOStageCoordinator:
                 int(archived.get("reward_valid_observations") or 0),
                 float(archived.get("reward_valid_day_rate") or 0.0),
                 float(archived.get("reward_observation_rate") or 0.0),
+                float(archived["reward_scale"]) if archived.get("reward_scale") is not None else None,
             ))
         self.records.extend(standard_records)
         return entries, scored
@@ -528,8 +541,8 @@ class VerlGRPOStageCoordinator:
         if self.checkpoint is not None and not (self.checkpoint / "actor").is_dir():
             raise RuntimeError("paired Verl actor checkpoint is missing")
         state = {
-            "schema_version": 6,
-            "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v6",
+            "schema_version": 7,
+            "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v7",
             "paired_optimizer_step": self.updates,
             "ledger": self.ledger.state_dict(),
             "seen": sorted(self.seen),
@@ -561,8 +574,8 @@ class VerlGRPOStageCoordinator:
         write_json(
             self.run_dir / "checkpoint_commit.json",
             {
-                "schema_version": 6,
-                "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v6",
+                "schema_version": 7,
+                "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v7",
                 "paired_optimizer_step": self.updates,
                 "checkpoint": file_fingerprint(checkpoint_path),
                 "verl_checkpoint": self.checkpoint_fingerprint,
@@ -576,12 +589,12 @@ class VerlGRPOStageCoordinator:
         if not commit_path.exists():
             raise RuntimeError("GRPO checkpoint is uncommitted and cannot be resumed")
         commit = json.loads(commit_path.read_text(encoding="utf-8"))
-        if commit.get("schema_version") != 6 or commit.get("reward_pool_semantics") != "fixed-universe-zero-fill-psd-gram-v6":
+        if commit.get("schema_version") != 7 or commit.get("reward_pool_semantics") != "fixed-universe-zero-fill-psd-gram-v7":
             raise RuntimeError("GRPO checkpoint uses incompatible reward/pool semantics")
         if file_fingerprint(state_path)["sha256"] != commit["checkpoint"]["sha256"]:
             raise RuntimeError("GRPO checkpoint hash mismatch")
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        if state.get("schema_version") != 6 or state.get("reward_pool_semantics") != "fixed-universe-zero-fill-psd-gram-v6":
+        if state.get("schema_version") != 7 or state.get("reward_pool_semantics") != "fixed-universe-zero-fill-psd-gram-v7":
             raise RuntimeError("GRPO state uses incompatible reward/pool semantics")
         if int(state["paired_optimizer_step"]) != int(commit["paired_optimizer_step"]):
             raise RuntimeError("model/domain checkpoint step mismatch")

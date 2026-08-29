@@ -20,8 +20,8 @@ from .models import BudgetLedger, CandidateOutcome, SearchContext
 
 
 class SearchCoordinator:
-    CHECKPOINT_SCHEMA_VERSION = 6
-    REWARD_POOL_SEMANTICS = "fixed-universe-zero-fill-psd-gram-v6"
+    CHECKPOINT_SCHEMA_VERSION = 7
+    REWARD_POOL_SEMANTICS = "fixed-universe-zero-fill-psd-gram-v7"
 
     def __init__(self, searcher: Searcher, pool: PoolManager, evaluator: Callable[[object], np.ndarray], membership: np.ndarray, budget: int, run_dir: str | Path | None = None):
         self.searcher = searcher
@@ -93,7 +93,7 @@ class SearchCoordinator:
                 validity = validate_signal(signal, self.membership, [entry.signal for entry in self.pool.entries])
             except Exception as exc:
                 self.ledger.invalid += 1
-                outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, False, "evaluation_error", False, metadata={**base_metadata, "error": str(exc)}))
+                outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, False, "evaluation_error", False, shaped_reward=-1.0, metadata={**base_metadata, "error": str(exc)}))
                 continue
             if not validity.valid:
                 self.ledger.invalid += 1
@@ -132,6 +132,7 @@ class SearchCoordinator:
                     "reward_valid_observations": scores[item.expr_hash].reward_valid_observations,
                     "reward_valid_day_rate": scores[item.expr_hash].reward_valid_day_rate,
                     "reward_observation_rate": scores[item.expr_hash].reward_observation_rate,
+                    "reward_scale": scores[item.expr_hash].reward_scale,
                 },
             )
             if item.expr_hash in scores

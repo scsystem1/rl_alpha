@@ -1,6 +1,6 @@
 # Unified prompt contract
 
-RLAlpha maintains exactly one prompt, `unified_compact_v1`, for both Base-LLM
+RLAlpha maintains exactly one prompt, `unified_compact_v7`, for both Base-LLM
 and formal GRPO. There is no prompt-version switch and no rotating hint. Reward
 variants also do not change the prompt.
 
@@ -15,8 +15,9 @@ The prompt contains only:
    ranking;
 5. the exact `<expr>FORMULA</expr>` output schema.
 
-The complete grammar is enforced by structured decoding and included in the
-prompt contract hash, but is not repeated in the natural-language prompt.
+The finite depth-six, featureful grammar is enforced by structured decoding and
+included in the prompt contract hash, but is not repeated in the
+natural-language prompt.
 Parsing, canonicalization, semantic validity, duplicate detection, and
 train-only market evaluation remain mandatory after decoding.
 

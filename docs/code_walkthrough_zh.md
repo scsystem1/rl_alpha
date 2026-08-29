@@ -675,12 +675,12 @@ lookback    max(20, 19)=20
 
 | 层 | 检查者 | 通过意味着什么 | 典型失败 |
 |---|---|---|---|
-| XGrammar-valid | vLLM/xgrammar | token 串匹配 CFG | 非法标签、拼错 operator |
-| AST-valid | `parse_llm_response` | 类型、arity、limits、固定常数/窗口正确 | 深度过大、constant-only `Call`；root constant 是例外 |
+| XGrammar-valid | vLLM/xgrammar | token 串匹配有限深度、必含 feature 的 CFG | 非法标签、拼错 operator、深度过大、constant-only 表达式 |
+| AST-valid | `parse_llm_response` | 类型、arity、limits、固定常数/窗口正确 | node 或累计 lookback 超限 |
 | Signal-valid | `validate_signal` | 真实 train panel 上覆盖、变异性、去相关通过 | constant correlation、coverage 低 |
 | Unique market-evaluated | coordinator | 非 exact duplicate，且完成 signal validity | seen hash、budget exhausted |
 
-XGrammar 不编码 depth/nodes/lookback，也允许语法上的 constant 子表达式，所以后三级仍不可省略。
+XGrammar 编码 depth≤6 和 featureful 约束，但不编码 nodes/lookback；普通 binary 和 pair-rolling 的一侧仍可使用 constant，所以后三级检查仍不可省略。
 
 ### 3.7 Signal validity
 
@@ -847,7 +847,7 @@ SE=\sqrt{\max(0,\hat\Omega)/T}.
 
 有限 observation 少于 2 时 SE 为 NaN；求和 offset 会截到 `T-1`，但 Bartlett 分母仍使用原请求 `lag+1=21`，不会按截短后的 lag 重标权重。1.645 是单侧 95% critical value。这里惩罚的是 mean estimator 的 HAC 标准误，不是 daily RNIC 的原始标准差。
 
-R0/R1 在没有任何有限 daily IC 时返回 `objective=-inf`；R2_LCB 则通过 `lcb_score()` 返回 NaN，只有一个有限日时也因 SE=NaN 而得到 NaN。`PoolManager` 没有额外的 finite-objective guard，且 `max(-1,min(1,100*NaN))` 在 Python 当前参数顺序下会得到 `+1`。真实 panel 的 validity/day count 通常让该分支不可达，但这是 synthetic/异常数据下需要测试或修复的数值边界。
+R0/R1 在没有任何有限 daily IC 时返回 `objective=-inf`；R2_LCB 则通过 `lcb_score()` 返回 NaN，只有一个有限日时也因 SE=NaN 而得到 NaN。`PoolManager` 会把 non-finite objective/delta 显式标记为 invalid 并给予 `-1`，不会让它参与组内 reward scale。
 
 ### 4.7 Candidate delta 与精确替换
 
@@ -868,11 +868,14 @@ pool 已有 20 个因子时，枚举全部槽位：
 
 每个假设 pool 都重新求 ridge weights；不是按现有因子的单体贡献近似删除。候选已在 pool 时 delta=0、shaped reward=-0.5。
 
-有效候选的 shaped reward：
+整组冻结候选完成评分后，只用 valid、finite 的 add-only delta 计算：
 
 \[
-r(c)=clip(100\Delta(c),-1,1).
+s=\max(\operatorname{median}(|\Delta_{add}|),10^{-5}),\qquad
+r(c)=\frac{\Delta_{add}(c)}{|\Delta_{add}(c)|+s}.
 \]
+
+`reward_scale=s` 随候选记录归档；无效候选不参与 scale，仍使用固定 penalty。`post_prune_delta` 只用于 admission，不参与训练 reward。
 
 `consider_group()` 对整个 frozen group 的 precomputed scores 取最大 delta，只在 `delta > min_delta=1e-5` 时 admission。未满则 append；已满则替换预计算的最佳槽位。一次调用最多让 pool version 增加 1。
 
@@ -897,7 +900,7 @@ replace A by D → 0.0325
 replace B by D → 0.0350   => D best score 0.0350, delta 0.0050
 ```
 
-两者 reward 分别为 0.4、0.5，但 group 只 admission D，并替换 B：
+两者的 scale 为 0.0045，reward 分别约为 0.471、0.526；group 只 admission D，并替换 B：
 
 ```text
 P'=[A,D]
@@ -915,13 +918,13 @@ pool_version += 1
 | `node is None` | false | false | 不消耗 | -1.0 |
 | seen/pool exact duplicate | false | false | 不消耗 | -0.5 |
 | 当前组内 budget 已耗尽 | false | false | 不消耗 | 0.0 |
-| evaluator exception | false | false | 不消耗 | 当前默认 0.0 |
+| evaluator exception | false | false | 不消耗 | -1.0 |
 | near-duplicate signal | false | false | 不消耗 | -0.5 |
 | 其他 validity failure | false | false | 不消耗 | -0.75 |
-| valid unique signal | true | true | +1 | `clip(100*delta,-1,1)` |
+| valid unique signal | true | true | +1 | group median-softsign `delta_add` |
 | 已见的 `gp_rescore` | true | true | 不消耗 | 同正常 delta；未见 hash 仍按首次评估消耗 |
 
-**潜在风险**：signal evaluation exception 没有显式 negative penalty，沿用 dataclass 默认 shaped reward 0；这与 parse/effective validity failure 的惩罚不一致。`pool.score_candidates()` 位于逐候选 `try/except` 之外，reward/ridge 求解本身若抛异常会终止整个 cell，而不是生成一条 `evaluation_error` outcome。
+`pool.score_candidates()` 位于逐候选 `try/except` 之外，reward/ridge 求解本身若抛异常会终止整个 cell，而不是生成一条 `evaluation_error` outcome。
 
 ---
 

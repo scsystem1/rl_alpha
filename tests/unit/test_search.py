@@ -94,6 +94,21 @@ def test_random_and_alphagen_gp_each_propose_eight_typed_candidates():
             assert len({item.expr_hash for item in proposed}) == 8
 
 
+def test_search_evaluation_errors_receive_invalid_penalty():
+    membership = np.ones((300, 120), dtype=bool)
+
+    def fail_evaluation(_):
+        raise RuntimeError("synthetic evaluator failure")
+
+    coordinator = SearchCoordinator(
+        RandomSearcher(91), PoolManager(_Objective()), fail_evaluation, membership, 8
+    )
+    outcomes = coordinator.run_group(8)
+    evaluation_errors = [item for item in outcomes if item.reason == "evaluation_error"]
+    assert evaluation_errors
+    assert {item.shaped_reward for item in evaluation_errors} == {-1.0}
+
+
 def test_alphagen_gp_generation_uses_one_frozen_pool_and_one_admission(tmp_path):
     searcher = GPSearcher(13, ALPHAGEN_ROOT, population_size=8)
     pool = PoolManager(_Objective(), capacity=3, min_delta=-1.0)
@@ -181,8 +196,8 @@ def test_checkpoint_with_old_reward_semantics_refuses_resume(tmp_path):
     coordinator.run_group(8)
     commit_path = tmp_path / "checkpoint_commit.json"
     commit = __import__("json").loads(commit_path.read_text(encoding="utf-8"))
-    commit["schema_version"] = 5
-    commit["reward_pool_semantics"] = "fixed-universe-zero-fill-psd-gram-v5"
+    commit["schema_version"] = 6
+    commit["reward_pool_semantics"] = "fixed-universe-zero-fill-psd-gram-v6"
     commit_path.write_text(__import__("json").dumps(commit), encoding="utf-8")
 
     resumed = SearchCoordinator(RandomSearcher(5), PoolManager(_Objective()), lambda node: base, np.ones_like(base, dtype=bool), 8, tmp_path)
