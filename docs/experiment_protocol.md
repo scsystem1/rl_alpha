@@ -1,7 +1,10 @@
 # Experiment protocol
 
-The formal design crosses search method (`random`, `gp`, `base_llm`,
-`grpo_llm`) with reward (`r0`, `r1`, `r2_lcb`). Every proposal group has eight
+The current rolling OOF comparison crosses `random`, `base_llm`, `grpo_llm`
+with `r1`, `r1_oof`, `r2_paired_oof`, seeds 0/1/2. The legacy `gp`, `r0` and
+`r2_lcb` implementations remain available. See [rolling OOF protocol](rolling_oof.md)
+for fixed folds, paired statistics, outer weight fitting and pending experiments.
+Every proposal group has eight
 candidates, is scored against one frozen train-only pool, and admits at most
 one candidate. Pool capacity is 20. Every method runs the same fixed number of
 search steps (250 by default), so each formal cell receives exactly 2,000 raw
@@ -15,7 +18,7 @@ coordinator supplies the add-only common-support candidate delta as fitness. Inv
 DSL trees and already generated expressions are rejected before the formal
 proposal group, so every recorded GP round contains eight new typed formulas.
 
-Base-LLM and GRPO use the identical `unified_compact_v7` prompt. Base-LLM
+Base-LLM and GRPO use the identical `unified_rolling_summary_v8` prompt. Base-LLM
 samples that one prompt eight times. GRPO uses one prompt row with eight
 rollouts, learns from those eight rewards in one optimizer update, and then
 admits at most one of the same eight candidates. There are no per-answer hint
@@ -33,7 +36,8 @@ must not be used to claim M0–M9 completion.
 - Train: factor evaluation, validity/duplicate checks, reward, candidate
   delta, pool admission, and GRPO reward if/when enabled.
 - Validation: selection among already frozen pool snapshots using the
-  predeclared reward objective. It never updates model or pool.
+  predeclared objective; both new OOF rewards use mean RNIC with full-train
+  weights. It never updates model or pool.
 - Test: may be opened independently for any requested method after that
   method's configured cells complete the configured steps and identities.
 
@@ -64,7 +68,7 @@ Each cell identity covers the experiment/search/reward/data/evaluation/model
 configs, panel/risk/index strong hashes, repository commits and dirty patch
 hashes, and actual model files for LLM methods. Run identity additionally
 freezes the effective config and evaluator semantics. A checkpoint is readable
-only with matching checkpoint schema 7, fixed-universe reward semantics, and
+only with matching checkpoint schema 8, rolling-paired reward semantics, reward/prompt contracts, and
 checkpoint fingerprint. Matrix
 completion requires accepted train metrics, final pool, manifest, exact step count
 and current identity.

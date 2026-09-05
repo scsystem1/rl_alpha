@@ -12,11 +12,12 @@ import pandas as pd
 from ...dsl.parser import parse_expression
 from ...factors.cache import SignalCache
 from ...factors.pool import PoolManager
-from ...factors.records import CandidateScore, PoolEntry, PoolScore
+from ...factors.records import CandidateScore, PoolEntry, PoolScore, PoolIncrement
+from ...rewards.factory import CHECKPOINT_SCHEMA_VERSION, REWARD_POOL_SEMANTICS, objective_contract
 from ...utils.hashing import file_fingerprint, stable_hash
 from ...utils.io import atomic_write_text, write_json
 from ..models import BudgetLedger, SearchContext
-from ..prompts import build_messages
+from ..prompts import build_messages, prompt_contract
 from .verl_config import build_verl_grpo_config
 from .verl_trainer import run_quant_evolver_verl_trainer
 
@@ -74,6 +75,7 @@ class VerlGRPOStageCoordinator:
         self.total_tokens = 0
         self.gpu_seconds = 0.0
         self.searcher = self
+        self.prompt_diagnostics = None
         self.pool_snapshots: list[dict[str, Any]] = []
         self._persisted_record_count = 0
 
@@ -87,6 +89,7 @@ class VerlGRPOStageCoordinator:
             self.ledger.valid_unique_evaluations,
             self.ledger.limit,
             tuple(self.records[-64:]),
+            self.prompt_diagnostics() if self.prompt_diagnostics else None,
         )
 
     def _event(self, kind: str, **payload: Any) -> dict[str, Any]:
@@ -98,8 +101,10 @@ class VerlGRPOStageCoordinator:
     def _stage_spec(self, archive_path: Path, expected_samples: int) -> dict[str, Any]:
         score = self.pool.score
         spec = {
-            "schema_version": 7,
-            "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v7",
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "reward_contract": objective_contract(self.pool.objective),
+            "prompt_contract_hash": prompt_contract()["hash"],
+            "reward_pool_semantics": REWARD_POOL_SEMANTICS,
             "stage": self.stage,
             "expected_samples": int(expected_samples),
             "remaining_budget": self.ledger.remaining,
@@ -120,6 +125,7 @@ class VerlGRPOStageCoordinator:
                 )
             ),
             "pool_objective": float(score.objective),
+            "prompt_contract": prompt_contract(),
             "pool_weights": list(map(float, score.weights)),
             "pool": [
                 {"expression": item.expression, "expr_hash": item.expr_hash, "metadata": item.metadata}
@@ -328,6 +334,8 @@ class VerlGRPOStageCoordinator:
                 float(archived.get("reward_valid_day_rate") or 0.0),
                 float(archived.get("reward_observation_rate") or 0.0),
                 float(archived["reward_scale"]) if archived.get("reward_scale") is not None else None,
+                PoolIncrement(**archived["add_increment"]) if archived.get("add_increment") else None,
+                PoolIncrement(**archived["post_prune_increment"]) if archived.get("post_prune_increment") else None,
             ))
         self.records.extend(standard_records)
         return entries, scored
@@ -395,6 +403,9 @@ class VerlGRPOStageCoordinator:
         support_diagnostics = getattr(self.pool.objective, "support_diagnostics", None)
         if prepared is not None and callable(support_diagnostics):
             train_score["support"] = support_diagnostics(prepared)
+        diagnostics = getattr(self.pool.objective, "snapshot_diagnostics", None)
+        if callable(diagnostics):
+            train_score.update(diagnostics(prepared))
         snapshot_factors = [
             {
                 "factor_id": entry.expr_hash,
@@ -540,8 +551,10 @@ class VerlGRPOStageCoordinator:
         if self.checkpoint is not None and not (self.checkpoint / "actor").is_dir():
             raise RuntimeError("paired Verl actor checkpoint is missing")
         state = {
-            "schema_version": 7,
-            "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v7",
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "reward_contract": objective_contract(self.pool.objective),
+            "prompt_contract_hash": prompt_contract()["hash"],
+            "reward_pool_semantics": REWARD_POOL_SEMANTICS,
             "paired_optimizer_step": self.updates,
             "ledger": self.ledger.state_dict(),
             "seen": sorted(self.seen),
@@ -573,8 +586,10 @@ class VerlGRPOStageCoordinator:
         write_json(
             self.run_dir / "checkpoint_commit.json",
             {
-                "schema_version": 7,
-                "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v7",
+                "schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "reward_contract": objective_contract(self.pool.objective),
+                "prompt_contract_hash": prompt_contract()["hash"],
+                "reward_pool_semantics": REWARD_POOL_SEMANTICS,
                 "paired_optimizer_step": self.updates,
                 "checkpoint": file_fingerprint(checkpoint_path),
                 "verl_checkpoint": self.checkpoint_fingerprint,
@@ -588,12 +603,12 @@ class VerlGRPOStageCoordinator:
         if not commit_path.exists():
             raise RuntimeError("GRPO checkpoint is uncommitted and cannot be resumed")
         commit = json.loads(commit_path.read_text(encoding="utf-8"))
-        if commit.get("schema_version") != 7 or commit.get("reward_pool_semantics") != "fixed-universe-zero-fill-psd-gram-v7":
+        if commit.get("schema_version") != CHECKPOINT_SCHEMA_VERSION or commit.get("reward_pool_semantics") != REWARD_POOL_SEMANTICS:
             raise RuntimeError("GRPO checkpoint uses incompatible reward/pool semantics")
         if file_fingerprint(state_path)["sha256"] != commit["checkpoint"]["sha256"]:
             raise RuntimeError("GRPO checkpoint hash mismatch")
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        if state.get("schema_version") != 7 or state.get("reward_pool_semantics") != "fixed-universe-zero-fill-psd-gram-v7":
+        if state.get("schema_version") != CHECKPOINT_SCHEMA_VERSION or state.get("reward_pool_semantics") != REWARD_POOL_SEMANTICS:
             raise RuntimeError("GRPO state uses incompatible reward/pool semantics")
         if int(state["paired_optimizer_step"]) != int(commit["paired_optimizer_step"]):
             raise RuntimeError("model/domain checkpoint step mismatch")
@@ -601,6 +616,8 @@ class VerlGRPOStageCoordinator:
         fingerprint = state.get("checkpoint_fingerprint")
         if checkpoint is not None and not (checkpoint / "actor").is_dir():
             raise RuntimeError("paired GRPO Verl checkpoint is missing")
+        if state.get("reward_contract") != objective_contract(self.pool.objective) or state.get("prompt_contract_hash") != prompt_contract()["hash"]:
+            raise RuntimeError("checkpoint reward or prompt contract changed; start a new experiment ID")
         self.ledger = BudgetLedger.from_state_dict(state["ledger"])
         self.seen = set(state["seen"])
         self.stage = int(state["stage"])

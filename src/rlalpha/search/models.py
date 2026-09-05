@@ -39,6 +39,12 @@ class CandidateOutcome:
 
 
 @dataclass(frozen=True)
+class TrainPoolSummary:
+    oof_mean_rnic: float
+    normalized_fold_weights: tuple[float, ...]
+
+
+@dataclass(frozen=True)
 class SearchContext:
     pool_version: int
     pool_formulas: tuple[str, ...]
@@ -47,6 +53,7 @@ class SearchContext:
     valid_unique_evaluations: int
     budget: int
     history_summary: tuple[dict[str, Any], ...] = ()
+    prompt_summary: TrainPoolSummary | None = None
 
     def to_prompt_dict(self) -> dict[str, Any]:
         return asdict(self)

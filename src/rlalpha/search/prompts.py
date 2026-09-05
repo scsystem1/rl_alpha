@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import math
 
 from ..dsl.operators import (
     BINARY,
@@ -18,8 +19,29 @@ from ..utils.hashing import stable_hash
 from .models import SearchContext
 
 
-PROMPT_VERSION = "unified_compact_v7"
+PROMPT_VERSION = "unified_rolling_summary_v8"
 SYSTEM_PROMPT = "Propose one alpha factor. Return exactly one <expr>...</expr> block and no explanation."
+
+USER_TEMPLATE = """Task: predict 20-trading-day returns from next-close entry to t+21 close exit.
+Goal: add one valid, non-duplicate factor that improves the pool's mean daily cross-sectional Pearson RNIC after risk neutralization. The Balanced-22 risk benchmark removes intercept, industry and style exposures. Seek information beyond this benchmark using only past/current data.
+
+Current pool:
+{pool}
+{summary}
+Allowed elements:
+features: {features}
+operators: {operators}
+windows: {windows}
+constants: {constants}
+
+Keep nodes<=21 and depth<=6. Along each path, cumulative lookback must be <=252: Ref/Delta add w; other rolling operators add w-1.
+Output: <expr>FORMULA</expr>"""
+
+POOL_ROW_TEMPLATE = "- w={weight:+.3f} {formula}"
+SUMMARY_TEMPLATE = (
+    "Training rolling RNIC={rnic:+.4f}: weights fitted on earlier years, scored on later years.\n"
+    "w averages signed normalized fit coefficients across three folds; negative means inverse use. Coefficients are not factor importance.\n"
+)
 
 MAX_FACTOR_DEPTH = 6
 
@@ -72,7 +94,15 @@ DSL_GRAMMAR = _build_dsl_grammar()
 
 
 def _pool_lines(context: SearchContext) -> str:
-    return "\n".join(f"- {formula}" for formula in context.pool_formulas) or "- empty"
+    summary = context.prompt_summary
+    if summary is None:
+        return "\n".join(f"- {formula}" for formula in context.pool_formulas) or "- empty"
+    if (len(summary.normalized_fold_weights) != len(context.pool_formulas)
+            or not math.isfinite(summary.oof_mean_rnic)
+            or not all(math.isfinite(w) for w in summary.normalized_fold_weights)):
+        raise ValueError("prompt summary must contain finite, formula-aligned training evidence")
+    return "\n".join(POOL_ROW_TEMPLATE.format(weight=weight, formula=formula) for formula, weight in
+        zip(context.pool_formulas, summary.normalized_fold_weights, strict=True)) or "- empty"
 
 
 def build_messages(context: SearchContext) -> list[dict[str, str]]:
@@ -84,19 +114,12 @@ def build_messages(context: SearchContext) -> list[dict[str, str]]:
     """
     payload = context.to_prompt_dict()
     assert_train_only_context(payload)
-    user = f"""Current pool:
-{_pool_lines(context)}
-
-Allowed elements:
-features: {', '.join(sorted(FEATURES))}
-operators: {', '.join(sorted(OPERATORS))}
-windows: {', '.join(map(str, WINDOWS))}
-constants: {', '.join(map(str, CONSTANTS))}
-
-Goal: create one valid, non-duplicate factor that best complements and improves the current pool on training data.
-Hints: consider momentum, mean reversion, volatility, price-volume interaction, multi-horizon structure, and cross-sectional ranking; combine signals when useful and never use future information. Keep nodes<=21. Along each path, cumulative lookback must be <=252: Ref/Delta add w; other rolling operators add w-1.
-
-Output: <expr>FORMULA</expr>"""
+    summary = ""
+    if context.prompt_summary is not None:
+        summary = SUMMARY_TEMPLATE.format(rnic=context.prompt_summary.oof_mean_rnic)
+    user = USER_TEMPLATE.format(pool=_pool_lines(context), summary=summary,
+        features=', '.join(sorted(FEATURES)), operators=', '.join(sorted(OPERATORS)),
+        windows=', '.join(map(str, WINDOWS)), constants=', '.join(map(str, CONSTANTS)))
     assert_train_only_context({"system": SYSTEM_PROMPT, "user": user})
     return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]
 
@@ -105,6 +128,10 @@ def prompt_contract() -> dict[str, object]:
     payload = {
         "version": PROMPT_VERSION,
         "system": SYSTEM_PROMPT,
+        "user_template": USER_TEMPLATE,
+        "pool_row_template": POOL_ROW_TEMPLATE,
+        "summary_template": SUMMARY_TEMPLATE,
+        "summary": "canonical neutralized rolling RNIC; mean signed L1-normalized fold weights; train only",
         "grammar": DSL_GRAMMAR,
         "features": sorted(FEATURES),
         "operators": sorted(OPERATORS),

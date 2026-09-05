@@ -29,3 +29,24 @@ def lcb_score(values: np.ndarray, lag: int = 20, critical_value: float = 1.645) 
     mean = float(finite.mean())
     standard_error = newey_west_mean_se(finite, lag=lag)
     return mean - critical_value * standard_error, mean, standard_error
+
+
+def gap_aware_mean_se(values: np.ndarray, lag: int = 20) -> float:
+    """Bartlett HAC of a mean on its original trading-day grid.
+
+    Missing dates contribute zero centered scores, but do not enter the
+    sample-size denominator. In particular, purged fold tails are not joined.
+    """
+    values = np.asarray(values, dtype=float)
+    if values.ndim != 1 or lag < 0:
+        raise ValueError("HAC requires a vector and a nonnegative lag")
+    finite = np.isfinite(values)
+    n = int(finite.sum())
+    if n < 2:
+        return float("nan")
+    centered = np.where(finite, values - values[finite].mean(), 0.0)
+    max_lag = min(lag, len(values) - 1)
+    variance = float(centered @ centered)
+    for offset in range(1, max_lag + 1):
+        variance += 2 * (1 - offset / (max_lag + 1)) * float(centered[offset:] @ centered[:-offset])
+    return math.sqrt(max(0.0, variance)) / n

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Real QuantEvolver/Verl optimizer-update and resume smoke on a small panel."""
+"""Real QuantEvolver/Verl optimizer-update and resume smoke on the train panel."""
 
 import argparse
 import json
@@ -14,6 +14,7 @@ from rlalpha.factors.pool import PoolManager
 from rlalpha.search.base_llm import resolve_model_path
 from rlalpha.search.grpo.stage_coordinator import VerlGRPOStageCoordinator
 from rlalpha.search.run import objective_for
+from rlalpha.search.prompt_diagnostics import PoolPromptDiagnostics
 from rlalpha.utils.hashing import file_fingerprint, stable_hash
 from rlalpha.utils.io import write_json, write_yaml
 
@@ -62,10 +63,10 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=Path("configs/experiment/revision_v3_full_smoke.yaml"))
     parser.add_argument("--run-dir", type=Path, default=Path("/data/sunyuxiang/rl_alpha/runs/grpo_optimizer_smoke"))
     parser.add_argument("--updates", type=int, default=2)
-    parser.add_argument("--reward", choices=("r0", "r1", "r2_lcb"), default="r0")
+    parser.add_argument("--reward", choices=("r0", "r1", "r2_lcb", "r1_oof", "r2_paired_oof"), default="r1_oof")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--train-start", default="2016-01-01")
-    parser.add_argument("--train-end", default="2017-12-31")
+    parser.add_argument("--train-start", default="2010-01-01")
+    parser.add_argument("--train-end", default="2018-12-31")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--verify-existing", action="store_true")
     args = parser.parse_args()
@@ -118,7 +119,7 @@ def main() -> None:
     else:
         write_yaml(run_dir / "effective_config.yaml", effective)
         panel = PanelStore(paths.processed_root).load_split("train", start=args.train_start, end=args.train_end)
-        pool = PoolManager(objective_for(args.reward, panel), capacity=20)
+        pool = PoolManager(objective_for(args.reward, panel, reward_config["reward"]), capacity=20)
         coordinator = VerlGRPOStageCoordinator(
             pool,
             panel.evaluate,
@@ -133,6 +134,7 @@ def main() -> None:
             train_start=args.train_start,
             train_end=args.train_end,
         )
+        coordinator.prompt_diagnostics = PoolPromptDiagnostics(panel, pool, reward_config["reward"])
         if args.resume and checkpoint_path.exists():
             coordinator.load_checkpoint()
         result = coordinator.run_cell()

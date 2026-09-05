@@ -19,9 +19,8 @@ from rlalpha.dsl.validity import validate_signal, validate_signals
 from rlalpha.factors.cache import SignalCache
 from rlalpha.factors.pool import PoolManager
 from rlalpha.factors.records import PoolEntry
-from rlalpha.rewards.r0 import R0Objective
-from rlalpha.rewards.r1 import R1Objective
-from rlalpha.rewards.r2_lcb import R2LCBObjective
+from rlalpha.rewards.factory import (objective_for as _objective, objective_contract, CHECKPOINT_SCHEMA_VERSION, REWARD_POOL_SEMANTICS)
+from rlalpha.search.prompts import prompt_contract
 from rlalpha.utils.hashing import stable_hash
 from rlalpha.utils.io import atomic_write_text
 
@@ -49,32 +48,6 @@ def _loop_lock() -> asyncio.Lock:
     return _LOCKS.setdefault(id(loop), asyncio.Lock())
 
 
-def _objective(name: str, panel, config: dict[str, Any] | None = None):
-    config = config or {}
-    label = panel.target(panel.label)
-    mask = panel.target(panel.common_mask)
-    support = {
-        "min_pool_valid_day_rate": float(config.get("min_pool_valid_day_rate", 0.80)),
-        "min_pool_observation_rate": float(config.get("min_pool_observation_rate", 0.80)),
-        "min_pool_valid_days": int(config.get("min_pool_valid_days", 252)),
-    }
-    if name == "r0":
-        return R0Objective(label, mask, **support)
-    exposures = panel.target(panel.exposures)
-    if name == "r1":
-        return R1Objective(label, mask, exposures, **support)
-    if name == "r2_lcb":
-        return R2LCBObjective(
-            label,
-            mask,
-            exposures,
-            hac_lag=int(config.get("hac_lag", 20)),
-            critical_value=float(config.get("critical_value", 1.645)),
-            **support,
-        )
-    raise ValueError(f"unknown reward {name!r}")
-
-
 def _empty_record(request: dict[str, Any]) -> dict[str, Any]:
     return {
         "stage": int(request["extra_info"]["stage"]),
@@ -98,6 +71,8 @@ def _empty_record(request: dict[str, Any]) -> dict[str, Any]:
         "self_evicted": False,
         "formally_rechecked": False,
         "pool_score": None,
+        "add_increment": None,
+        "post_prune_increment": None,
         "duplicate_representative_index": None,
         "coverage": None,
         "valid_days": None,
@@ -133,7 +108,7 @@ def _load_spec(requests: list[dict[str, Any]]) -> dict[str, Any]:
     if stable_hash(hash_payload) != expected_hash:
         raise RuntimeError("frozen GRPO stage spec hash mismatch")
     spec["spec_hash"] = expected_hash
-    if spec.get("schema_version") != 7 or spec.get("reward_pool_semantics") != "fixed-universe-zero-fill-psd-gram-v7":
+    if spec.get("schema_version") != CHECKPOINT_SCHEMA_VERSION or spec.get("reward_pool_semantics") != REWARD_POOL_SEMANTICS:
         raise RuntimeError("GRPO stage spec uses incompatible reward/pool semantics")
     if len(requests) != int(spec["expected_samples"]):
         raise RuntimeError("reward batch size does not match the frozen stage spec")
@@ -167,6 +142,9 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if objective is None:
         objective = _objective(reward_name, panel, reward_config)
         _OBJECTIVES[objective_key] = objective
+    if (spec.get("reward_contract") != objective_contract(objective)
+            or spec.get("prompt_contract_hash") != prompt_contract()["hash"]):
+        raise RuntimeError("frozen reward or prompt contract changed inside the reward worker")
     objective.parallel_workers = int(spec.get("candidate_workers", 1))
     pool_key = (
         panel_key,
@@ -206,6 +184,9 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
     baseline = pool.score
     if not math.isclose(float(baseline.objective), float(spec["pool_objective"]), rel_tol=1e-8, abs_tol=1e-10):
         raise RuntimeError("frozen pool objective changed inside the reward worker")
+    if (len(baseline.weights) != len(spec["pool_weights"])
+            or not np.allclose(baseline.weights, spec["pool_weights"], rtol=1e-8, atol=1e-10)):
+        raise RuntimeError("frozen full-train pool weights changed inside the reward worker")
 
     parsed: list[tuple[Any | None, dict[str, Any]]] = []
     for request in requests:
@@ -388,6 +369,8 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "self_evicted": bool(candidate_score.self_evicted),
                 "formally_rechecked": bool(candidate_score.formally_rechecked),
                 "pool_score": asdict(candidate_score.pool_score),
+                "add_increment": asdict(candidate_score.add_increment) if candidate_score.add_increment else None,
+                "post_prune_increment": asdict(candidate_score.post_prune_increment) if candidate_score.post_prune_increment else None,
                 "reward_valid_days": int(candidate_score.reward_valid_days),
                 "reward_valid_observations": int(candidate_score.reward_valid_observations),
                 "reward_valid_day_rate": float(candidate_score.reward_valid_day_rate),
@@ -403,7 +386,7 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "mean_abs_daily_corr", "pooled_correlation", "mean_abs_daily_rank_corr",
         "correlation_coverage", "saliency", "eviction_candidates",
         "post_prune_delta", "self_evicted", "formally_rechecked",
-        "pool_score",
+        "pool_score", "add_increment", "post_prune_increment",
         "reward_valid_days", "reward_valid_observations",
         "reward_valid_day_rate", "reward_observation_rate",
         "reward_scale",

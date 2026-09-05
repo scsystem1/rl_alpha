@@ -55,14 +55,14 @@ def _gpu_candidates(
 ) -> list[int]:
     configured = (experiment or {}).get("gpu_devices", {}).get(method)
     if configured:
-        offset = {"r0": 0, "r1": 1, "r2_lcb": 2}.get(reward, 0)
+        offset = {"r0": 0, "r1": 1, "r2_lcb": 2, "r1_oof": 1, "r2_paired_oof": 2}.get(reward, 0)
         start = (seed + offset) % len(configured)
         return [int(configured[(start + index) % len(configured)]) for index in range(len(configured))]
     if method == "base_llm":
         return [4]
     if method == "grpo_llm":
         devices = [2, 3]
-        start = (seed + {"r0": 0, "r1": 1, "r2_lcb": 2}[reward]) % len(devices)
+        start = (seed + {"r0": 0, "r1": 1, "r2_lcb": 2, "r1_oof": 1, "r2_paired_oof": 2}[reward]) % len(devices)
         return devices[start:] + devices[:start]
     if method == "quantevolver":
         return [4]

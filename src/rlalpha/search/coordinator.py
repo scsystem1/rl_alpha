@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 import time
 from pathlib import Path
 from typing import Callable
@@ -17,11 +18,13 @@ from ..utils.io import write_json
 from ..utils.hashing import file_fingerprint, stable_hash
 from .base import Searcher
 from .models import BudgetLedger, CandidateOutcome, SearchContext
+from ..rewards.factory import CHECKPOINT_SCHEMA_VERSION as SCHEMA_VERSION, REWARD_POOL_SEMANTICS as POOL_SEMANTICS, objective_contract
+from .prompts import prompt_contract
 
 
 class SearchCoordinator:
-    CHECKPOINT_SCHEMA_VERSION = 7
-    REWARD_POOL_SEMANTICS = "fixed-universe-zero-fill-psd-gram-v7"
+    CHECKPOINT_SCHEMA_VERSION = SCHEMA_VERSION
+    REWARD_POOL_SEMANTICS = POOL_SEMANTICS
 
     def __init__(self, searcher: Searcher, pool: PoolManager, evaluator: Callable[[object], np.ndarray], membership: np.ndarray, budget: int, run_dir: str | Path | None = None):
         self.searcher = searcher
@@ -38,11 +41,12 @@ class SearchCoordinator:
         self.pending_scores: list[CandidateScore] = []
         self.groups_since_admission = 0
         self.group_index = 0
+        self.prompt_diagnostics = None
         self._persisted_record_count = 0
 
     def context(self) -> SearchContext:
         score = self.pool.score
-        context = SearchContext(self.pool.version, tuple(item.expression for item in self.pool.entries), tuple(score.weights), score.objective, self.ledger.valid_unique_evaluations, self.ledger.limit, tuple(self.records[-64:]))
+        context = SearchContext(self.pool.version, tuple(item.expression for item in self.pool.entries), tuple(score.weights), score.objective, self.ledger.valid_unique_evaluations, self.ledger.limit, tuple(self.records[-64:]), self.prompt_diagnostics() if self.prompt_diagnostics else None)
         assert_train_only_context(context.to_prompt_dict())
         return context
 
@@ -133,6 +137,8 @@ class SearchCoordinator:
                     "reward_valid_day_rate": scores[item.expr_hash].reward_valid_day_rate,
                     "reward_observation_rate": scores[item.expr_hash].reward_observation_rate,
                     "reward_scale": scores[item.expr_hash].reward_scale,
+                    "add_increment": asdict(scores[item.expr_hash].add_increment) if scores[item.expr_hash].add_increment else None,
+                    "post_prune_increment": asdict(scores[item.expr_hash].post_prune_increment) if scores[item.expr_hash].post_prune_increment else None,
                 },
             )
             if item.expr_hash in scores
@@ -191,7 +197,7 @@ class SearchCoordinator:
     def save_checkpoint(self) -> None:
         assert self.run_dir is not None
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        state = {"schema_version": self.CHECKPOINT_SCHEMA_VERSION, "reward_pool_semantics": self.REWARD_POOL_SEMANTICS, "ledger": self.ledger.state_dict(), "seen": sorted(self.seen), "searcher": self.searcher.state_dict(), "pool_version": self.pool.version, "pool": [{"expression": item.expression, "expr_hash": item.expr_hash, "metadata": item.metadata} for item in self.pool.entries], "pool_history": self.pool.history, "pending_entries": [{"expression": item.expression, "expr_hash": item.expr_hash, "metadata": item.metadata} for item in self.pending_entries], "groups_since_admission": self.groups_since_admission, "group_index": self.group_index}
+        state = {"reward_contract": objective_contract(self.pool.objective), "prompt_contract": prompt_contract()["hash"], "schema_version": self.CHECKPOINT_SCHEMA_VERSION, "reward_pool_semantics": self.REWARD_POOL_SEMANTICS, "ledger": self.ledger.state_dict(), "seen": sorted(self.seen), "searcher": self.searcher.state_dict(), "pool_version": self.pool.version, "pool": [{"expression": item.expression, "expr_hash": item.expr_hash, "metadata": item.metadata} for item in self.pool.entries], "pool_history": self.pool.history, "pending_entries": [{"expression": item.expression, "expr_hash": item.expr_hash, "metadata": item.metadata} for item in self.pending_entries], "groups_since_admission": self.groups_since_admission, "group_index": self.group_index}
         write_json(self.run_dir / "checkpoint.json", state)
         if self._persisted_record_count < len(self.records):
             candidate_path = self.run_dir / "candidates.jsonl"
@@ -223,6 +229,8 @@ class SearchCoordinator:
             state = json.load(handle)
         if state.get("schema_version") != self.CHECKPOINT_SCHEMA_VERSION or state.get("reward_pool_semantics") != self.REWARD_POOL_SEMANTICS:
             raise RuntimeError("checkpoint state uses incompatible reward/pool semantics")
+        if state.get("reward_contract") != objective_contract(self.pool.objective) or state.get("prompt_contract") != prompt_contract()["hash"]:
+            raise RuntimeError("checkpoint reward or prompt contract changed; start a new experiment ID")
         self.ledger = BudgetLedger.from_state_dict(state["ledger"])
         self.seen = set(state["seen"])
         self.searcher.load_state_dict(state["searcher"])

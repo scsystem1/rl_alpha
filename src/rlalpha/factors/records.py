@@ -13,6 +13,19 @@ class PoolScore:
 
 
 @dataclass(frozen=True)
+class PoolIncrement:
+    mean_delta: float
+    standard_error: float
+    penalty: float
+    reward: float
+    valid_days: int = 0
+    fold_means: tuple[float, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "fold_means", tuple(self.fold_means))
+
+
+@dataclass(frozen=True)
 class CandidateScore:
     candidate_hash: str
     pool_score: PoolScore
@@ -35,6 +48,8 @@ class CandidateScore:
     reward_valid_day_rate: float = 0.0
     reward_observation_rate: float = 0.0
     reward_scale: float | None = None
+    add_increment: PoolIncrement | None = None
+    post_prune_increment: PoolIncrement | None = None
 
     def __post_init__(self) -> None:
         if self.delta_add is None:

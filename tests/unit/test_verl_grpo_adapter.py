@@ -176,8 +176,8 @@ def test_current_verl_reward_batch_reuses_intra_group_duplicates(monkeypatch, tm
     archive = tmp_path / "rollouts.jsonl"
     signal_cache_root = tmp_path / "signals"
     spec_payload = {
-        "schema_version": 7,
-        "reward_pool_semantics": "fixed-universe-zero-fill-psd-gram-v7",
+        "schema_version": 8,
+        "reward_pool_semantics": "fixed-universe-rolling-paired-oof-v8",
         "stage": 0,
         "expected_samples": 3,
         "remaining_budget": 10,
@@ -202,6 +202,9 @@ def test_current_verl_reward_batch_reuses_intra_group_duplicates(monkeypatch, tm
         "archive_path": str(archive),
         "signal_cache_root": str(signal_cache_root),
     }
+    spec_payload["reward_contract"] = verl_reward_function.objective_contract(
+        verl_reward_function._objective("r0", Panel(), spec_payload["reward_config"]))
+    spec_payload["prompt_contract_hash"] = verl_reward_function.prompt_contract()["hash"]
     spec = {
         **spec_payload,
         "spec_hash": stable_hash({

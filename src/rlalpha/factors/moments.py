@@ -26,14 +26,37 @@ def fixed_universe_moments(
     """
 
     count = len(signals)
+    if not count:
+        empty = np.empty((0, 0), dtype=float)
+        return FixedUniverseMoments(empty, np.empty(0), 0, float("nan"), float("nan"))
+    daily_gram, daily_predictive, valid_days = daily_fixed_universe_moments(signals, label, metric_mask)
+    gram = np.mean(daily_gram[valid_days], axis=0)
+    gram = 0.5 * (gram + gram.T)
+    predictive = np.mean(daily_predictive[valid_days], axis=0)
+    if not np.isfinite(gram).all() or not np.isfinite(predictive).all():
+        raise ValueError("fixed-universe moments are non-finite")
+    eigenvalues = np.linalg.eigvalsh(gram)
+    scale_bound = max(1.0, float(np.max(np.abs(eigenvalues))))
+    if float(eigenvalues[0]) < -1e-10 * scale_bound:
+        raise ValueError("fixed-universe Gram matrix is not positive semidefinite")
+    positive = eigenvalues[eigenvalues > 1e-12 * scale_bound]
+    condition = float(positive[-1] / positive[0]) if len(positive) else float("inf")
+    return FixedUniverseMoments(gram, predictive, int(valid_days.sum()), float(eigenvalues[0]), condition)
+
+
+def daily_fixed_universe_moments(
+    signals: tuple[np.ndarray, ...] | list[np.ndarray],
+    label: np.ndarray,
+    metric_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Small daily sufficient statistics, reusable across overlapping fit windows."""
+    count = len(signals)
     target = np.asarray(label, dtype=float)
     mask = np.asarray(metric_mask, dtype=bool) & np.isfinite(target)
     if target.shape != mask.shape:
         raise ValueError("label and metric mask shapes differ")
-    if not count:
-        empty = np.empty((0, 0), dtype=float)
-        return FixedUniverseMoments(empty, np.empty(0), 0, float("nan"), float("nan"))
-    matrix = np.stack([np.asarray(signal, dtype=float) for signal in signals], axis=-1)
+    matrix = (np.stack([np.asarray(signal, dtype=float) for signal in signals], axis=-1)
+              if count else np.empty((*target.shape, 0)))
     if matrix.shape[:2] != mask.shape:
         raise ValueError("signal and metric mask shapes differ")
     matrix = np.where(mask[..., None], np.where(np.isfinite(matrix), matrix, 0.0), 0.0)
@@ -46,27 +69,7 @@ def fixed_universe_moments(
     scale[valid_days] = 1.0 / observations[valid_days]
     daily_gram = np.einsum("daf,dag,d->dfg", matrix, matrix, scale, optimize=True)
     daily_predictive = np.einsum("daf,da,d->df", matrix, y, scale, optimize=True)
-    gram = np.mean(daily_gram[valid_days], axis=0)
-    # Eliminate asymmetric floating-point accumulation before eigensolving.
-    gram = 0.5 * (gram + gram.T)
-    predictive = np.mean(daily_predictive[valid_days], axis=0)
-    if not np.isfinite(gram).all() or not np.isfinite(predictive).all():
-        raise ValueError("fixed-universe moments are non-finite")
-    eigenvalues = np.linalg.eigvalsh(gram)
-    scale_bound = max(1.0, float(np.max(np.abs(eigenvalues))))
-    if float(eigenvalues[0]) < -1e-10 * scale_bound:
-        raise ValueError("fixed-universe Gram matrix is not positive semidefinite")
-    positive = eigenvalues[eigenvalues > 1e-12 * scale_bound]
-    condition = (
-        float(positive[-1] / positive[0]) if len(positive) else float("inf")
-    )
-    return FixedUniverseMoments(
-        gram,
-        predictive,
-        int(valid_days.sum()),
-        float(eigenvalues[0]),
-        condition,
-    )
+    return daily_gram, daily_predictive, valid_days
 
 
 def solve_psd_ridge(

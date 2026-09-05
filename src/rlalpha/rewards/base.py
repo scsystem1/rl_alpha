@@ -10,7 +10,7 @@ import threading
 import numpy as np
 from ..factors.calculator import FactorCalculator, daily_corr
 from ..factors.moments import fixed_universe_moments, solve_psd_ridge
-from ..factors.records import PoolScore
+from ..factors.records import PoolIncrement, PoolScore
 from ..factors.transform import combine_fixed_signals, prepare_fixed_universe_inputs
 from ..risk.neutralize import PreparedRiskSolve, RiskNeutralizer
 
@@ -694,6 +694,12 @@ class RewardObjective(ABC):
 
     def score_pool(self, signals: list[np.ndarray]) -> PoolScore:
         return self.prepare_pool(signals).score
+
+    def compare_scores(self, old: PoolScore, new: PoolScore) -> PoolIncrement:
+        """Legacy rewards retain their difference-of-pool-objectives semantics."""
+        mean = float(new.mean_ic - old.mean_ic)
+        reward = float(new.objective - old.objective)
+        return PoolIncrement(mean, float("nan"), mean - reward, reward)
 
     def score_prepared_with_weights(
         self,

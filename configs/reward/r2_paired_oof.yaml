@@ -1,0 +1,12 @@
+reward:
+  name: r2_paired_oof
+  neutralized: true
+  hac_lag: 20
+  critical_value: 1.645
+  min_pool_valid_day_rate: 0.80
+  min_pool_observation_rate: 0.80
+  min_pool_valid_days: 252
+  time_folds:
+    - {fit: [2010-01-01, 2012-12-31], score: [2013-01-01, 2014-12-31]}
+    - {fit: [2012-01-01, 2014-12-31], score: [2015-01-01, 2016-12-31]}
+    - {fit: [2014-01-01, 2016-12-31], score: [2017-01-01, 2018-12-31]}

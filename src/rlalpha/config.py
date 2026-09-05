@@ -39,7 +39,7 @@ class DataConfig(StrictModel):
 
 
 SearchMethod = Literal["random", "gp", "base_llm", "grpo_llm", "quantevolver", "alphasage"]
-RewardName = Literal["r0", "r1", "r2_lcb", "qe_native"]
+RewardName = Literal["r0", "r1", "r2_lcb", "r1_oof", "r2_paired_oof", "qe_native"]
 
 
 class ExperimentConfig(StrictModel):
@@ -179,6 +179,17 @@ class SearchConfig(StrictModel):
         return self
 
 
+class TimeFoldConfig(StrictModel):
+    fit: tuple[date, date]
+    score: tuple[date, date]
+
+    @model_validator(mode="after")
+    def chronological(self):
+        if not self.fit[0] <= self.fit[1] < self.score[0] <= self.score[1]:
+            raise ValueError("a time fold must fit strictly before it scores")
+        return self
+
+
 class RewardConfig(StrictModel):
     name: RewardName
     neutralized: bool
@@ -188,6 +199,17 @@ class RewardConfig(StrictModel):
     min_pool_valid_day_rate: float = Field(default=0.80, gt=0, le=1)
     min_pool_observation_rate: float = Field(default=0.80, gt=0, le=1)
     min_pool_valid_days: int = Field(default=252, gt=0)
+    ridge: float = Field(default=0.001, gt=0)
+    time_folds: list[TimeFoldConfig] | None = None
+
+    @model_validator(mode="after")
+    def validate_time_folds(self):
+        if self.name in {"r1_oof", "r2_paired_oof"} and not self.time_folds:
+            raise ValueError("OOF rewards require explicit time_folds")
+        folds = self.time_folds or []
+        if any(a.score[1] >= b.score[0] for a, b in zip(folds, folds[1:])):
+            raise ValueError("OOF score windows must be ordered and disjoint")
+        return self
 
 
 class EvaluationConfig(StrictModel):

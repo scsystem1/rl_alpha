@@ -1,43 +1,9 @@
 # Unified prompt contract
 
-RLAlpha maintains exactly one prompt, `unified_compact_v7`, for both Base-LLM
-and formal GRPO. There is no prompt-version switch and no rotating hint. Reward
-variants also do not change the prompt.
+The shared Base-LLM / GRPO prompt is `unified_rolling_summary_v8`. It contains the full formula pool, DSL vocabulary and limits, the next-close 20-trading-day target, Balanced-22 neutralization, and compact canonical training evidence. It has no named search themes or rotating hints.
 
-The prompt contains only:
+The numerical evidence is one rolling OOF RNIC plus one signed coefficient per formula. Coefficients are L1-normalized within each fit fold and then averaged; they describe how the combination uses factors, not importance. All reward variants use the same neutralized diagnostic definition, cached once per frozen pool version. Neither reward-specific pool objectives nor validation/test statistics enter the prompt.
 
-1. every formula currently in the frozen train-only pool;
-2. the allowed features, operators, windows, and constants;
-3. one short goal: propose a valid, non-duplicate complement that improves the
-   current pool on training data;
-4. one compact hint line covering momentum, mean reversion, volatility,
-   price-volume interaction, multi-horizon structure, and cross-sectional
-   ranking;
-5. the exact `<expr>FORMULA</expr>` output schema.
+The structured depth-six grammar is provided separately from the natural-language prompt. The contract hash includes the system text, user template, summary definition, grammar and vocabulary. Eight independent completions see an identical frozen prompt. Numeric-summary ablation is confined to the offline benchmark script, with matched pool snapshots and random seeds.
 
-The finite depth-six, featureful grammar is enforced by structured decoding and
-included in the prompt contract hash, but is not repeated in the
-natural-language prompt.
-Parsing, canonicalization, semantic validity, duplicate detection, and
-train-only market evaluation remain mandatory after decoding.
-
-## Sampling and admission protocol
-
-- Base-LLM: render the prompt once, sample it independently eight times, score
-  all eight against one frozen pool, and admit at most the best one.
-- GRPO: use one prompt row with `rollout.n=8`; the eight rewards form one GRPO
-  group and one optimizer update. After the update, admit at most the best one
-  against the same frozen pre-round pool.
-- Random follows the same eight-candidate frozen-pool admission round. GP is
-  maintained separately.
-
-Run the tokenizer profile for the sole prompt with:
-
-```bash
-python scripts/benchmark_prompts.py \
-  --model /data/shared/huggingface/Qwen3.5-2B \
-  --output /data/sunyuxiang/rl_alpha/runs/prompt_benchmark/token_profile.json
-```
-
-The profile reports token counts at representative pool sizes; it does not
-select among templates because alternative prompt versions no longer exist.
+The pinned Qwen3.5-2B tokenizer and config hashes match the model configuration. Full 20-factor prompts use 763 tokens for ordinary formulas and 1813 for the tested complex legal formulas, leaving room under 4096 with 128 output tokens reserved. This validates length only. See [protocol and commands](rolling_oof.md) and [token profile](rolling_oof_token_profile.json).

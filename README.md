@@ -1,5 +1,7 @@
 # RLAlpha
 
+当前改进方案与运行入口：[三折滚动 reward / 精简 prompt（v8）](docs/rolling_oof.md)。主方案为 `r1_oof`，配对 LCB 对照为 `r2_paired_oof`；外层保持全历史拟合。
+
 RLAlpha is a leakage-audited S&P 500 factor-search research implementation
 based on `../REMOTE_CODEX_BUILD_GUIDE.md` and the stricter repair contract in
 `../repair.md`. AlphaGen and QuantEvolver are read-only reference checkouts.

@@ -6,7 +6,7 @@ from typing import Iterable
 
 import numpy as np
 
-from .records import CandidateScore, PoolEntry, PoolScore
+from .records import CandidateScore, PoolEntry, PoolIncrement, PoolScore
 from ..utils.hashing import stable_hash
 
 
@@ -126,6 +126,9 @@ class PoolManager:
         return self.objective.score_subset(state, indices)
 
     def _saliency(self, state: object, score: PoolScore) -> np.ndarray:
+        saliency = getattr(self.objective, "saliency", None)
+        if callable(saliency):
+            return saliency(state)
         weights = np.asarray(score.weights, dtype=float)
         inverse = np.asarray(getattr(state, "system_inverse", np.empty((0, 0))), dtype=float)
         if inverse.shape == (len(weights), len(weights)):
@@ -134,6 +137,14 @@ class PoolManager:
                 saliency = weights * weights / diagonal
             return np.where(np.isfinite(saliency) & (diagonal > 0), saliency, np.inf)
         return np.where(np.isfinite(weights), weights * weights, np.inf)
+
+    def _increment(self, old: PoolScore, new: PoolScore) -> PoolIncrement:
+        compare = getattr(self.objective, "compare_scores", None)
+        if callable(compare):
+            return compare(old, new)
+        mean = float(new.mean_ic - old.mean_ic)
+        reward = float(new.objective - old.objective)
+        return PoolIncrement(mean, float("nan"), mean - reward, reward)
 
     def _provisional_candidate_plan(
         self,
@@ -193,7 +204,8 @@ class PoolManager:
                 ),
                 None,
             )
-        delta_add = float(add_score.objective - add_baseline.objective)
+        add_increment = self._increment(add_baseline, add_score)
+        delta_add = add_increment.reward
         if not np.isfinite(delta_add):
             return self._invalid(candidate, add_score, "non_finite_delta")
         # Valid rewards are shaped only after every frozen-pool candidate has
@@ -217,6 +229,8 @@ class PoolManager:
                     reward_valid_observations=int(support.get("valid_observations", 0)),
                     reward_valid_day_rate=float(support.get("valid_day_rate", 0.0)),
                     reward_observation_rate=float(support.get("observation_rate", 0.0)),
+                    add_increment=add_increment,
+                    post_prune_increment=add_increment,
                 ),
                 None,
             )
@@ -256,12 +270,13 @@ class PoolManager:
         ]
         if not finite:
             return self._invalid(candidate, add_score, "non_finite_prune_objective")
-        fixed_score, delete_index = max(finite, key=lambda item: item[0].objective)
+        fixed_score, delete_index = max(finite, key=lambda item: self._increment(add_baseline, item[0]).reward)
         self_evicted = delete_index == len(self.entries)
         replaced_hash = None if self_evicted else self.entries[delete_index].expr_hash
         labels = [entry.expr_hash for entry in self.entries] + [candidate.expr_hash]
         eviction_candidates = tuple(labels[int(index)] for index in delete_indices)
-        provisional_delta = float(fixed_score.objective - add_baseline.objective)
+        post_increment = self._increment(add_baseline, fixed_score)
+        provisional_delta = post_increment.reward
         return _CandidatePlan(
             candidate,
             CandidateScore(
@@ -283,6 +298,8 @@ class PoolManager:
                 int(support.get("valid_observations", 0)),
                 float(support.get("valid_day_rate", 0.0)),
                 float(support.get("observation_rate", 0.0)),
+                add_increment=add_increment,
+                post_prune_increment=post_increment,
             ),
             delete_index,
             add_state,
@@ -335,6 +352,7 @@ class PoolManager:
                     formal_score = baseline
                     formal_delta = 0.0
                     formal_valid = True
+                    formal_increment = self._increment(baseline, baseline)
                 else:
                     replacement = int(plan.delete_index)
                     formal_entries = (
@@ -371,12 +389,9 @@ class PoolManager:
                             base_state, prepared_new_state
                         )
                         formal_score = natural_new_state.score
-                        shared_delta = float(
-                            shared_new_score.objective - old_score.objective
-                        )
-                        natural_delta = float(
-                            formal_score.objective - baseline.objective
-                        )
+                        shared_delta = self._increment(old_score, shared_new_score).reward
+                        formal_increment = self._increment(baseline, formal_score)
+                        natural_delta = formal_increment.reward
                         formal_delta = min(shared_delta, natural_delta)
                         support_is_valid = getattr(self.objective, "support_is_valid", None)
                         formal_valid = not callable(support_is_valid) or support_is_valid(natural_new_state)
@@ -391,18 +406,16 @@ class PoolManager:
                         # Requiring the cached natural-support objective to be
                         # monotone as well preserves the pool invariant used by
                         # snapshots and subsequent add-only rewards.
-                        shared_delta = float(
-                            shared_new_score.objective - old_score.objective
-                        )
-                        natural_delta = float(
-                            formal_score.objective - baseline.objective
-                        )
+                        shared_delta = self._increment(old_score, shared_new_score).reward
+                        formal_increment = self._increment(baseline, formal_score)
+                        natural_delta = formal_increment.reward
                         formal_delta = min(shared_delta, natural_delta)
                         support_is_valid = getattr(self.objective, "support_is_valid", None)
                         formal_valid = not callable(support_is_valid) or support_is_valid(natural_new_state)
                     else:
                         formal_score = self._score(formal_entries)
-                        formal_delta = float(formal_score.objective - baseline.objective)
+                        formal_increment = self._increment(baseline, formal_score)
+                        formal_delta = formal_increment.reward
                         formal_valid = True
                     cache_prepared = getattr(
                         self.objective, "cache_prepared_pool", None
@@ -419,6 +432,7 @@ class PoolManager:
                         plan.score,
                         pool_score=formal_score,
                         post_prune_delta=formal_delta if formal_valid else float("-inf"),
+                        post_prune_increment=formal_increment,
                         formally_rechecked=True,
                         valid=bool(plan.score.valid and formal_valid),
                         reason=plan.score.reason if formal_valid else "insufficient_pool_support",

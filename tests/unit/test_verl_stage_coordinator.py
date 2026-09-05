@@ -177,8 +177,8 @@ def test_stage_io_paths_do_not_change_frozen_semantic_hash(tmp_path):
     assert left["archive_path"] != right["archive_path"]
     assert left["signal_cache_root"] != right["signal_cache_root"]
     assert left["spec_hash"] == right["spec_hash"]
-    assert left["schema_version"] == 7
-    assert left["reward_pool_semantics"] == "fixed-universe-zero-fill-psd-gram-v7"
+    assert left["schema_version"] == 8
+    assert left["reward_pool_semantics"] == "fixed-universe-rolling-paired-oof-v8"
 
 
 def test_domain_metrics_audit_reward_scale_and_valid_saturation():

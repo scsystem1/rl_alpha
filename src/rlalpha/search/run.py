@@ -17,9 +17,8 @@ from ..factors.pool import PoolManager
 from ..manifest import build_manifest, git_info
 from ..data.discovery import discover_data_files
 from ..dsl.evaluator import EVALUATOR_SEMANTICS_VERSION
-from ..rewards.r0 import R0Objective
-from ..rewards.r1 import R1Objective
-from ..rewards.r2_lcb import R2LCBObjective
+from ..rewards.factory import objective_for, REWARD_POOL_SEMANTICS
+from .prompt_diagnostics import PoolPromptDiagnostics
 from ..utils.hashing import file_fingerprint, stable_hash
 from ..utils.io import atomic_write_text, write_json, write_yaml
 from ..utils.experiment_log import append_event, update_progress, write_result_summary
@@ -77,6 +76,9 @@ def _snapshot_record(pool: PoolManager, validation_score: dict[str, Any], valid_
     support_diagnostics = getattr(pool.objective, "support_diagnostics", None)
     if prepared is not None and callable(support_diagnostics):
         train_score["support"] = support_diagnostics(prepared)
+    diagnostics = getattr(pool.objective, "snapshot_diagnostics", None)
+    if callable(diagnostics):
+        train_score.update(diagnostics(prepared))
     state = searcher.state_dict()
     factors = []
     for index, entry in enumerate(pool.entries):
@@ -171,34 +173,6 @@ def _write_lineage(run_dir: Path, coordinator: SearchCoordinator, snapshots: lis
     return final
 
 
-def objective_for(reward: str, panel: SplitPanel, reward_config: dict[str, Any] | None = None):
-    reward_config = reward_config or {}
-    label = panel.target(panel.label)
-    # Reward transforms factors on the label-free trade universe.  Label
-    # availability is introduced only by RewardObjective's metric mask.
-    mask = panel.target(panel.common_mask)
-    support = {
-        "min_pool_valid_day_rate": float(reward_config.get("min_pool_valid_day_rate", 0.80)),
-        "min_pool_observation_rate": float(reward_config.get("min_pool_observation_rate", 0.80)),
-        "min_pool_valid_days": int(reward_config.get("min_pool_valid_days", 252)),
-    }
-    if reward == "r0":
-        return R0Objective(label, mask, **support)
-    exposures = panel.target(panel.exposures)
-    if reward == "r1":
-        return R1Objective(label, mask, exposures, **support)
-    if reward == "r2_lcb":
-        return R2LCBObjective(
-            label,
-            mask,
-            exposures,
-            hac_lag=int(reward_config.get("hac_lag", 20)),
-            critical_value=float(reward_config.get("critical_value", 1.645)),
-            **support,
-        )
-    raise ValueError(f"unknown reward {reward}")
-
-
 def searcher_for(method: str, seed: int, config: dict[str, Any], alphagen_root: str | Path | None = None):
     if method == "random":
         return RandomSearcher(seed, int(config.get("max_depth", 6)))
@@ -244,7 +218,7 @@ def _score_validation(
         if expression not in signal_cache:
             signal_cache[expression] = panel.evaluate(parse_expression(expression))
         signals.append(signal_cache[expression])
-    objective = objective_for(reward, panel, reward_config)
+    objective = objective_for(reward, panel, reward_config, evaluation=True)
     state = objective.prepare_pool(signals)
     score = objective.score_prepared_with_weights(state, train_weights)
     return {
@@ -295,6 +269,7 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, ste
     reward_config = load_yaml(paths.code_root / f"configs/reward/{reward}.yaml")
     data_config = load_yaml(paths.code_root / "configs/data/sp500.yaml").get("data", {})
     evaluation_config = load_yaml(paths.code_root / "configs/eval/preliminary.yaml").get("evaluation", {})
+    reward_config["reward"]["ridge"] = float(evaluation_config["ridge_lambda"])
     merged_config = {**method_config, **model_config, "method": method, "reward": reward, "seed": seed, "search_steps": steps}
     run_dir = paths.runs_root / experiment_id / method / reward / f"seed_{seed}"
     if not resume and run_dir.exists() and any(run_dir.iterdir()):
@@ -319,7 +294,8 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, ste
     write_yaml(run_dir / "effective_config.yaml", effective_config)
     identity_inputs = {
         "schema_version": 3,
-        "final_pool_selection_version": "train-ridge-validation-objective-v1",
+        "final_pool_selection_version": "full-train-ridge-oof-mean-validation-v2",
+        "prompt_contract": prompt_contract() if method in {"base_llm", "grpo_llm"} else None,
         "effective_config": effective_config,
         "evaluator_version": EVALUATOR_SEMANTICS_VERSION,
         "repositories": {
@@ -374,6 +350,8 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, ste
     else:
         searcher = searcher_for(method, seed, merged_config, paths.alphagen_root)
         coordinator = SearchCoordinator(searcher, pool, train.evaluate, train.target(train.common_mask), candidate_limit, run_dir)
+    if method in {"base_llm", "grpo_llm"}:
+        coordinator.prompt_diagnostics = PoolPromptDiagnostics(train, pool, reward_options)
     checkpoint = run_dir / "checkpoint.json"
     if resume and checkpoint.exists():
         coordinator.load_checkpoint()
@@ -463,7 +441,7 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, ste
     write_json(run_dir / "train_metrics.json", train_metrics)
     write_json(run_dir / "validation_metrics.json", selected.get("validation", {}))
     prompt = prompt_contract() if method in {"base_llm", "grpo_llm"} else None
-    manifest = build_manifest(paths, list(discover_data_files(paths.raw_data_root).values()), effective_config=effective_config, model_config=model_config.get("model") if model_config else None, prompt=prompt, reward_version=f"{reward}:fixed-universe-zero-fill-psd-gram-v7", evaluator_version=EVALUATOR_SEMANTICS_VERSION)
+    manifest = build_manifest(paths, list(discover_data_files(paths.raw_data_root).values()), effective_config=effective_config, model_config=model_config.get("model") if model_config else None, prompt=prompt, reward_version=f"{reward}:{REWARD_POOL_SEMANTICS}", evaluator_version=EVALUATOR_SEMANTICS_VERSION)
     manifest.update({"experiment_id": experiment_id, "method": method, "reward": reward, "seed": seed, "search_steps": int(steps), "completed_steps": completed_steps, "candidates_per_step": group_size, "search_accounting": coordinator.ledger.state_dict(), "model": model_config.get("model") if model_config else None, "splits": {name: {"start": str(split.start.date()), "end": str(split.end.date())} for name, split in __import__("rlalpha.data.splits", fromlist=["SPLITS"]).SPLITS.items()}, "conventions": {"label": "20 trading-day next-close total return", "signal": "formed after t close", "execution": "next trading-day close", "pnl_start": "trading day after execution"}})
     manifest.pop("manifest_hash", None)
     manifest["manifest_hash"] = stable_hash(manifest)
