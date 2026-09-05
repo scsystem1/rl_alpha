@@ -38,8 +38,8 @@ class DataConfig(StrictModel):
     fundamental_max_age_months: int = Field(gt=0)
 
 
-SearchMethod = Literal["random", "gp", "base_llm", "grpo_llm", "alphasage"]
-RewardName = Literal["r0", "r1", "r2_lcb"]
+SearchMethod = Literal["random", "gp", "base_llm", "grpo_llm", "quantevolver", "alphasage"]
+RewardName = Literal["r0", "r1", "r2_lcb", "qe_native"]
 
 
 class ExperimentConfig(StrictModel):

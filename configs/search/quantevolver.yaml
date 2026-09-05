@@ -1,0 +1,4 @@
+search:
+  method: quantevolver
+  group_size: 8
+

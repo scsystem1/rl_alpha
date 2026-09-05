@@ -162,7 +162,7 @@ def _write_lineage(run_dir: Path, coordinator: SearchCoordinator, snapshots: lis
             "group": selected.get("group"),
             "optimizer_update": selected.get("optimizer_update"),
             "checkpoint": selected.get("checkpoint"),
-            "selection_rule": "support-qualified maximum predeclared validation objective; tie smaller pool then earlier pool version",
+            "selection_rule": "support-qualified maximum validation objective with train-fitted ridge weights; tie smaller pool then earlier pool version",
         },
         "factors": final_factors,
     }
@@ -234,6 +234,7 @@ def _score_validation(
     expressions: list[str],
     panel: SplitPanel,
     reward: str,
+    train_weights: list[float] | tuple[float, ...],
     signal_cache: dict[str, Any] | None = None,
     reward_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -245,8 +246,16 @@ def _score_validation(
         signals.append(signal_cache[expression])
     objective = objective_for(reward, panel, reward_config)
     state = objective.prepare_pool(signals)
-    score = state.score
-    return {"objective": score.objective, "mean_ic": score.mean_ic, "standard_error": score.standard_error, "weights": list(score.weights), "daily_ic": list(score.daily_ic), "support": objective.support_diagnostics(state)}
+    score = objective.score_prepared_with_weights(state, train_weights)
+    return {
+        "objective": score.objective,
+        "mean_ic": score.mean_ic,
+        "standard_error": score.standard_error,
+        "weights": list(score.weights),
+        "daily_ic": list(score.daily_ic),
+        "support": objective.support_diagnostics(state),
+        "ridge_weight_source": "train",
+    }
 
 
 def _select_snapshot(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
@@ -271,6 +280,10 @@ def _select_snapshot(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
 def run_search(config_path: str | Path, method: str, reward: str, seed: int, steps: int, experiment_id: str, resume: bool = True) -> dict[str, Any]:
     if steps <= 0:
         raise ValueError(f"search steps must be positive, got {steps}")
+    if method == "quantevolver":
+        from .quantevolver.run import run_quantevolver
+
+        return run_quantevolver(config_path, reward, seed, steps, experiment_id, resume)
     raw_config = load_yaml(config_path)
     group_size = int(raw_config.get("experiment", {}).get("proposal_group_size", 8))
     if method in {"random", "gp", "base_llm", "grpo_llm"} and group_size != 8:
@@ -305,7 +318,8 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, ste
         effective_config["model"]["path"] = str(resolve_model_path(effective_config))
     write_yaml(run_dir / "effective_config.yaml", effective_config)
     identity_inputs = {
-        "schema_version": 2,
+        "schema_version": 3,
+        "final_pool_selection_version": "train-ridge-validation-objective-v1",
         "effective_config": effective_config,
         "evaluator_version": EVALUATOR_SEMANTICS_VERSION,
         "repositories": {
@@ -380,7 +394,12 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, ste
         cell_result = coordinator.run_cell()
         for snapshot in cell_result["pool_snapshots"]:
             validation_score = _score_validation(
-                list(snapshot["expressions"]), validation, reward, validation_signal_cache, reward_options
+                list(snapshot["expressions"]),
+                validation,
+                reward,
+                list(snapshot["train"].get("weights", [])),
+                validation_signal_cache,
+                reward_options,
             )
             completed = {**snapshot, "validation": validation_score}
             snapshots.append(completed)
@@ -401,7 +420,14 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, ste
             _record_round(run_dir, method, int(coordinator.group_index), outcomes, admission, coordinator, pool, steps)
             if pool.version != last_version:
                 expressions = [entry.expression for entry in pool.entries]
-                validation_score = _score_validation(expressions, validation, reward, validation_signal_cache, reward_options)
+                validation_score = _score_validation(
+                    expressions,
+                    validation,
+                    reward,
+                    list(pool.score.weights),
+                    validation_signal_cache,
+                    reward_options,
+                )
                 snapshot = _snapshot_record(pool, validation_score, coordinator.ledger.valid_unique_evaluations, searcher)
                 snapshots.append(snapshot)
                 append_snapshot(snapshot)
@@ -411,7 +437,19 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, ste
             coordinator.flush_admission()
         if pool.version != previous_version:
             expressions = [entry.expression for entry in pool.entries]
-            snapshot = _snapshot_record(pool, _score_validation(expressions, validation, reward, validation_signal_cache, reward_options), coordinator.ledger.valid_unique_evaluations, searcher)
+            snapshot = _snapshot_record(
+                pool,
+                _score_validation(
+                    expressions,
+                    validation,
+                    reward,
+                    list(pool.score.weights),
+                    validation_signal_cache,
+                    reward_options,
+                ),
+                coordinator.ledger.valid_unique_evaluations,
+                searcher,
+            )
             snapshots.append(snapshot)
             append_snapshot(snapshot)
     coordinator.save_checkpoint()

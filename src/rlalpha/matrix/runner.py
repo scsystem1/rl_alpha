@@ -20,6 +20,7 @@ from ..manifest import git_info
 
 GPU_THRESHOLDS_MIB = {2: 34 * 1024, 3: 28 * 1024, 4: 14 * 1024}
 GPU_MEMORY_UTILIZATION = {2: "0.18", 3: "0.15", 4: "0.18"}
+GRPO_METHODS = {"grpo_llm", "quantevolver"}
 
 
 @lru_cache(maxsize=16)
@@ -63,6 +64,8 @@ def _gpu_candidates(
         devices = [2, 3]
         start = (seed + {"r0": 0, "r1": 1, "r2_lcb": 2}[reward]) % len(devices)
         return devices[start:] + devices[:start]
+    if method == "quantevolver":
+        return [4]
     return []
 
 
@@ -89,7 +92,15 @@ def _matrix_progress(root: Path, cells: list[tuple[str, str, int]]) -> dict[str,
 
 def _contains_cuda_oom(text: str) -> bool:
     lowered = text.lower()
-    return "cuda out of memory" in lowered or "torch.outofmemoryerror" in lowered or "cublas_status_alloc_failed" in lowered
+    return any(
+        marker in lowered
+        for marker in (
+            "cuda out of memory",
+            "torch.outofmemoryerror",
+            "cublas_status_alloc_failed",
+            "no available memory for the cache blocks",
+        )
+    )
 
 
 def _expected_cell_identity(config: Path, paths: Any, method: str, reward: str, seed: int, steps: int) -> str:
@@ -100,7 +111,7 @@ def _expected_cell_identity(config: Path, paths: Any, method: str, reward: str, 
         Path(paths.code_root) / "configs/data/sp500.yaml",
         Path(paths.code_root) / "configs/eval/preliminary.yaml",
     ]
-    if method in {"base_llm", "grpo_llm"}:
+    if method in {"base_llm", "grpo_llm", "quantevolver"}:
         referenced.append(Path(paths.code_root) / "configs/model/qwen3_5_2b.yaml")
     panel = Path(paths.processed_root) / "panel"
     referenced.extend(panel / name for name in ("build_manifest.yaml", "risk_build_manifest.yaml", "index.json"))
@@ -117,7 +128,7 @@ def _expected_cell_identity(config: Path, paths: Any, method: str, reward: str, 
         "quantevolver": _repository_identity(str(Path(paths.quantevolver_root).resolve())),
     }
     model_runtime = []
-    if method in {"base_llm", "grpo_llm"}:
+    if method in {"base_llm", "grpo_llm", "quantevolver"}:
         model_config = load_yaml(Path(paths.code_root) / "configs/model/qwen3_5_2b.yaml")["model"]
         model_path = Path(model_config["path"])
         candidates = [model_path / "config.json", model_path / "tokenizer.json", *sorted(model_path.glob("*.safetensors"))]
@@ -195,7 +206,7 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
         occupied = [str(_cell_dir(root, method, reward, int(seed))) for method, reward, seed in cells if _cell_dir(root, method, reward, int(seed)).exists() and any(_cell_dir(root, method, reward, int(seed)).iterdir())]
         if occupied:
             raise RuntimeError(f"--no-resume refuses existing cell directories: {occupied}; use a new experiment ID")
-    if any(method in {"base_llm", "grpo_llm"} for method, _, _ in cells) and not bool(experiment.get("auto_start_expensive_jobs", False)):
+    if any(method in {"base_llm", "grpo_llm", "quantevolver"} for method, _, _ in cells) and not bool(experiment.get("auto_start_expensive_jobs", False)):
         raise RuntimeError("expensive Base-LLM/GRPO cells are disabled by experiment.auto_start_expensive_jobs=false")
     steps = int(experiment.get("search_steps", 250))
     append_event(root / "experiment.log", "matrix_started", experiment_id=experiment_id, cells=len(cells), search_steps=steps, candidates_per_step=int(experiment.get("proposal_group_size", 8)))
@@ -219,17 +230,20 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
         if state.get("status") == "running" and _pid_alive(state.get("pid")):
             external[(method, reward, int(seed))] = state
             continue
-        pending.append((method, reward, int(seed), int(state.get("attempt", 0)) + 1, int(state.get("rollout_microbatch", 8))))
+        # QuantEvolver still draws eight completions per prompt; this only
+        # serializes those completions to fit the shared 48 GiB devices.
+        default_microbatch = 1 if method == "quantevolver" else 8
+        pending.append((method, reward, int(seed), int(state.get("attempt", 0)) + 1, int(state.get("rollout_microbatch", default_microbatch))))
     running: dict[subprocess.Popen[str], tuple[str, str, int, float, Any, int | None, int, int, int]] = {}
     while pending or running or external:
         free = _gpu_free_mib()
         busy_gpus = {item[5] for item in running.values()} | {item.get("gpu") for item in external.values()}
         cpu_jobs = sum(item[5] is None for item in running.values()) + sum(item.get("gpu") is None for item in external.values())
         total_cpu_threads = sum(
-            int(experiment.get("grpo_ray_cpus", 8)) if item[0] == "grpo_llm" else int(experiment.get("cpu_threads_per_job", 8))
+            int(experiment.get("grpo_ray_cpus", 8)) if item[0] in GRPO_METHODS else int(experiment.get("cpu_threads_per_job", 8))
             for item in running.values()
         ) + sum(
-            int(experiment.get("grpo_ray_cpus", 8)) if cell[0] == "grpo_llm" else int(experiment.get("cpu_threads_per_job", 8))
+            int(experiment.get("grpo_ray_cpus", 8)) if cell[0] in GRPO_METHODS else int(experiment.get("cpu_threads_per_job", 8))
             for cell in external
         )
         base_busy = any(item[0] == "base_llm" for item in running.values()) or any(
@@ -246,7 +260,7 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
                 ),
                 gpu_options[0] if gpu_options else None,
             )
-            required_threads = int(experiment.get("grpo_ray_cpus", 8)) if method == "grpo_llm" else int(experiment.get("cpu_threads_per_job", 8))
+            required_threads = int(experiment.get("grpo_ray_cpus", 8)) if method in GRPO_METHODS else int(experiment.get("cpu_threads_per_job", 8))
             if total_cpu_threads + required_threads > int(experiment.get("max_total_cpu_threads", 90)):
                 continue
             if gpu is None and cpu_jobs >= max_cpu_jobs:
@@ -271,10 +285,10 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
                 env["CUDA_VISIBLE_DEVICES"] = str(gpu)
                 env["RLALPHA_PHYSICAL_GPU"] = str(gpu)
                 env["RLALPHA_VLLM_MEMORY_UTILIZATION"] = gpu_memory_utilization.get(gpu, "0.18")
-            thread_count = int(experiment.get("grpo_ray_cpus", 8)) if method == "grpo_llm" else int(experiment.get("cpu_threads_per_job", 8))
+            thread_count = int(experiment.get("grpo_ray_cpus", 8)) if method in GRPO_METHODS else int(experiment.get("cpu_threads_per_job", 8))
             for variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMBA_NUM_THREADS"):
                 env[variable] = str(thread_count)
-            if method == "grpo_llm":
+            if method in GRPO_METHODS:
                 env["RLALPHA_GRPO_MICROBATCH"] = str(microbatch)
             command = [sys.executable, "-m", "rlalpha.cli", "search", "run", "--method", method, "--reward", reward, "--seed", str(seed), "--steps", str(steps), "--experiment-id", experiment_id, "--config", str(config)]
             process = subprocess.Popen(command, cwd=paths.code_root, env=env, stdout=log_handle, stderr=subprocess.STDOUT, text=True)
@@ -299,7 +313,7 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
                 handle.seek(log_offset)
                 attempt_log = handle.read()
             state_path = _cell_dir(root, method, reward, seed) / "progress.json"
-            oom_retry = returncode != 0 and method == "grpo_llm" and _contains_cuda_oom(attempt_log) and microbatch > 1
+            oom_retry = returncode != 0 and method in GRPO_METHODS and _contains_cuda_oom(attempt_log) and microbatch > 1
             accepted, acceptance_error = _cell_acceptance(_cell_dir(root, method, reward, seed), steps) if returncode == 0 else (False, None)
             status = "retrying_after_oom" if oom_retry else ("complete" if returncode == 0 and accepted else "failed")
             next_microbatch = max(1, microbatch // 2) if oom_retry else microbatch
@@ -322,7 +336,8 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
             if int(metrics.get("completed_steps", -1)) >= steps and state.get("cell_identity") == expected_identity:
                 update_progress(directory / "progress.json", **{**state, "status": "complete", "recovered_after_runner_restart": True, "finished_at": time.time()})
             else:
-                pending.append((method, reward, seed, int(state.get("attempt", 0)) + 1, int(state.get("rollout_microbatch", 8))))
+                default_microbatch = 1 if method == "quantevolver" else 8
+                pending.append((method, reward, seed, int(state.get("attempt", 0)) + 1, int(state.get("rollout_microbatch", default_microbatch))))
             del external[cell]
         if running:
             time.sleep(min(poll_seconds, 30))

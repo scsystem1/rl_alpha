@@ -1,0 +1,17 @@
+paths:
+  code_root: /home/sunyuxiang/rl_alpha/ours
+  raw_data_root: /data/sunyuxiang/rl_alpha
+  processed_root: /data/sunyuxiang/rl_alpha/processed
+  cache_root: /data/sunyuxiang/rl_alpha/cache
+  runs_root: /data/sunyuxiang/rl_alpha/runs
+  model_search_root: /data/shared/huggingface
+  alphagen_root: /home/sunyuxiang/rl_alpha/baseline/alphagen
+  quantevolver_root: /home/sunyuxiang/rl_alpha/baseline/QuantEvolver
+experiment:
+  cells:
+    - [alphasage, r0]
+  seeds: [1]
+  search_steps: 250
+  proposal_group_size: 1
+  pool_capacity: 20
+  auto_start_expensive_jobs: false

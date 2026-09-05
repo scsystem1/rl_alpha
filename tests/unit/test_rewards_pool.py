@@ -67,6 +67,29 @@ def test_pool_scoring_matches_explicit_independent_availability_combination():
     assert np.isfinite(np.asarray(score.daily_ic)[5:10]).all()
 
 
+def test_prepared_pool_can_be_scored_with_fixed_train_weights():
+    rng = np.random.default_rng(191)
+    shape = (30, 50)
+    train_signals = [rng.normal(size=shape), rng.normal(size=shape)]
+    train_label = 0.8 * train_signals[0] - 0.2 * train_signals[1] + rng.normal(size=shape)
+    validation_signals = [rng.normal(size=shape), rng.normal(size=shape)]
+    validation_label = -0.1 * validation_signals[0] + 0.9 * validation_signals[1] + rng.normal(size=shape)
+    mask = np.ones(shape, dtype=bool)
+
+    train = R0Objective(train_label, mask)
+    train_weights = np.asarray(train.score_pool(train_signals).weights)
+    validation = R0Objective(validation_label, mask)
+    state = validation.prepare_pool(validation_signals)
+    fixed = validation.score_prepared_with_weights(state, train_weights)
+    refit = state.score
+
+    combined, _ = combine_fixed_signals(state.prepared_signals, train_weights)
+    expected = daily_corr(combined, state.prepared_label, state.common_mask)
+    assert np.allclose(fixed.weights, train_weights)
+    assert np.allclose(fixed.daily_ic, expected, equal_nan=True)
+    assert not np.allclose(fixed.weights, refit.weights)
+
+
 def test_neutralized_signal_and_label_use_identical_projection_sample():
     rng = np.random.default_rng(123)
     days, assets = 3, 40

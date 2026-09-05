@@ -695,5 +695,34 @@ class RewardObjective(ABC):
     def score_pool(self, signals: list[np.ndarray]) -> PoolScore:
         return self.prepare_pool(signals).score
 
+    def score_prepared_with_weights(
+        self,
+        state: PreparedPoolState,
+        weights: np.ndarray | list[float] | tuple[float, ...],
+    ) -> PoolScore:
+        """Score an already prepared pool with a weight vector fitted elsewhere.
+
+        This supports validation-only model selection: ridge coefficients are
+        estimated on train, then held fixed while validation supplies only the
+        daily ICs and reward-specific objective.
+        """
+        fixed = np.asarray(weights, dtype=float)
+        factor_count = len(state.prepared_signals)
+        if fixed.ndim != 1 or len(fixed) != factor_count:
+            raise ValueError(
+                "fixed ridge weight count differs from prepared pool factor count"
+            )
+        if not np.isfinite(fixed).all():
+            raise ValueError("fixed ridge weights must be finite")
+        if factor_count == 0:
+            return state.score
+        combined, _ = combine_fixed_signals(state.prepared_signals, fixed)
+        result_mask = state.common_mask & np.isfinite(state.prepared_label)
+        combined[~result_mask] = np.nan
+        daily = _fixed_universe_daily_corr(
+            combined, state.prepared_label, result_mask
+        )
+        return self._score_from_daily(daily, fixed)
+
     @abstractmethod
     def objective_name(self) -> str: ...
