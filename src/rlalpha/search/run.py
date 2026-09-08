@@ -18,7 +18,6 @@ from ..manifest import build_manifest, git_info
 from ..data.discovery import discover_data_files
 from ..dsl.evaluator import EVALUATOR_SEMANTICS_VERSION
 from ..rewards.factory import objective_for, REWARD_POOL_SEMANTICS
-from .prompt_diagnostics import PoolPromptDiagnostics
 from ..utils.hashing import file_fingerprint, stable_hash
 from ..utils.io import atomic_write_text, write_json, write_yaml
 from ..utils.experiment_log import append_event, update_progress, write_result_summary
@@ -350,8 +349,6 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, ste
     else:
         searcher = searcher_for(method, seed, merged_config, paths.alphagen_root)
         coordinator = SearchCoordinator(searcher, pool, train.evaluate, train.target(train.common_mask), candidate_limit, run_dir)
-    if method in {"base_llm", "grpo_llm"}:
-        coordinator.prompt_diagnostics = PoolPromptDiagnostics(train, pool, reward_options)
     checkpoint = run_dir / "checkpoint.json"
     if resume and checkpoint.exists():
         coordinator.load_checkpoint()

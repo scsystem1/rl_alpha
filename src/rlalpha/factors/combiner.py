@@ -14,7 +14,7 @@ from .transform import (
 
 
 class RidgeCombiner:
-    def __init__(self, ridge: float = 1e-3, pipeline: FactorTransformPipeline | None = None):
+    def __init__(self, ridge: float = 1e-2, pipeline: FactorTransformPipeline | None = None):
         self.ridge = ridge
         self.pipeline = pipeline or IndependentFactorTransformPipeline(
             TransformConfig(

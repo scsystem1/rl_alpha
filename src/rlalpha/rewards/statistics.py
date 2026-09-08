@@ -21,7 +21,7 @@ def newey_west_mean_se(values: np.ndarray, lag: int = 20) -> float:
     return math.sqrt(max(0.0, long_run_variance) / count)
 
 
-def lcb_score(values: np.ndarray, lag: int = 20, critical_value: float = 1.645) -> tuple[float, float, float]:
+def lcb_score(values: np.ndarray, lag: int = 20, critical_value: float = 0.5) -> tuple[float, float, float]:
     values = np.asarray(values, dtype=float)
     finite = values[np.isfinite(values)]
     if not len(finite):
@@ -36,6 +36,10 @@ def gap_aware_mean_se(values: np.ndarray, lag: int = 20) -> float:
 
     Missing dates contribute zero centered scores, but do not enter the
     sample-size denominator. In particular, purged fold tails are not joined.
+    Each day's own residual products enter the variance; equal fold variances
+    are not assumed. Fit-window lengths are not observation weights. This is
+    a time-series uncertainty estimate for realized OOF scores, not a full
+    refit/bootstrap or post-search confidence guarantee.
     """
     values = np.asarray(values, dtype=float)
     if values.ndim != 1 or lag < 0:

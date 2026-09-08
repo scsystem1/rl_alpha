@@ -214,15 +214,15 @@ class VerlGRPOStageCoordinator:
     def _domain_metrics(records: list[dict[str, Any]], groups: int) -> dict[str, Any]:
         rewards = np.asarray([float(item["shaped_reward"]) for item in records], dtype=float)
         grouped = [[float(item["shaped_reward"]) for item in records if int(item["prompt_group"]) == group] for group in range(groups)]
-        normalized = []
+        advantages = []
         zero = 0
         for values in grouped:
             array = np.asarray(values, dtype=float)
-            if len(array) == 0 or float(np.std(array)) <= 1e-12:
+            if len(array) == 0:
                 zero += 1
-                normalized.extend([0.0] * len(array))
-            else:
-                normalized.extend(((array - array.mean()) / (array.std() + 1e-6)).tolist())
+                continue
+            zero += int(float(np.std(array)) <= 1e-12)
+            advantages.extend((array - array.mean()).tolist())
         valid = sum(bool(item["valid"]) for item in records)
         unique = sum(bool(item["market_evaluated"]) for item in records)
         valid_rewards = np.asarray(
@@ -244,9 +244,11 @@ class VerlGRPOStageCoordinator:
             "domain/valid_reward_saturation_rate": (
                 float(np.mean(np.abs(valid_rewards) > 0.95)) if len(valid_rewards) else 0.0
             ),
-            "domain/advantage_mean": float(np.mean(normalized)) if normalized else 0.0,
-            "domain/advantage_std": float(np.std(normalized)) if normalized else 0.0,
+            "domain/advantage_mean": float(np.mean(advantages)) if advantages else 0.0,
+            "domain/advantage_std": float(np.std(advantages)) if advantages else 0.0,
             "domain/zero_variance_groups": zero,
+            "domain/no_improvement_groups": sum(not any(value > 0 for value in values) for values in grouped),
+            "domain/positive_reward_rate": float(np.mean(rewards > 0)),
         }
 
     def _consume_records(self, records: list[dict[str, Any]]) -> tuple[list[PoolEntry], list[Any]]:

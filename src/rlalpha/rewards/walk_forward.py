@@ -13,8 +13,8 @@ from ..factors.transform import combine_fixed_signals, prepare_fixed_universe_in
 
 DEFAULT_TIME_FOLDS = (
     {"fit": ("2010-01-01", "2012-12-31"), "score": ("2013-01-01", "2014-12-31")},
-    {"fit": ("2012-01-01", "2014-12-31"), "score": ("2015-01-01", "2016-12-31")},
-    {"fit": ("2014-01-01", "2016-12-31"), "score": ("2017-01-01", "2018-12-31")},
+    {"fit": ("2010-01-01", "2014-12-31"), "score": ("2015-01-01", "2016-12-31")},
+    {"fit": ("2010-01-01", "2016-12-31"), "score": ("2017-01-01", "2018-12-31")},
 )
 
 
@@ -32,7 +32,7 @@ class PreparedOOFPoolState(PreparedPoolState):
 
 
 class WalkForwardObjective(RewardObjective):
-    """Train-only rolling fits with paired, date-aligned subsequent scores.
+    """Train-only walk-forward fits (expanding by default) with paired scores.
 
     Cross-sectional transforms are shared by all folds. Only small sufficient
     statistics and ridge fits differ. score.weights always means FULL train
@@ -129,6 +129,9 @@ class WalkForwardObjective(RewardObjective):
     def _from_prepared(self, raw, raw_common, common, prepared, label, subsets=None):
         self._check_coverage(raw_common, common, label)
         dg, dp, valid = daily_fixed_universe_moments(prepared, label, common)
+        # These are mean moments, not sums. The same ridge penalty therefore
+        # has the same units with 3, 5, 7 or all training years; do not divide
+        # ridge by the number of fit observations again.
         moments = [(dg[valid].mean(axis=0), dp[valid].mean(axis=0))]
         moments.extend((dg[rows & valid].mean(axis=0), dp[rows & valid].mean(axis=0)) for rows in self.fit_rows)
         subsets = [list(range(len(raw)))] if subsets is None else subsets
@@ -193,10 +196,16 @@ class WalkForwardObjective(RewardObjective):
         n = int(np.isfinite(delta).sum())
         if n < 2:
             raise ValueError("OOF comparison has insufficient paired dates")
+        # The estimand is mean performance per OOF scoring day, not per fit
+        # observation. Daily HAC retains heteroskedasticity across folds and
+        # the original date gaps. Unequal fit lengths do not justify n_fit
+        # weights, a sqrt(n_fit) correction or an independent-three-fold SE.
         mean, se = float(np.nanmean(delta)), gap_aware_mean_se(delta, self.hac_lag)
         penalty = self.critical_value * se
         return PoolIncrement(mean, se, penalty, mean - penalty, n,
-            tuple(float(np.nanmean(delta[rows])) for rows in self.score_rows))
+            tuple(float(np.nanmean(delta[rows])) for rows in self.score_rows),
+            tuple(int(np.isfinite(delta[rows]).sum()) for rows in self.score_rows),
+            tuple(gap_aware_mean_se(np.where(rows, delta, np.nan), self.hac_lag) for rows in self.score_rows))
 
     def saliency(self, state):
         return np.mean([np.square(f.weights) / np.diag(f.inverse) for f in state.fold_fits], axis=0)
@@ -207,8 +216,15 @@ class WalkForwardObjective(RewardObjective):
             "normalized_fold_weights": tuple(map(float, np.mean(weights, axis=0)))}
 
     def snapshot_diagnostics(self, state):
-        return {"estimator": "rolling_oof", "time_folds": self.time_folds,
+        daily = np.asarray(state.score.daily_ic)
+        expanding = len({fold["fit"][0] for fold in self.time_folds}) == 1
+        return {"estimator": "expanding_oof" if expanding else "rolling_oof", "time_folds": self.time_folds,
             "weights_source": "full_train", "fold_weights": [f.weights.tolist() for f in state.fold_fits],
             "fold_mean_rnic": [float(np.nanmean(np.asarray(state.score.daily_ic)[r])) for r in self.score_rows],
+            "fold_fit_valid_days": [record["fit_support"]["valid_days"] for record in self._coverage],
+            "fold_score_valid_days": [int(np.isfinite(daily[r]).sum()) for r in self.score_rows],
+            "fold_standard_errors": [gap_aware_mean_se(np.where(r, daily, np.nan), self.hac_lag) for r in self.score_rows],
+            "score_aggregation": "equal_scoring_day",
+            "uncertainty_estimator": "daily_gap_aware_hac",
             "hac_lag": self.hac_lag, "critical_value": self.critical_value,
             "label_exit_offset": self.horizon_trading_days + 1}

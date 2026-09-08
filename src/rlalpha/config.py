@@ -199,7 +199,7 @@ class RewardConfig(StrictModel):
     min_pool_valid_day_rate: float = Field(default=0.80, gt=0, le=1)
     min_pool_observation_rate: float = Field(default=0.80, gt=0, le=1)
     min_pool_valid_days: int = Field(default=252, gt=0)
-    ridge: float = Field(default=0.001, gt=0)
+    ridge: float = Field(default=0.01, gt=0)
     time_folds: list[TimeFoldConfig] | None = None
 
     @model_validator(mode="after")
@@ -213,7 +213,7 @@ class RewardConfig(StrictModel):
 
 
 class EvaluationConfig(StrictModel):
-    ridge_lambda: float = Field(default=0.001, gt=0)
+    ridge_lambda: float = Field(default=0.01, gt=0)
     hac_lag: int = Field(default=20, ge=0)
     rebalance_days: int = Field(default=5, gt=0)
     holding_days: int = Field(default=20, gt=0)

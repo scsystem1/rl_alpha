@@ -7,8 +7,8 @@ from .walk_forward import DEFAULT_TIME_FOLDS, WalkForwardObjective
 
 
 OOF_REWARDS = ("r1_oof", "r2_paired_oof")
-CHECKPOINT_SCHEMA_VERSION = 8
-REWARD_POOL_SEMANTICS = "fixed-universe-rolling-paired-oof-v8"
+CHECKPOINT_SCHEMA_VERSION = 9
+REWARD_POOL_SEMANTICS = "fixed-universe-expanding-positive-softsign-v9"
 
 
 def objective_contract(objective):
@@ -29,7 +29,7 @@ def objective_for(reward, panel, reward_config=None, *, evaluation=False):
     config = reward_config or {}
     support = {key: config.get(key, default) for key, default in (
         ("min_pool_valid_day_rate", .80), ("min_pool_observation_rate", .80),
-        ("min_pool_valid_days", 252), ("ridge", .001))}
+        ("min_pool_valid_days", 252), ("ridge", .01))}
     label, mask = panel.target(panel.label), panel.target(panel.common_mask)
     if reward == "r0":
         return R0Objective(label, mask, **support)
@@ -37,7 +37,7 @@ def objective_for(reward, panel, reward_config=None, *, evaluation=False):
     if reward == "r1" or (reward in OOF_REWARDS and evaluation):
         return R1Objective(label, mask, exposures, **support)
     lag = config.get("hac_lag") if config.get("hac_lag") is not None else 20
-    critical = config.get("critical_value") if config.get("critical_value") is not None else 1.645
+    critical = config.get("critical_value") if config.get("critical_value") is not None else 0.5
     if reward == "r2_lcb":
         return R2LCBObjective(label, mask, exposures, hac_lag=lag, critical_value=critical, **support)
     if reward in OOF_REWARDS:

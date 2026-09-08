@@ -107,7 +107,7 @@ class PoolManager:
     def _invalid(
         self, candidate: PoolEntry, baseline: PoolScore, reason: str, delta: float = float("-inf")
     ) -> _CandidatePlan:
-        shaped = -0.5 if reason == "exact_duplicate" else -1.0
+        shaped = -1.0
         return _CandidatePlan(
             candidate,
             CandidateScore(
@@ -449,10 +449,17 @@ class PoolManager:
                 valid_delta_by_hash.setdefault(
                     plan.score.candidate_hash, float(plan.score.delta_add)
                 )
-        valid_deltas = np.asarray(list(valid_delta_by_hash.values()), dtype=float)
+        # Gate on the same minimum improvement used by admission, before
+        # shaping. Negative/uncertain candidates teach validity only. Scale
+        # from positive unique candidates so many bad proposals cannot drown
+        # out one sparse, useful candidate (a sole positive maps to 0.5).
+        positive_deltas = np.asarray(
+            [delta for delta in valid_delta_by_hash.values() if delta > self.min_delta], dtype=float
+        )
         reward_scale = (
-            max(float(np.median(np.abs(valid_deltas))), self.min_delta, 1e-5)
-            if len(valid_deltas)
+            max(float(np.median(positive_deltas)), self.min_delta, 1e-5)
+            if len(positive_deltas)
+            else max(self.min_delta, 1e-5) if valid_delta_by_hash
             else None
         )
         if reward_scale is not None:
@@ -464,14 +471,11 @@ class PoolManager:
                     delta_add = float(score.delta_add)
                     shaped_reward = (
                         0.0
-                        if delta_add == 0.0
+                        if delta_add <= self.min_delta
                         else float(
-                            np.copysign(
-                                min(
-                                    1.0 / (1.0 + reward_scale / abs(delta_add)),
-                                    float(np.nextafter(1.0, 0.0)),
-                                ),
-                                delta_add,
+                            min(
+                                1.0 / (1.0 + reward_scale / delta_add),
+                                float(np.nextafter(1.0, 0.0)),
                             )
                         )
                     )

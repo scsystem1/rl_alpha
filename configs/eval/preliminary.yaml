@@ -1,5 +1,5 @@
 evaluation:
-  ridge_lambda: 0.001
+  ridge_lambda: 0.01
   hac_lag: 20
   rebalance_days: 5
   holding_days: 20

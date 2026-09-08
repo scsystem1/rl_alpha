@@ -12,12 +12,10 @@ def test_prompt_is_train_only_and_identical_across_reward_objectives():
     assert "mean($return,20)" in rendered
 
 
-def test_compact_prompt_has_task_evidence_without_theme_hints():
+def test_v7_prompt_restores_theme_hints_without_numerical_feedback():
     context = SearchContext(3, tuple(f"Mean($return,{window})" for window in (1, 5, 10, 20, 40, 60, 120, 252)), tuple(range(8)), 0.01, 40, 5000)
     rendered = str(build_messages(context)).lower()
-    assert all(theme not in rendered for theme in ("momentum", "mean reversion", "volatility", "price-volume", "multi-horizon"))
-    assert "20-trading-day" in rendered and "t+21" in rendered
-    assert "balanced-22" in rendered
+    assert all(theme in rendered for theme in ("momentum", "mean reversion", "volatility", "price-volume", "multi-horizon"))
     assert "$open" in rendered and "$return" in rendered
     assert "csrank" in rendered and "corr" in rendered
     assert "factor_6" not in rendered
@@ -29,22 +27,21 @@ def test_compact_prompt_has_task_evidence_without_theme_hints():
     assert len(contract["hash"]) == 64
 
 
-def test_prompt_uses_only_canonical_summary_not_reward_specific_objective():
+def test_prompt_ignores_weights_objectives_and_optional_numerical_summary():
     from dataclasses import replace
     summary = TrainPoolSummary(.012345, (-.125,))
     context = SearchContext(2, ("Mean($return,20)",), (99.,), -123., 40, 5000, prompt_summary=summary)
     rendered = str(build_messages(context))
-    assert "w=-0.125 Mean($return,20)" in rendered
-    assert "RNIC=+0.0123" in rendered
+    assert "- Mean($return,20)" in rendered
+    assert "w=" not in rendered and "RNIC=" not in rendered
     assert "-123" not in rendered and "99.0" not in rendered
     assert build_messages(context) == build_messages(replace(context, train_objective=456., pool_weights=(3.,)))
+    assert build_messages(context) == build_messages(replace(context, prompt_summary=None))
 
 
-def test_summary_must_align_with_all_formulas_and_be_finite():
-    import pytest
+def test_unused_summary_does_not_constrain_v7_formula_pool():
     context = SearchContext(0, ("$return",), (), 0., 0, 8, prompt_summary=TrainPoolSummary(.01, ()))
-    with pytest.raises(ValueError, match="formula-aligned"):
-        build_messages(context)
+    assert "- $return" in build_messages(context)[1]["content"]
 
 
 def test_prompt_api_has_no_hint_or_version_switches():

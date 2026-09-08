@@ -17,8 +17,12 @@ def test_verl_config_consumes_ratio_clip_reference_kl_and_qwen_padding(tmp_path,
     pytest.importorskip("omegaconf")
     root = tmp_path / "qe"
     (root / "configs").mkdir(parents=True)
-    source = __import__("pathlib").Path(__file__).parents[3] / "QuantEvolver/configs/verl_ppo_trainer_base.yaml"
-    (root / "configs/verl_ppo_trainer_base.yaml").write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    # Exercise merging against inherited std normalization without requiring
+    # a sibling QuantEvolver checkout or a GPU stack for this adapter test.
+    source = root / "configs/verl_ppo_trainer_base.yaml"
+    source.write_text("algorithm:\n  norm_adv_by_std_in_grpo: true\nreward: {}\nray_kwargs: {}\n", encoding="utf-8")
+    from omegaconf import OmegaConf
+    monkeypatch.setattr("rlalpha.search.grpo.verl_config._load_verl_base", lambda _: (OmegaConf.load(source), source))
     no_think = root / "quant_evolver/rft/no_think_dataset.py"
     no_think.parent.mkdir(parents=True)
     no_think.write_text("class NoThinkRLHFDataset: pass\n", encoding="utf-8")
@@ -33,6 +37,7 @@ def test_verl_config_consumes_ratio_clip_reference_kl_and_qwen_padding(tmp_path,
     }
     config = build_verl_grpo_config(root, effective, train, validation, tmp_path / "run", experiment_name="smoke")
     assert config.algorithm.adv_estimator == "grpo"
+    assert config.algorithm.norm_adv_by_std_in_grpo is False
     assert config.actor_rollout_ref.actor.clip_ratio == 0.2
     assert config.actor_rollout_ref.actor.use_kl_loss
     assert config.actor_rollout_ref.actor.kl_loss_coef == 0.001
@@ -50,6 +55,10 @@ def test_verl_config_consumes_ratio_clip_reference_kl_and_qwen_padding(tmp_path,
     assert config.actor_rollout_ref.actor.checkpoint.save_lora_only is True
     assert config.ray_kwargs.ray_init.num_cpus == 8
     assert config.ray_kwargs.ray_init.object_store_memory == 8 * 1024**3
+    config.algorithm.norm_adv_by_std_in_grpo = True
+    with pytest.raises(ValueError, match="without std normalization"):
+        assert_grpo_loss_controls(config)
+    config.algorithm.norm_adv_by_std_in_grpo = False
     config.actor_rollout_ref.actor.ppo_epochs = 1
     with pytest.raises(ValueError, match="rollout reuse"):
         assert_grpo_loss_controls(config)
@@ -73,6 +82,25 @@ def test_verl_old_log_prob_padding_conversion_has_torch_fallback():
     converted = left_right_2_no_padding(data)
     assert converted["input_ids"].is_nested
     assert converted["input_ids"].values().tolist() == [1, 2, 3, 4, 5, 6]
+
+
+def test_installed_verl_advantages_preserve_validity_ties_and_sparse_positive_credit():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("verl")
+    from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
+
+    # Three prompts: all valid/no improvement, validity only, sparse success.
+    rewards = torch.tensor([[0.] * 8, [-1., -1.] + [0.] * 6, [.5] + [0.] * 7]).flatten()
+    token_rewards = torch.zeros((24, 3))
+    token_rewards[:, 1] = rewards
+    mask = torch.tensor([[1., 1., 0.]]).repeat(24, 1)
+    advantage, _ = compute_grpo_outcome_advantage(
+        token_level_rewards=token_rewards, response_mask=mask,
+        index=np.repeat(np.arange(3), 8), norm_adv_by_std_in_grpo=False,
+    )
+    expected = (rewards.reshape(3, 8) - rewards.reshape(3, 8).mean(dim=1, keepdim=True)).flatten()
+    torch.testing.assert_close(advantage, expected[:, None] * mask)
+    assert advantage[16, 0].item() == .4375
 
 
 def test_installed_verl_loss_graph_consumes_clip_and_reference_kl(monkeypatch):
@@ -176,8 +204,8 @@ def test_current_verl_reward_batch_reuses_intra_group_duplicates(monkeypatch, tm
     archive = tmp_path / "rollouts.jsonl"
     signal_cache_root = tmp_path / "signals"
     spec_payload = {
-        "schema_version": 8,
-        "reward_pool_semantics": "fixed-universe-rolling-paired-oof-v8",
+        "schema_version": 9,
+        "reward_pool_semantics": "fixed-universe-expanding-positive-softsign-v9",
         "stage": 0,
         "expected_samples": 3,
         "remaining_budget": 10,
@@ -236,7 +264,9 @@ def test_current_verl_reward_batch_reuses_intra_group_duplicates(monkeypatch, tm
     assert records[0]["market_evaluated"]
     assert records[1]["reason_code"] == "intra_group_duplicate_reused"
     assert not records[1]["market_evaluated"]
-    assert records[0]["shaped_reward"] == records[1]["shaped_reward"]
+    assert records[0]["valid"]
+    assert not records[1]["valid"] and records[1]["shaped_reward"] == -1.0
+    assert records[0]["shaped_reward"] >= 0
     assert records[0]["reward_scale"] == records[1]["reward_scale"]
     assert records[0]["reward_scale"] == records[2]["reward_scale"]
     assert records[2]["market_evaluated"]

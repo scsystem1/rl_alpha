@@ -72,6 +72,8 @@ def main():
     parser.add_argument("--groups", type=int, default=16)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    if prompt_contract()["version"] == "unified_compact_v7":
+        parser.error("v7 intentionally omits numerical feedback; run this historical v8 summary ablation at commit 41ee884")
     if args.groups < 1:
         parser.error("groups must be positive")
     if args.output.exists():

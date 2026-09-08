@@ -246,7 +246,7 @@ def finalize_cell(
     final_pool_path = run_dir / "final_pool.json"
     selected = json.loads(final_pool_path.read_text(encoding="utf-8"))
     evaluation_config = evaluation_config or {
-        "ridge_lambda": 1e-3, "hac_lag": 20, "rebalance_days": 5, "holding_days": 20,
+        "ridge_lambda": 1e-2, "hac_lag": 20, "rebalance_days": 5, "holding_days": 20,
         "one_way_cost_bps": [0, 10], "fully_neutral_max_weight": 0.02,
         "net_tolerance": 1e-8, "exposure_tolerance": 1e-6, "gross_tolerance": 1e-6,
         "weight_tolerance": 1e-6, "bootstrap_block_length": 20, "bootstrap_samples": bootstrap_samples,

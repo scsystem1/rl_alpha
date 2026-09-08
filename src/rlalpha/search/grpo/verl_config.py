@@ -65,7 +65,10 @@ def build_verl_grpo_config(
     max_steps = int(total_training_steps or max(expected_global_step, 1))
     current_api = "reward" in base and "ray_kwargs" in base
     overrides = OmegaConf.create({
-        "algorithm": {"adv_estimator": "grpo", "use_kl_in_reward": False},
+        # Reward is already bounded and dynamically scaled. Center it once;
+        # dividing by a tiny group std would amplify tiny score differences.
+        "algorithm": {"adv_estimator": "grpo", "use_kl_in_reward": False,
+                      "norm_adv_by_std_in_grpo": False},
         "data": {
             "train_files": [str(Path(train_file).resolve())],
             "val_files": [str(Path(validation_file).resolve())],
@@ -203,6 +206,8 @@ def assert_grpo_loss_controls(config: Any) -> None:
     actor = config.actor_rollout_ref.actor
     if config.algorithm.adv_estimator != "grpo":
         raise ValueError("advantage estimator is not GRPO")
+    if config.algorithm.get("norm_adv_by_std_in_grpo", True) is not False:
+        raise ValueError("GRPO must center the dynamically scaled reward without std normalization")
     if not actor.use_kl_loss or float(actor.kl_loss_coef) <= 0:
         raise ValueError("reference-policy KL is not active")
     if float(actor.clip_ratio) <= 0 or float(actor.clip_ratio_low) <= 0 or float(actor.clip_ratio_high) <= 0:

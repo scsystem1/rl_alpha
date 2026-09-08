@@ -234,7 +234,7 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
         expr_hash = str(record["expr_hash"])
         if expr_hash in prior_hashes:
             record["reason_code"] = "exact_duplicate"
-            record["shaped_reward"] = -0.5
+            record["shaped_reward"] = float(spec["invalid_penalty"])
             continue
         if expr_hash in representative:
             representative_index = representative[expr_hash]
@@ -331,7 +331,7 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
         )
         if not validity.valid:
             record["reason_code"] = validity.reason
-            record["shaped_reward"] = -0.5 if validity.reason == "near_duplicate_signal" else -0.75
+            record["shaped_reward"] = float(spec["invalid_penalty"])
             continue
         consumed += 1
         record["market_evaluated"] = True
@@ -396,7 +396,14 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
         source = parsed[representative_index][1]
         alias.update({key: source[key] for key in reused_fields})
         alias["market_evaluated"] = False
+        # Reuse the expensive market diagnostics, not the positive training
+        # reward. Repeated completions must not multiply a formula's credit.
+        alias["valid"] = False
         alias["reason_code"] = "intra_group_duplicate_reused"
+
+    for _, record in parsed:
+        if not record["valid"] and record["reason_code"] != "budget_exhausted":
+            record["shaped_reward"] = float(spec["invalid_penalty"])
 
     retained = pool.hashes | {entry.expr_hash for entry in scored_entries}
     for key in list(_SIGNALS):

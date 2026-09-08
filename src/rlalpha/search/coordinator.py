@@ -81,7 +81,7 @@ class SearchCoordinator:
                 continue
             if candidate.expr_hash in self.seen or candidate.expr_hash in self.pool.hashes:
                 self.ledger.duplicates += 1
-                outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, False, "exact_duplicate", False, shaped_reward=-0.5, metadata=base_metadata))
+                outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, False, "exact_duplicate", False, shaped_reward=-1.0, metadata=base_metadata))
                 continue
             if self.ledger.exhausted:
                 outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, False, "budget_exhausted", False, metadata=base_metadata))
@@ -101,7 +101,7 @@ class SearchCoordinator:
                 continue
             if not validity.valid:
                 self.ledger.invalid += 1
-                penalty = -0.5 if validity.reason == "near_duplicate_signal" else -0.75
+                penalty = -1.0
                 outcomes.append(CandidateOutcome(candidate.expr_hash, candidate.expression, False, validity.reason, False, shaped_reward=penalty, metadata={**base_metadata, "coverage": validity.coverage, "redundancy": {"mean_abs_daily_corr": validity.mean_abs_daily_corr, "pooled_correlation": validity.pooled_correlation, "mean_abs_daily_rank_corr": validity.mean_abs_daily_rank_corr, "correlation_coverage": validity.correlation_coverage}}))
                 continue
             self.ledger.valid_unique_evaluations += 1

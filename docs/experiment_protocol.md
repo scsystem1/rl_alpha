@@ -1,6 +1,6 @@
 # Experiment protocol
 
-The current rolling OOF comparison crosses `random`, `base_llm`, `grpo_llm`
+The current expanding OOF comparison crosses `random`, `base_llm`, `grpo_llm`
 with `r1`, `r1_oof`, `r2_paired_oof`, seeds 0/1/2. The legacy `gp`, `r0` and
 `r2_lcb` implementations remain available. See [rolling OOF protocol](rolling_oof.md)
 for fixed folds, paired statistics, outer weight fitting and pending experiments.
@@ -18,11 +18,19 @@ coordinator supplies the add-only common-support candidate delta as fitness. Inv
 DSL trees and already generated expressions are rejected before the formal
 proposal group, so every recorded GP round contains eight new typed formulas.
 
-Base-LLM and GRPO use the identical `unified_rolling_summary_v8` prompt. Base-LLM
+Base-LLM and GRPO use the identical restored `unified_compact_v7` prompt. Base-LLM
 samples that one prompt eight times. GRPO uses one prompt row with eight
 rollouts, learns from those eight rewards in one optimizer update, and then
 admits at most one of the same eight candidates. There are no per-answer hint
 variants.
+
+The v9 protocol uses expanding 3/5/7-year fits, paired daily HAC with equal
+scoring-day weights, default LCB coefficient 0.5 and ridge 0.01. GRPO maps
+non-improving valid candidates to zero and scales only qualified positive
+increments with the group's positive median. Advantages subtract the group
+mean without dividing by group standard deviation. Repeated completions reuse
+market diagnostics but receive the duplicate penalty, not the original reward.
+No validity/quality mixing coefficient is introduced.
 
 This protocol is registered but not fully accepted. Random/GP CPU execution is
 available, Base-LLM generation is implemented, and formal GRPO dispatch now
@@ -68,7 +76,7 @@ Each cell identity covers the experiment/search/reward/data/evaluation/model
 configs, panel/risk/index strong hashes, repository commits and dirty patch
 hashes, and actual model files for LLM methods. Run identity additionally
 freezes the effective config and evaluator semantics. A checkpoint is readable
-only with matching checkpoint schema 8, rolling-paired reward semantics, reward/prompt contracts, and
+only with matching checkpoint schema 9, expanding/positive-softsign reward semantics, reward/prompt contracts, and
 checkpoint fingerprint. Matrix
 completion requires accepted train metrics, final pool, manifest, exact step count
 and current identity.

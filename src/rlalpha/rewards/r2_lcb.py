@@ -8,7 +8,7 @@ from ..factors.records import PoolScore
 
 
 class R2LCBObjective(RewardObjective):
-    def __init__(self, *args, hac_lag: int = 20, critical_value: float = 1.645, **kwargs):
+    def __init__(self, *args, hac_lag: int = 20, critical_value: float = 0.5, **kwargs):
         super().__init__(*args, **kwargs)
         self.hac_lag = hac_lag
         self.critical_value = critical_value

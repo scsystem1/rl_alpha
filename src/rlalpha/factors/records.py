@@ -20,9 +20,13 @@ class PoolIncrement:
     reward: float
     valid_days: int = 0
     fold_means: tuple[float, ...] = ()
+    fold_valid_days: tuple[int, ...] = ()
+    fold_standard_errors: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "fold_means", tuple(self.fold_means))
+        object.__setattr__(self, "fold_valid_days", tuple(self.fold_valid_days))
+        object.__setattr__(self, "fold_standard_errors", tuple(self.fold_standard_errors))
 
 
 @dataclass(frozen=True)

@@ -329,7 +329,7 @@ class _SumObjective:
         return PoolScore(score, score, tuple(), tuple(values))
 
 
-def test_group_reward_uses_median_softsign_without_changing_raw_deltas():
+def test_group_reward_gates_non_improvements_without_changing_raw_deltas():
     pool = PoolManager(_SumObjective(), min_delta=1e-5)
     candidates = [
         PoolEntry("small", "small", 1e-5),
@@ -343,13 +343,13 @@ def test_group_reward_uses_median_softsign_without_changing_raw_deltas():
     assert all(item.reward_scale == 2e-5 for item in scored)
     np.testing.assert_allclose(
         [item.shaped_reward for item in scored],
-        [1 / 3, 1 / 2, -2 / 3],
+        [0., 1 / 2, 0.],
     )
 
 
 @pytest.mark.parametrize(
     ("delta", "expected_scale", "expected_reward"),
-    [(5e-5, 5e-5, 0.5), (1e-6, 1e-5, 1 / 11)],
+    [(5e-5, 5e-5, 0.5), (1e-6, 1e-5, 0.), (1e-5, 1e-5, 0.), (-.01, 1e-5, 0.)],
 )
 def test_single_candidate_reward_respects_dynamic_scale_floor(
     delta, expected_scale, expected_reward
@@ -366,13 +366,13 @@ def test_invalid_candidates_do_not_set_scale_but_share_a_valid_group_scale():
     pool.entries = [PoolEntry("existing", "existing", 1.0)]
 
     invalid_only = pool.score_candidates([PoolEntry("duplicate", "existing", 1.0)])[0]
-    assert invalid_only.shaped_reward == -0.5
+    assert invalid_only.shaped_reward == -1.0
     assert invalid_only.reward_scale is None
 
     invalid, valid = pool.score_candidates(
         [PoolEntry("duplicate", "existing", 1.0), PoolEntry("new", "new", 2.0)]
     )
-    assert not invalid.valid and invalid.shaped_reward == -0.5
+    assert not invalid.valid and invalid.shaped_reward == -1.0
     assert valid.valid and valid.shaped_reward == 0.5
     assert invalid.reward_scale == valid.reward_scale == 2.0
 
@@ -388,6 +388,40 @@ def test_softsign_reward_stays_finite_for_extreme_delta():
     assert all(np.isfinite(item.shaped_reward) for item in scored)
     assert all(-1.0 < item.shaped_reward < 1.0 for item in scored)
     assert scored[-1].shaped_reward > scored[1].shaped_reward > scored[0].shaped_reward
+
+
+def test_no_improvement_group_has_no_quality_ranking_and_cannot_enter_pool():
+    pool = PoolManager(_SumObjective())
+    candidates = [PoolEntry(str(i), str(i), delta) for i, delta in enumerate([-.2, -.001, 0., 1e-6, 1e-5])]
+    scores = pool.score_candidates(candidates)
+    rewards = np.array([score.shaped_reward for score in scores])
+    np.testing.assert_array_equal(rewards, np.zeros(5))
+    assert not pool.consider_group(candidates, scores).admitted
+
+
+def test_sparse_positive_is_not_drowned_out_by_negative_scale_or_double_normalization():
+    pool = PoolManager(_SumObjective())
+    candidates = [PoolEntry(str(i), str(i), delta) for i, delta in enumerate([2e-5] + [-100.] * 7)]
+    scores = pool.score_candidates(candidates)
+    rewards = np.array([score.shaped_reward for score in scores])
+    assert all(score.reward_scale == 2e-5 for score in scores)
+    np.testing.assert_allclose(rewards, [.5] + [0.] * 7)
+    # The configured Verl estimator centers these bounded rewards once.
+    np.testing.assert_allclose(rewards - rewards.mean(), [.4375] + [-.0625] * 7)
+    assert pool.consider_group(candidates, scores).admitted
+
+
+def test_validity_only_group_keeps_all_failed_valid_formulas_tied():
+    pool = PoolManager(_SumObjective())
+    pool.entries = [PoolEntry("base", "base", 0.)]
+    scores = pool.score_candidates([
+        PoolEntry("duplicate", "base", 0.),
+        PoolEntry("bad", "bad", -.02),
+        PoolEntry("worse", "worse", -100.),
+    ])
+    rewards = np.array([score.shaped_reward for score in scores])
+    np.testing.assert_array_equal(rewards, [-1., 0., 0.])
+    np.testing.assert_allclose(rewards - rewards.mean(), [-2 / 3, 1 / 3, 1 / 3])
 
 
 def test_pool_exact_replacement_and_one_admission_per_group():
@@ -418,13 +452,14 @@ def test_non_finite_candidate_objective_gets_explicit_invalid_penalty():
     assert pool.version == 0
 
 
-def test_newey_west_lcb_is_mean_minus_standard_error_not_std():
+@pytest.mark.parametrize("critical", [0.5, 1.645])
+def test_newey_west_lcb_is_mean_minus_standard_error_not_std(critical):
     values = np.array([0.01, 0.02, -0.01, 0.03, 0.00] * 20)
     se = newey_west_mean_se(values, lag=20)
-    objective, mean, reported = lcb_score(values, lag=20)
+    objective, mean, reported = lcb_score(values, lag=20, critical_value=critical)
     assert np.isclose(reported, se)
-    assert np.isclose(objective, mean - 1.645 * se)
-    assert not np.isclose(objective, mean - 1.645 * values.std())
+    assert np.isclose(objective, mean - critical * se)
+    assert not np.isclose(objective, mean - critical * values.std())
 
 
 def test_newey_west_matches_statsmodels_without_small_sample_correction():
@@ -450,7 +485,7 @@ def test_r2_uses_neutralized_daily_ic_lcb():
     label = 0.1 * residual + exposure[:, :, 1] + rng.normal(size=(days, assets))
     score = R2LCBObjective(label, np.ones_like(label, dtype=bool), exposure, hac_lag=5).score_pool([residual])
     assert np.isfinite(score.objective)
-    assert np.isclose(score.objective, score.mean_ic - 1.645 * score.standard_error)
+    assert np.isclose(score.objective, score.mean_ic - 0.5 * score.standard_error)
 
 
 @pytest.mark.parametrize("objective_type", [R0Objective, R1Objective, R2LCBObjective])

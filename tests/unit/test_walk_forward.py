@@ -19,13 +19,13 @@ def sample(assets=30):
     signals = [rng.normal(size=(420, assets)) for _ in range(4)]
     risk = np.stack([np.ones((420, assets)), rng.normal(size=(420, assets))], axis=-1)
     label = .3 * signals[0] - .15 * signals[1] + rng.normal(size=(420, assets))
-    folds = [{"fit": [str(dates[s].date()), str(dates[s+119].date())],
+    folds = [{"fit": [str(dates[0].date()), str(dates[s+119].date())],
               "score": [str(dates[s+120].date()), str(dates[s+219].date())]} for s in (0, 100, 200)]
     return signals, {"label": label, "mask": np.ones_like(label, bool), "exposures": risk,
         "dates": dates, "time_folds": folds, "min_pool_valid_days": 40}
 
 
-@pytest.mark.parametrize("critical", [0., 1.645])
+@pytest.mark.parametrize("critical", [0., 0.5, 1.645])
 def test_cached_fold_fits_match_independent_reference_and_full_train_weights(critical):
     signals, kwargs = sample()
     signals[1][::9, :8] = np.nan
@@ -45,6 +45,13 @@ def test_cached_fold_fits_match_independent_reference_and_full_train_weights(cri
     np.testing.assert_allclose(state.score.weights, full.score.weights, atol=1e-12)
     assert state.score.objective == pytest.approx(np.nanmean(expected))
     assert objective.snapshot_diagnostics(state)["weights_source"] == "full_train"
+    diagnostics = objective.snapshot_diagnostics(state)
+    assert diagnostics["estimator"] == "expanding_oof"
+    assert diagnostics["fold_fit_valid_days"] == [99, 199, 299]
+    assert diagnostics["fold_score_valid_days"] == [79, 79, 79]
+    assert diagnostics["score_aggregation"] == "equal_scoring_day"
+    for rows, se in zip(objective.score_rows, diagnostics["fold_standard_errors"]):
+        assert se == pytest.approx(newey_west_mean_se(expected[rows]))
 
 
 def test_label_exit_purge_and_current_score_labels_cannot_change_current_fit():
@@ -123,6 +130,56 @@ def test_gap_aware_hac_matches_reference_without_joining_purged_tails():
     reference = np.sqrt(centered @ kernel @ centered) / finite.sum()
     assert gap_aware_mean_se(values) == pytest.approx(reference)
     assert gap_aware_mean_se(values) != pytest.approx(newey_west_mean_se(values))
+
+
+def test_expanding_unequal_fold_support_uses_daily_heteroskedastic_paired_hac():
+    _, kwargs = sample()
+    kwargs["time_folds"][0]["score"][1] = str(kwargs["dates"][209].date())
+    obj = WalkForwardObjective(**kwargs, critical_value=.5)
+    rng = np.random.default_rng(146)
+    delta = np.full(420, np.nan)
+    for rows, mean, scale in zip(obj.score_rows, [.003, .001, -.002], [.08, .025, .005]):
+        noise = rng.normal(size=rows.sum())
+        for t in range(1, len(noise)):
+            noise[t] += .7 * noise[t - 1]
+        delta[rows] = mean + scale * noise
+    before = np.where(obj.scoring_rows, rng.normal(size=420), np.nan)
+    score = lambda d: PoolScore(float(np.nanmean(d)), float(np.nanmean(d)), tuple(d), ())
+    increment = obj.compare_scores(score(before), score(before + delta))
+    n = np.isfinite(delta).sum()
+    centered = np.where(np.isfinite(delta), delta - np.nanmean(delta), 0.)
+    distance = np.abs(np.arange(420)[:, None] - np.arange(420)[None, :])
+    kernel = np.maximum(1 - distance / 21, 0.)
+    expected_se = np.sqrt(centered @ kernel @ centered) / n
+    assert increment.valid_days == n
+    assert increment.fold_valid_days == (69, 79, 79)
+    assert increment.mean_delta == pytest.approx(np.average(increment.fold_means, weights=increment.fold_valid_days))
+    assert increment.standard_error == pytest.approx(expected_se)
+    assert increment.reward == pytest.approx(np.nanmean(delta) - .5 * expected_se)
+    for rows, se in zip(obj.score_rows, increment.fold_standard_errors):
+        assert se == pytest.approx(newey_west_mean_se(delta[rows]))
+    # Identical realized OOF differences have the same uncertainty even if
+    # the user supplies shorter fitting windows. No invented n_fit scaling.
+    for s, fold in zip((0, 100, 200), kwargs["time_folds"]):
+        fold["fit"][0] = str(kwargs["dates"][s].date())
+    rolling = WalkForwardObjective(**kwargs, critical_value=.5)
+    assert rolling.compare_scores(score(before), score(before + delta)) == increment
+
+
+def test_factory_defaults_and_overrides_keep_ridge_consistent_with_outer_evaluation():
+    from rlalpha.config import EvaluationConfig, RewardConfig
+    from rlalpha.factors.combiner import RidgeCombiner
+    _, kwargs = sample()
+    panel = SimpleNamespace(label=kwargs["label"], common_mask=kwargs["mask"], exposures=kwargs["exposures"],
+        target=lambda a: a, target_dates=kwargs["dates"])
+    config = {"time_folds": kwargs["time_folds"], "min_pool_valid_days": 40}
+    oof = objective_for("r2_paired_oof", panel, config)
+    outer = objective_for("r2_paired_oof", panel, config, evaluation=True)
+    assert oof.critical_value == .5
+    assert oof.ridge == outer.ridge == RidgeCombiner().ridge == EvaluationConfig().ridge_lambda == .01
+    assert RewardConfig(name="r1", neutralized=True).ridge == .01
+    historical = objective_for("r2_paired_oof", panel, {**config, "ridge": .001, "critical_value": 1.645})
+    assert historical.ridge == .001 and historical.critical_value == 1.645
 
 
 def test_insufficient_or_overlapping_folds_fail_instead_of_falling_back():
@@ -283,6 +340,9 @@ def test_both_new_reward_configs_and_experiment_matrix_validate():
     a = ProjectConfig.model_validate(load_yaml(root / "configs/reward/r1_oof.yaml"))
     b = ProjectConfig.model_validate(load_yaml(root / "configs/reward/r2_paired_oof.yaml"))
     assert a.reward.time_folds == b.reward.time_folds
+    assert {str(f.fit[0]) for f in a.reward.time_folds} == {"2010-01-01"}
+    assert a.reward.ridge == b.reward.ridge == .01
+    assert b.reward.critical_value == .5
     matrix = ProjectConfig.model_validate(load_yaml(root / "configs/experiment/rolling_oof.yaml"))
     assert matrix.experiment.seeds == [0, 1, 2]
     assert matrix.experiment.rewards == ["r1_oof", "r2_paired_oof", "r1"]
@@ -335,6 +395,7 @@ def test_full_worker_batch_matches_main_search_including_pruning_and_replay(rewa
         assert record["replaced_hash"] == reference.replaced_hash
     assert records[2]["reason_code"] == "intra_group_duplicate_reused"
     assert records[2]["add_increment"] == records[0]["add_increment"]
+    assert not records[2]["valid"] and records[2]["shaped_reward"] == -1.
     replay = worker._score_batch_sync(requests)
     assert [r["delta_add"] for r in replay] == [r["delta_add"] for r in records]
     assert pool.version == 1 and len(pool.entries) == 1

@@ -14,7 +14,6 @@ from rlalpha.factors.pool import PoolManager
 from rlalpha.search.base_llm import resolve_model_path
 from rlalpha.search.grpo.stage_coordinator import VerlGRPOStageCoordinator
 from rlalpha.search.run import objective_for
-from rlalpha.search.prompt_diagnostics import PoolPromptDiagnostics
 from rlalpha.utils.hashing import file_fingerprint, stable_hash
 from rlalpha.utils.io import write_json, write_yaml
 
@@ -134,7 +133,6 @@ def main() -> None:
             train_start=args.train_start,
             train_end=args.train_end,
         )
-        coordinator.prompt_diagnostics = PoolPromptDiagnostics(panel, pool, reward_config["reward"])
         if args.resume and checkpoint_path.exists():
             coordinator.load_checkpoint()
         result = coordinator.run_cell()
@@ -169,8 +167,8 @@ def main() -> None:
         item.update(domain_by_step.get(int(item["training/global_step"]), {}))
     if len(metrics) < args.updates:
         raise RuntimeError(f"only {len(metrics)} optimizer metric records were emitted")
-    if not all(math.isfinite(float(item["actor/grad_norm"])) and float(item["actor/grad_norm"]) > 0 for item in metrics):
-        raise RuntimeError("at least one claimed optimizer update has a non-positive/non-finite gradient norm")
+    if not all(math.isfinite(float(item["actor/grad_norm"])) and float(item["actor/grad_norm"]) >= 0 for item in metrics):
+        raise RuntimeError("at least one optimizer update has a negative/non-finite gradient norm")
     required_finite = (
         "actor/pg_loss",
         "actor/pg_clipfrac",
@@ -183,6 +181,8 @@ def main() -> None:
         "domain/reward_scale",
         "domain/valid_reward_saturation_rate",
         "domain/zero_variance_groups",
+        "domain/no_improvement_groups",
+        "domain/positive_reward_rate",
     )
     if not all(all(math.isfinite(float(item[key])) for key in required_finite) for item in metrics):
         raise RuntimeError("formal-GRPO smoke emitted a missing/non-finite loss metric")
@@ -192,8 +192,12 @@ def main() -> None:
         raise RuntimeError("reference-policy KL loss never activated")
     if any(float(item["domain/valid_reward_saturation_rate"]) >= 0.10 for item in metrics):
         raise RuntimeError("valid shaped rewards exceeded the 10% saturation gate")
-    if any(int(item["domain/zero_variance_groups"]) != 0 for item in metrics):
-        raise RuntimeError("at least one GRPO reward group had zero variance")
+    # A zero group is intentional when all valid candidates fail the gate
+    # (or all completions are invalid). It cannot certify policy learning,
+    # but must not invalidate other informative updates in the same smoke.
+    if not any(float(item["domain/advantage_std"]) > 1e-12
+               and float(item["actor/grad_norm"]) > 0 for item in metrics):
+        raise RuntimeError("smoke sampled no informative policy update; extend the smoke to collect training evidence")
     checkpoint_sizes = []
     for checkpoint in latest:
         actor_files = [path.name for path in (checkpoint / "actor").rglob("*") if path.is_file()]
@@ -229,6 +233,8 @@ def main() -> None:
                     "actor/lr",
                     "critic/advantages/mean",
                     "domain/advantage_std",
+                    "domain/no_improvement_groups",
+                    "domain/positive_reward_rate",
                     "domain/invalid_rate",
                     "domain/unique_rate",
                     "domain/reward_mean",

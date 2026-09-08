@@ -115,7 +115,7 @@ class RewardObjective(ABC):
         label: np.ndarray,
         mask: np.ndarray,
         exposures: np.ndarray | None = None,
-        ridge: float = 1e-3,
+        ridge: float = 1e-2,
         min_pool_valid_day_rate: float = 0.80,
         min_pool_observation_rate: float = 0.80,
         min_pool_valid_days: int = 252,

@@ -177,20 +177,23 @@ def test_stage_io_paths_do_not_change_frozen_semantic_hash(tmp_path):
     assert left["archive_path"] != right["archive_path"]
     assert left["signal_cache_root"] != right["signal_cache_root"]
     assert left["spec_hash"] == right["spec_hash"]
-    assert left["schema_version"] == 8
-    assert left["reward_pool_semantics"] == "fixed-universe-rolling-paired-oof-v8"
+    assert left["schema_version"] == 9
+    assert left["reward_pool_semantics"] == "fixed-universe-expanding-positive-softsign-v9"
 
 
 def test_domain_metrics_audit_reward_scale_and_valid_saturation():
     records = [
         {"prompt_group": 0, "shaped_reward": 0.5, "valid": True, "market_evaluated": True, "reward_scale": 2e-5},
-        {"prompt_group": 0, "shaped_reward": -0.25, "valid": True, "market_evaluated": True, "reward_scale": 2e-5},
+        {"prompt_group": 0, "shaped_reward": 0., "valid": True, "market_evaluated": True, "reward_scale": 2e-5},
         {"prompt_group": 0, "shaped_reward": -1.0, "valid": False, "market_evaluated": False, "reward_scale": 2e-5},
     ]
     metrics = VerlGRPOStageCoordinator._domain_metrics(records, 1)
     assert metrics["domain/reward_scale"] == 2e-5
     assert metrics["domain/valid_reward_saturation_rate"] == 0.0
     assert metrics["domain/zero_variance_groups"] == 0
+    assert metrics["domain/no_improvement_groups"] == 0
+    assert metrics["domain/positive_reward_rate"] == pytest.approx(1 / 3)
+    assert metrics["domain/advantage_std"] == pytest.approx(np.std([.5, 0., -1.]))
 
 
 def test_resume_ignores_unpaired_journal_and_rejects_old_semantics(monkeypatch, tmp_path):

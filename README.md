@@ -1,6 +1,6 @@
 # RLAlpha
 
-当前改进方案与运行入口：[三折滚动 reward / 精简 prompt（v8）](docs/rolling_oof.md)。主方案为 `r1_oof`，配对 LCB 对照为 `r2_paired_oof`；外层保持全历史拟合。
+当前改进方案与运行入口：[Expanding OOF / v7 prompt / 单一 GRPO reward（v9）](docs/rolling_oof.md)。保留 `r1_oof` 与 `r2_paired_oof`，LCB 默认 0.5、ridge 默认 0.01；外层保持全历史拟合。
 
 RLAlpha is a leakage-audited S&P 500 factor-search research implementation
 based on `../REMOTE_CODEX_BUILD_GUIDE.md` and the stricter repair contract in
