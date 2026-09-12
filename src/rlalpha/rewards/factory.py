@@ -50,6 +50,7 @@ def objective_for(reward, panel, reward_config=None, *, evaluation=False):
 
 
 def prompt_objective_for(panel, reward_config=None):
-    config = {**(reward_config or {}), "time_folds": DEFAULT_TIME_FOLDS}
+    config = dict(reward_config or {})
+    config.setdefault("time_folds", DEFAULT_TIME_FOLDS)
     # Prompt evidence is canonical across reward variants, including R0.
     return objective_for("r1_oof", panel, config)

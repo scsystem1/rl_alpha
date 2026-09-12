@@ -87,6 +87,10 @@ def _comparison_pairs(keys: set[tuple[str, str]]) -> list[tuple[tuple[str, str],
 def build_report(experiment_id: str, config: str | Path, methods: list[str] | None = None) -> dict[str, Any]:
     paths = load_paths(config)
     raw_config = load_yaml(config)
+    if raw_config.get("rolling"):
+        from .rolling import build_rolling_report
+
+        return build_rolling_report(experiment_id, config, methods)
     root = paths.runs_root / experiment_id
     append_event(root / "experiment.log", "report_started", experiment_id=experiment_id)
     cells: dict[tuple[str, str, int], Path] = {}

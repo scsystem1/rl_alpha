@@ -85,9 +85,12 @@ def factor_eval(expr: str = typer.Option(...), split: str = typer.Option("train"
 
 
 @search_app.command("run")
-def search_run(method: str = typer.Option(...), reward: str = typer.Option(...), seed: int = typer.Option(0), steps: int = typer.Option(250, min=1), experiment_id: str = typer.Option("preliminary_screen"), config: Path = typer.Option(Path("configs/experiment/preliminary_screen.yaml"), exists=True), resume: bool = typer.Option(True)) -> None:
+def search_run(method: str = typer.Option(...), reward: str = typer.Option(...), seed: int = typer.Option(0), steps: int | None = typer.Option(None, min=1), experiment_id: str = typer.Option("preliminary_screen"), config: Path = typer.Option(Path("configs/experiment/preliminary_screen.yaml"), exists=True), resume: bool = typer.Option(True)) -> None:
     from .search.run import run_search
+    from .config import load_yaml
 
+    if steps is None:
+        steps = int(load_yaml(config).get("experiment", {}).get("search_steps", 250))
     typer.echo(json.dumps(run_search(config, method, reward, seed, steps, experiment_id, resume), indent=2, default=str))
 
 

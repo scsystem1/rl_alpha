@@ -194,7 +194,7 @@ class RewardConfig(StrictModel):
     name: RewardName
     neutralized: bool
     hac_lag: int | None = Field(default=None, ge=0)
-    critical_value: float | None = Field(default=None, gt=0)
+    critical_value: float | None = Field(default=None, ge=0)
     invalid_penalty: float = -1.0
     min_pool_valid_day_rate: float = Field(default=0.80, gt=0, le=1)
     min_pool_observation_rate: float = Field(default=0.80, gt=0, le=1)
@@ -230,7 +230,21 @@ class EvaluationConfig(StrictModel):
     fdr_threshold: float = Field(default=0.05, gt=0, lt=1)
 
 
+class RollingConfig(StrictModel):
+    test_years: list[int] = Field(default_factory=lambda: list(range(2021, 2026)))
+
+    @model_validator(mode="after")
+    def ordered_years(self):
+        if not self.test_years or self.test_years != sorted(set(self.test_years)):
+            raise ValueError("rolling.test_years must be nonempty, unique and increasing")
+        if any(year < 2013 or year > 9998 for year in self.test_years):
+            raise ValueError("rolling test years must be between 2013 and 9998")
+        return self
+
+
 class ProjectConfig(StrictModel):
+    protocol: Literal["recent_alpha_v1"] | None = None
+    rolling: RollingConfig | None = None
     paths: PathsConfig | None = None
     data: DataConfig | None = None
     experiment: ExperimentConfig | None = None
@@ -278,6 +292,30 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
 
 def load_project_config(path: str | Path) -> ProjectConfig:
     return ProjectConfig.model_validate(load_yaml(path))
+
+
+def resolve_data_evaluation(raw: dict[str, Any], code_root: str | Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Apply experiment overrides once, consistently in search and evaluation."""
+    root = Path(code_root)
+    data = _deep_merge(load_yaml(root / "configs/data/sp500.yaml")["data"], raw.get("data", {}))
+    evaluation = _deep_merge(load_yaml(root / "configs/eval/preliminary.yaml")["evaluation"], raw.get("evaluation", {}))
+    return DataConfig.model_validate(data).model_dump(mode="json"), EvaluationConfig.model_validate(evaluation).model_dump(mode="json")
+
+
+def merge_reward_config(raw: dict[str, Any], code_root: str | Path, reward_name: str) -> dict[str, Any]:
+    """Share window/support settings across R1 and paired-LCB reward variants."""
+    base = load_yaml(Path(code_root) / f"configs/reward/{reward_name}.yaml")["reward"]
+    overrides = dict(raw.get("reward", {}))
+    overrides.pop("name", None)
+    # A root R1 config must not disable the paired-LCB coefficient, and a root
+    # R2 config must not enable it on R1. The names retain their public meaning.
+    if reward_name == "r1_oof":
+        overrides.pop("critical_value", None)
+    merged = _deep_merge(base, overrides)
+    merged["name"] = reward_name
+    _, evaluation = resolve_data_evaluation(raw, code_root)
+    merged["ridge"] = evaluation["ridge_lambda"]
+    return RewardConfig.model_validate(merged).model_dump(mode="json", exclude_none=True)
 
 
 def load_paths(config: str | Path | None = None) -> PathsConfig:

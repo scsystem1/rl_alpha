@@ -36,7 +36,10 @@ def _cached_file_identity(path: str, size: int, mtime_ns: int) -> dict[str, obje
 
 
 def _gpu_free_mib() -> dict[int, int]:
-    result = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"], capture_output=True, text=True, check=False)
+    try:
+        result = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        return {}
     if result.returncode:
         return {}
     return {int(line.split(",")[0]): int(line.split(",")[1]) for line in result.stdout.splitlines() if "," in line}
@@ -363,6 +366,10 @@ def run_matrix(config: str | Path, experiment_id: str, resume: bool = True, poll
     lock = FileLock(str(lock_root / f"matrix-{stable_hash(str(root.resolve()))}.lock"))
     try:
         with lock.acquire(timeout=0):
+            if load_yaml(config).get("rolling"):
+                from ..rolling import run_rolling_matrix
+
+                return run_rolling_matrix(config, experiment_id, resume, poll_seconds, methods, rewards)
             return _run_matrix_unlocked(config, experiment_id, resume, poll_seconds, methods, rewards)
     except Timeout as exc:
         raise RuntimeError(f"another matrix runner owns {lock.lock_file}") from exc

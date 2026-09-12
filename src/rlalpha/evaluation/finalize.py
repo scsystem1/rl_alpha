@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import rankdata
 
-from ..config import load_paths, load_yaml
+from ..config import EvaluationConfig, load_paths, load_yaml
 from ..data.store import PanelStore, SplitPanel
 from ..dsl.parser import parse_expression
 from ..factors.calculator import FactorCalculator
@@ -24,7 +24,7 @@ from ..utils.hashing import file_fingerprint, stable_hash
 from ..utils.io import write_json
 from ..utils.experiment_log import append_event, update_progress, write_result_summary
 from .portfolio import PortfolioBacktester, portfolio_metrics
-from .statistics import benjamini_hochberg, factor_significance, series_summary
+from .statistics import benjamini_hochberg, bootstrap_date_indices, factor_significance, series_summary
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -44,6 +44,54 @@ def _evaluation_code_fingerprints() -> list[dict[str, Any]]:
 def _panel_fingerprints(processed_root: Path) -> list[dict[str, Any]]:
     panel = processed_root / "panel"
     return [file_fingerprint(path) for path in (panel / "index.json", panel / "build_manifest.yaml", panel / "risk_build_manifest.yaml")]
+
+
+def cell_finalization_scope_hash(cell_key: str) -> str:
+    """Stable scope shared by evaluation and report verification."""
+    return stable_hash({"cell": cell_key, "support": "fixed-universe-zero-fill-psd-gram-v6"})
+
+
+def cell_input_hash(
+    run_dir: str | Path,
+    processed_root: str | Path,
+    evaluation_config: dict[str, Any],
+    data_config: dict[str, Any] | None = None,
+    protocol: str | None = None,
+    finalization_scope_hash: str | None = None,
+) -> str:
+    """Fingerprint the current frozen pool and resolved evaluation inputs.
+
+    ``evaluation_config`` must include effective defaults, exactly as supplied
+    to finalization. Reports use this read-only check instead of reopening data
+    or trusting a completion flag left by an earlier pool/configuration.
+    """
+    recent = protocol == "recent_alpha_v1"
+    return stable_hash({
+        "schema_version": 12,
+        "final_pool": file_fingerprint(Path(run_dir) / "final_pool.json"),
+        "panel": _panel_fingerprints(Path(processed_root)),
+        "evaluation_code": _evaluation_code_fingerprints(),
+        "evaluation_config": evaluation_config,
+        "data_config": data_config,
+        "protocol": protocol,
+        "finalization_scope_hash": finalization_scope_hash,
+        "support_policy": "fixed-universe-zero-fill-psd-gram-v6",
+        "missing_return_policy": "zero-return-stale-value-v1",
+        "fit_policy": "calibration_only" if recent else "train_and_validation",
+        "liquidation_policy": "last_close" if recent else "none",
+    })
+
+
+def _verified_cached_metrics(test_dir: Path, input_hash: str) -> dict[str, Any]:
+    marker_path, metrics_path = test_dir / "finalization.json", test_dir / "metrics.json"
+    if not marker_path.is_file() or not metrics_path.is_file():
+        raise RuntimeError(f"finalized cell artifacts are missing: {test_dir}")
+    marker, metrics = _read_json(marker_path), _read_json(metrics_path)
+    if marker.get("status") != "complete" or marker.get("input_hash") != input_hash:
+        raise RuntimeError(f"finalized cell marker is incomplete or incompatible: {test_dir}")
+    if metrics.get("input_hash") != input_hash or stable_hash(metrics) != marker.get("metrics_hash"):
+        raise RuntimeError(f"finalized metrics changed after test was completed: {test_dir}")
+    return metrics
 
 
 def _daily_correlations(signal: np.ndarray, label: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -165,11 +213,13 @@ def _write_factor_statistics(
     common_mask: np.ndarray,
     diagnostics: tuple[dict[str, Any], ...],
     evaluation_config: dict[str, Any],
+    trade_mask: np.ndarray | None = None,
+    bootstrap_indices: np.ndarray | None = None,
 ) -> None:
     identity = _cell_identity(run_dir)
     final_pool_id = str(selected.get("final_pool_id") or f"final_pool_{stable_hash({'cell': identity, 'pool_version': selected.get('pool_version'), 'expressions': expressions})[:20]}")
     lineage_by_expression = {str(item.get("expression")): item for item in selected.get("factors", [])}
-    raw_calculator = FactorCalculator(raw_label, common_mask)
+    raw_calculator = FactorCalculator(raw_label, common_mask if trade_mask is None else trade_mask)
     raw_prepared = [raw_calculator.standardize(signal) for signal in raw_signals]
     daily_rows: list[pd.DataFrame] = []
     summary_rows: list[dict[str, Any]] = []
@@ -198,7 +248,7 @@ def _write_factor_statistics(
         daily_rows.append(frame)
         direction = float(np.sign(weights[index]))
         for metric, values in (("pearson_rnic", rnic), ("rank_rnic", rank_rnic)):
-            record = factor_significance(values, hac_lag=int(evaluation_config["hac_lag"]), bootstrap_block=int(evaluation_config["bootstrap_block_length"]), bootstrap_samples=int(evaluation_config["bootstrap_samples"]), seed=int(evaluation_config["bootstrap_seed"]) + (int(identity["seed"]) if int(identity["seed"]) >= 0 else 0))
+            record = factor_significance(values, hac_lag=int(evaluation_config["hac_lag"]), bootstrap_block=int(evaluation_config["bootstrap_block_length"]), bootstrap_samples=int(evaluation_config["bootstrap_samples"]), seed=int(evaluation_config["bootstrap_seed"]), dates=dates, bootstrap_indices=bootstrap_indices)
             summary_rows.append({
                 **identity,
                 "final_pool_id": final_pool_id,
@@ -227,7 +277,7 @@ def _write_factor_statistics(
         "schema_version": 1,
         "primary_metrics": ["pearson_rnic", "rank_rnic"],
         "hac_lag": evaluation_config["hac_lag"],
-        "bootstrap": {"method": "moving_block", "block_length": evaluation_config["bootstrap_block_length"], "samples": evaluation_config["bootstrap_samples"], "seed": int(evaluation_config["bootstrap_seed"]) + int(identity["seed"])},
+        "bootstrap": {"method": "year_stratified_moving_block_on_trading_grid", "block_length": evaluation_config["bootstrap_block_length"], "samples": evaluation_config["bootstrap_samples"], "seed": int(evaluation_config["bootstrap_seed"]), "shared_date_draws": True},
         "multiple_testing": {"method": "Benjamini-Hochberg", "scope": "final_pool_by_metric", "threshold": fdr_threshold},
         "test_direction_policy": "formula direction and ridge-weight sign were frozen before test; no test sign flip",
     })
@@ -241,22 +291,21 @@ def finalize_cell(
     fit_mask_override: np.ndarray | None = None,
     finalization_scope_hash: str | None = None,
     evaluation_config: dict[str, Any] | None = None,
+    data_config: dict[str, Any] | None = None,
+    protocol: str | None = None,
 ) -> dict[str, Any]:
     run_dir, processed_root = Path(run_dir), Path(processed_root)
     final_pool_path = run_dir / "final_pool.json"
     selected = json.loads(final_pool_path.read_text(encoding="utf-8"))
-    evaluation_config = evaluation_config or {
-        "ridge_lambda": 1e-2, "hac_lag": 20, "rebalance_days": 5, "holding_days": 20,
-        "one_way_cost_bps": [0, 10], "fully_neutral_max_weight": 0.02,
-        "net_tolerance": 1e-8, "exposure_tolerance": 1e-6, "gross_tolerance": 1e-6,
-        "weight_tolerance": 1e-6, "bootstrap_block_length": 20, "bootstrap_samples": bootstrap_samples,
-        "bootstrap_seed": 0, "fdr_threshold": 0.05,
-    }
+    evaluation_config = {**EvaluationConfig().model_dump(), "bootstrap_samples": bootstrap_samples, **(evaluation_config or {})}
+    recent = protocol == "recent_alpha_v1"
+    if recent and (data_config is None or selected.get("selection_rule") != "fixed_budget_terminal_pool"):
+        raise ValueError("recent alpha evaluation requires explicit dates and a fixed-budget terminal pool")
     bootstrap_samples = int(evaluation_config["bootstrap_samples"])
     expressions = list(selected.get("expressions", []))
     if not expressions:
         raise ValueError(f"selected pool is empty: {run_dir}")
-    input_hash = stable_hash({"schema_version": 11, "final_pool": file_fingerprint(final_pool_path), "panel": _panel_fingerprints(processed_root), "evaluation_code": _evaluation_code_fingerprints(), "evaluation_config": evaluation_config, "finalization_scope_hash": finalization_scope_hash, "support_policy": "fixed-universe-zero-fill-psd-gram-v6", "missing_return_policy": "zero-return-stale-value-v1"})
+    input_hash = cell_input_hash(run_dir, processed_root, evaluation_config, data_config, protocol, finalization_scope_hash)
     test_dir = run_dir / "test"
     test_dir.mkdir(parents=True, exist_ok=True)
     marker = test_dir / "finalization.json"
@@ -265,18 +314,25 @@ def finalize_cell(
         if state.get("input_hash") != input_hash:
             raise RuntimeError("test finalization input changed after test was opened")
         if state.get("status") == "complete":
-            return json.loads((test_dir / "metrics.json").read_text(encoding="utf-8"))
+            return _verified_cached_metrics(test_dir, input_hash)
     write_json(marker, {"status": "started", "input_hash": input_hash})
 
     store = PanelStore(processed_root)
-    train, validation, test = (store.load_split(name) for name in ("train", "validation", "test"))
-    fit_signals = [np.concatenate(pair, axis=0) for pair in zip(_signals(train, expressions), _signals(validation, expressions))]
-    fit_mask = np.concatenate([train.target(train.common_mask), validation.target(validation.common_mask)])
-    fit_exposures = np.concatenate([train.target(train.exposures), validation.target(validation.exposures)])
-    fit_label = np.concatenate([train.target(train.label), validation.target(validation.label)])
+    if recent:
+        assert data_config is not None
+        validation = store.load_interval("validation", *data_config["validation"])
+        test = store.load_interval("test", *data_config["test"])
+        fit_panels = [validation]
+    else:
+        train, validation, test = (store.load_split(name) for name in ("train", "validation", "test"))
+        fit_panels = [train, validation]
+    fit_signals = [np.concatenate(parts, axis=0) for parts in zip(*(_signals(panel, expressions) for panel in fit_panels))]
+    fit_mask = np.concatenate([panel.target(panel.common_mask) for panel in fit_panels])
+    fit_exposures = np.concatenate([panel.target(panel.exposures) for panel in fit_panels])
+    fit_label = np.concatenate([panel.target(panel.label) for panel in fit_panels])
     if fit_mask_override is not None:
         if fit_mask_override.shape != fit_mask.shape:
-            raise ValueError("shared fit mask shape differs from train+validation panel")
+            raise ValueError("shared fit mask shape differs from fitting panel")
         fit_mask &= fit_mask_override
     combiner = RidgeCombiner(
         float(evaluation_config["ridge_lambda"]),
@@ -292,6 +348,8 @@ def finalize_cell(
     fit_transformed = combiner.last_fit_result
     if fit_transformed is None:
         raise RuntimeError("combiner did not retain its fitted transform result")
+    if not np.isfinite(weights).all() or not np.isfinite(weights).any() or not fit_transformed.metric_mask.any():
+        raise ValueError("calibration has no usable fitted observations or weights")
     write_json(run_dir / "combiner.json", combiner.to_dict())
 
     trade_mask = test.target(test.common_mask)
@@ -328,21 +386,24 @@ def finalize_cell(
     raw_combined[~raw_common] = np.nan
     raw_pearson, raw_rank = _daily_correlations(raw_combined, raw_label, raw_common)
     pd.DataFrame({"date": test.target_dates, "raw_ic": raw_pearson, "raw_rank_ic": raw_rank, "rnic": pearson, "rank_rnic": rank}).to_parquet(test_dir / "rnic_daily.parquet", index=False)
+    bootstrap_indices = bootstrap_date_indices(test.target_dates, int(evaluation_config["bootstrap_block_length"]), bootstrap_samples, int(evaluation_config["bootstrap_seed"]))
     _write_factor_statistics(
         test_dir, run_dir, selected, expressions, weights, test.target_dates,
         test_signals, raw_label, transformed_ic.objective_signals,
-        transformed_label, ic_mask, ic_diagnostics, evaluation_config,
+        transformed_label, ic_mask, ic_diagnostics, evaluation_config, trade_mask, bootstrap_indices,
     )
 
     backtester = PortfolioBacktester(int(evaluation_config["rebalance_days"]), int(evaluation_config["holding_days"]))
     returns = test.target(test.daily_return)
-    dollar = backtester.run(combined, returns, portfolio_mask)
-    neutral_tolerances = {"net_tolerance": float(evaluation_config["net_tolerance"]), "exposure_tolerance": float(evaluation_config["exposure_tolerance"]), "gross_tolerance": float(evaluation_config["gross_tolerance"]), "weight_tolerance": float(evaluation_config["weight_tolerance"])}
-    fully = backtester.run(combined, returns, portfolio_mask, test_exposures, fully_neutral=True, max_weight=float(evaluation_config["fully_neutral_max_weight"]), neutral_tolerances=neutral_tolerances)
+    dollar = backtester.run(combined, returns, portfolio_mask, liquidate_last_close=recent)
+    backtests = {"dollar_neutral": dollar}
+    if not recent:
+        neutral_tolerances = {"net_tolerance": float(evaluation_config["net_tolerance"]), "exposure_tolerance": float(evaluation_config["exposure_tolerance"]), "gross_tolerance": float(evaluation_config["gross_tolerance"]), "weight_tolerance": float(evaluation_config["weight_tolerance"])}
+        backtests["fully_neutral"] = backtester.run(combined, returns, portfolio_mask, test_exposures, fully_neutral=True, max_weight=float(evaluation_config["fully_neutral_max_weight"]), neutral_tolerances=neutral_tolerances)
     daily_frames = {}
     portfolio_results = {}
     audit_frames = []
-    for name, result in (("dollar_neutral", dollar), ("fully_neutral", fully)):
+    for name, result in backtests.items():
         frame = pd.DataFrame({
             "date": test.target_dates,
             "gross_return": result.gross_returns,
@@ -350,6 +411,9 @@ def finalize_cell(
             "missing_held_returns": result.missing_held_returns,
             "missing_held_return_weight": result.missing_held_return_weight,
             "infeasible": result.infeasible,
+            "liquidation_turnover": result.liquidation_turnover,
+            "gross_weight": np.abs(result.weights).sum(axis=1),
+            "net_weight": result.weights.sum(axis=1),
         })
         for cost in map(float, evaluation_config["one_way_cost_bps"]):
             frame[f"net_return_{int(cost)}bps"] = result.gross_returns - cost / 10000.0 * result.turnover
@@ -374,7 +438,7 @@ def finalize_cell(
     if audit_frames:
         pd.concat(audit_frames, ignore_index=True).to_parquet(test_dir / "portfolio_solver_audits.parquet", index=False)
     exposures = []
-    for name, result in (("dollar_neutral", dollar), ("fully_neutral", fully)):
+    for name, result in backtests.items():
         finite_exposure = np.isfinite(test_exposures).all(axis=2)
         held_missing = (np.abs(result.weights) > 0) & ~finite_exposure
         auditable = ~held_missing.any(axis=1)
@@ -388,13 +452,18 @@ def finalize_cell(
         portfolio_results[name]["max_realized_risk_exposure"] = _max_abs_exposure(realized)
         portfolio_results[name]["missing_held_exposure_days"] = int((~auditable).sum())
     pd.concat(exposures, ignore_index=True).to_parquet(test_dir / "exposures.parquet", index=False)
-    raw_summary = series_summary(raw_pearson, bootstrap_samples=bootstrap_samples)
-    rnic_summary = series_summary(pearson, bootstrap_samples=bootstrap_samples)
+    summary_options = {"hac_lag": int(evaluation_config["hac_lag"]), "bootstrap_samples": bootstrap_samples, "seed": int(evaluation_config["bootstrap_seed"]), "bootstrap_block": int(evaluation_config["bootstrap_block_length"]), "dates": test.target_dates, "bootstrap_indices": bootstrap_indices}
+    raw_summary = series_summary(raw_pearson, **summary_options)
+    rnic_summary = series_summary(pearson, **summary_options)
     raw_mean, residual_mean = float(raw_summary["mean"]), float(rnic_summary["mean"])
     retention = abs(residual_mean) / abs(raw_mean) if np.isfinite(raw_mean) and abs(raw_mean) > 1e-12 else float("nan")
     metrics = {
         "input_hash": input_hash,
-        "evaluation_schema_version": 11,
+        "evaluation_schema_version": 12,
+        "protocol": protocol,
+        "data_intervals": data_config,
+        "fit_period": "calibration" if recent else "train_and_validation",
+        "annual_liquidation": "last_close" if recent else "none",
         "pool_version": selected.get("pool_version"),
         "pool_size": len(expressions),
         "expressions": expressions,
@@ -413,8 +482,9 @@ def finalize_cell(
         "raw_ic_diagnostic": raw_summary,
         "primary_pearson_rnic": rnic_summary,
         "raw_ic": raw_summary,
+        "raw_rank_ic": series_summary(raw_rank, **summary_options),
         "rnic": rnic_summary,
-        "rank_rnic": series_summary(rank, bootstrap_samples=bootstrap_samples),
+        "rank_rnic": series_summary(rank, **summary_options),
         "neutralization_retention": retention,
         "portfolios": portfolio_results,
         "evaluation_support_policy": "Factors are transformed independently on a label-free trade universe; missing transformed residuals are zero opinions; one fixed weight vector is applied without asset-wise renormalization; weights use a fixed-universe PSD Gram; primary RNIC jointly projects the deployment composite and label on the fixed metric universe.",
@@ -435,6 +505,15 @@ def finalize_cell(
             "portfolio_days": len({item.get("date") for item in portfolio_diagnostics}),
         },
     }
+    if recent:
+        cal_signal, cal_label, cal_mask, _ = combiner.transform_metric_composite(fit_signals, fit_label, fit_mask, fit_exposures)
+        cal_rnic, cal_rank = _daily_correlations(cal_signal, cal_label, cal_mask)
+        metrics["calibration_diagnostic"] = {
+            "semantics": "in_sample_weight_fit; not validation or pool selection",
+            "rnic_mean": float(np.nanmean(cal_rnic)) if np.isfinite(cal_rnic).any() else float("nan"),
+            "rank_rnic_mean": float(np.nanmean(cal_rank)) if np.isfinite(cal_rank).any() else float("nan"),
+            "valid_days": int(np.isfinite(cal_rnic).sum()),
+        }
     write_json(test_dir / "metrics.json", metrics)
     write_json(marker, {"status": "complete", "input_hash": input_hash, "metrics_hash": stable_hash(metrics)})
     result_path = run_dir / "result.json"
@@ -461,19 +540,25 @@ def finalize_cell(
     # its own monotonic field so adding readable progress cannot invalidate an
     # otherwise accepted cell.
     update_progress(run_dir / "progress.json", status="complete", evaluation_status="complete")
-    append_event(run_dir / "experiment.log", "evaluation_finished", primary_rnic=metrics["primary_pearson_rnic"].get("mean"), rank_rnic=metrics["rank_rnic"].get("mean"), fully_neutral_10bps_sharpe=metrics["portfolios"]["fully_neutral"]["10bps"].get("sharpe"))
+    append_event(run_dir / "experiment.log", "evaluation_finished", primary_rnic=metrics["primary_pearson_rnic"].get("mean"), rank_rnic=metrics["rank_rnic"].get("mean"), dollar_neutral_10bps_sharpe=metrics["portfolios"]["dollar_neutral"].get("10bps", {}).get("sharpe"))
     return metrics
 
 
 def finalize_experiment(experiment_id: str, config: str | Path, methods: list[str] | None = None) -> dict[str, Any]:
     raw_config = load_yaml(config)
+    if raw_config.get("rolling"):
+        from ..rolling import evaluate_rolling
+
+        return evaluate_rolling(experiment_id, config, methods=methods)
     paths = load_paths(config)
-    evaluation_config = load_yaml(paths.code_root / "configs/eval/preliminary.yaml")["evaluation"]
+    from ..config import resolve_data_evaluation
+
+    data_config, evaluation_config = resolve_data_evaluation(raw_config, paths.code_root)
     root = paths.runs_root / experiment_id
     append_event(root / "experiment.log", "evaluation_started", experiment_id=experiment_id)
     experiment = raw_config["experiment"]
     final_pools = _assert_experiment_frozen(config, paths, root, experiment, methods)
-    scope_input_hash = stable_hash({"schema_version": 2, "experiment_id": experiment_id, "final_pools": [file_fingerprint(path) for path in final_pools], "panel": _panel_fingerprints(paths.processed_root), "evaluation_code": _evaluation_code_fingerprints()})
+    scope_input_hash = stable_hash({"schema_version": 3, "experiment_id": experiment_id, "final_pools": [file_fingerprint(path) for path in final_pools], "panel": _panel_fingerprints(paths.processed_root), "evaluation_code": _evaluation_code_fingerprints(), "data_config": data_config, "evaluation_config": evaluation_config, "protocol": raw_config.get("protocol")})
     scope_name = "_".join(sorted(set(methods or ()))) or "all"
     transaction_path = root / ("test_finalization.json" if scope_name == "all" else f"test_finalization_{scope_name}.json")
     summary_path = root / ("evaluation_summary.json" if scope_name == "all" else f"evaluation_summary_{scope_name}.json")
@@ -482,7 +567,20 @@ def finalize_experiment(experiment_id: str, config: str | Path, methods: list[st
         if transaction.get("scope_input_hash") != scope_input_hash:
             raise RuntimeError("frozen experiment inputs changed after test finalization started")
         if transaction.get("status") == "complete":
-            return _read_json(summary_path)
+            summary = _read_json(summary_path)
+            expected_keys = {str(path.parent.relative_to(root)) for path in final_pools}
+            if set(summary) != expected_keys:
+                raise RuntimeError("cached evaluation summary cells differ from the frozen experiment")
+            for final_pool in final_pools:
+                cell = final_pool.parent
+                key = str(cell.relative_to(root))
+                input_hash = cell_input_hash(cell, paths.processed_root, evaluation_config, data_config,
+                                             raw_config.get("protocol"), cell_finalization_scope_hash(key))
+                metrics = _verified_cached_metrics(cell / "test", input_hash)
+                entry = summary[key]
+                if entry.get("status") != "complete" or stable_hash(entry.get("metrics")) != stable_hash(metrics):
+                    raise RuntimeError(f"cached evaluation summary differs from finalized cell metrics: {key}")
+            return summary
     write_json(transaction_path, {"status": "started", "scope_input_hash": scope_input_hash})
 
     results: dict[str, Any] = {}
@@ -490,8 +588,8 @@ def finalize_experiment(experiment_id: str, config: str | Path, methods: list[st
         cell = final_pool.parent
         key = str(cell.relative_to(root))
         try:
-            cell_scope_hash = stable_hash({"cell": key, "support": "fixed-universe-zero-fill-psd-gram-v6"})
-            results[key] = {"status": "complete", "metrics": finalize_cell(cell, paths.processed_root, finalization_scope_hash=cell_scope_hash, evaluation_config=evaluation_config)}
+            cell_scope_hash = cell_finalization_scope_hash(key)
+            results[key] = {"status": "complete", "metrics": finalize_cell(cell, paths.processed_root, finalization_scope_hash=cell_scope_hash, evaluation_config=evaluation_config, data_config=data_config, protocol=raw_config.get("protocol"))}
         except Exception as exc:
             results[key] = {"status": "failed", "error": str(exc)}
     write_json(summary_path, results)

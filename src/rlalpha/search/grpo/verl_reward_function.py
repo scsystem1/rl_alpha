@@ -27,9 +27,9 @@ from rlalpha.utils.io import atomic_write_text
 
 _BATCHES: dict[str, dict[str, Any]] = {}
 _LOCKS: dict[int, asyncio.Lock] = {}
-_PANELS: dict[tuple[str, str | None, str | None], Any] = {}
-_SIGNALS: dict[tuple[tuple[str, str | None, str | None], str], np.ndarray] = {}
-_OBJECTIVES: dict[tuple[tuple[str, str | None, str | None], str, str], Any] = {}
+_PANELS: dict[tuple[Any, ...], Any] = {}
+_SIGNALS: dict[tuple[Any, ...], np.ndarray] = {}
+_OBJECTIVES: dict[tuple[Any, ...], Any] = {}
 _POOLS: dict[tuple[Any, ...], PoolManager] = {}
 
 
@@ -129,11 +129,15 @@ def _load_spec(requests: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
     spec = _load_spec(requests)
-    panel_key = (str(spec["processed_root"]), spec.get("train_start"), spec.get("train_end"))
+    panel_key = (str(spec["processed_root"]), spec.get("protocol"), spec.get("train_start"), spec.get("train_end"))
     if panel_key not in _PANELS:
-        _PANELS[panel_key] = PanelStore(spec["processed_root"]).load_split(
-            "train", start=spec.get("train_start"), end=spec.get("train_end")
-        )
+        store = PanelStore(spec["processed_root"])
+        if spec.get("protocol") == "recent_alpha_v1":
+            if not spec.get("train_start") or not spec.get("train_end"):
+                raise RuntimeError("recent-alpha GRPO workers require explicit train dates")
+            _PANELS[panel_key] = store.load_interval("train", spec["train_start"], spec["train_end"])
+        else:
+            _PANELS[panel_key] = store.load_split("train", start=spec.get("train_start"), end=spec.get("train_end"))
     panel = _PANELS[panel_key]
     reward_name = str(spec["reward"])
     reward_config = dict(spec.get("reward_config") or {})

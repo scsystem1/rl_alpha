@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ..rewards.factory import prompt_objective_for
-from ..rewards.walk_forward import DEFAULT_TIME_FOLDS, WalkForwardObjective
+from ..rewards.walk_forward import WalkForwardObjective
 from .models import TrainPoolSummary
 
 
@@ -11,8 +11,7 @@ class PoolPromptDiagnostics:
     def __init__(self, panel, pool, reward_config=None):
         self.pool = pool
         current = pool.objective
-        self.objective = (current if isinstance(current, WalkForwardObjective)
-            and current.time_folds == DEFAULT_TIME_FOLDS else prompt_objective_for(panel, reward_config))
+        self.objective = current if isinstance(current, WalkForwardObjective) else prompt_objective_for(panel, reward_config)
         self._key = None
         self._summary = None
 

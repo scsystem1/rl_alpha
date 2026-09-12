@@ -61,7 +61,7 @@ def write_result_summary(
         f"- Final pool version: {pool_version}",
         f"- Final pool size: {len(expressions)}",
         f"- Train objective: {train_objective}",
-        f"- Validation objective: {validation_objective}",
+        *([f"- Validation objective: {validation_objective}"] if validation_objective is not None else []),
         "",
         "## Final factors",
         "",
@@ -71,7 +71,6 @@ def write_result_summary(
     if evaluation is not None:
         primary = evaluation.get("primary_pearson_rnic", evaluation.get("rnic", {}))
         rank = evaluation.get("rank_rnic", {})
-        fully = evaluation.get("portfolios", {}).get("fully_neutral", {}).get("10bps", {})
         lines.extend(
             [
                 "## Final evaluation",
@@ -79,10 +78,21 @@ def write_result_summary(
                 f"- Primary Pearson RNIC mean: {primary.get('mean')}",
                 f"- Primary Pearson RNIC HAC t: {primary.get('hac_t')}",
                 f"- Rank RNIC mean: {rank.get('mean')}",
-                f"- Fully-neutral 10bps annual return: {fully.get('annual_return')}",
-                f"- Fully-neutral 10bps Sharpe: {fully.get('sharpe')}",
-                f"- Fully-neutral 10bps max drawdown: {fully.get('max_drawdown')}",
                 "",
             ]
         )
+        calibration = evaluation.get("calibration_diagnostic")
+        if calibration:
+            lines.extend([f"- Calibration RNIC (in-sample weight-fit diagnostic): {calibration.get('rnic_mean')}", ""])
+        for name, costs in evaluation.get("portfolios", {}).items():
+            for cost, metrics in costs.items():
+                if not str(cost).endswith("bps") or not isinstance(metrics, dict):
+                    continue
+                lines.extend([
+                    f"- {name} {cost} total return: {metrics.get('total_return')}",
+                    f"- {name} {cost} CAGR: {metrics.get('cagr')}",
+                    f"- {name} {cost} Sharpe: {metrics.get('sharpe')}",
+                    f"- {name} {cost} max drawdown: {metrics.get('max_drawdown')}",
+                    "",
+                ])
     atomic_write_text(path, "\n".join(lines))

@@ -79,6 +79,11 @@ class VerlGRPOStageCoordinator:
         self.pool_snapshots: list[dict[str, Any]] = []
         self._persisted_record_count = 0
 
+    def _window_contract(self):
+        if self.effective_config.get("protocol") != "recent_alpha_v1":
+            return None
+        return stable_hash({key: self.effective_config.get(key) for key in ("protocol", "data", "evaluation")})
+
     def context(self) -> SearchContext:
         score = self.pool.score
         return SearchContext(
@@ -111,6 +116,7 @@ class VerlGRPOStageCoordinator:
             "invalid_penalty": float(self.effective_config.get("reward", {}).get("invalid_penalty", -1.0)),
             "reward": self.reward,
             "reward_config": dict(self.effective_config.get("reward", {})),
+            "protocol": self.effective_config.get("protocol"),
             "processed_root": str(self.processed_root.resolve()),
             "train_start": self.train_start,
             "train_end": self.train_end,
@@ -150,7 +156,7 @@ class VerlGRPOStageCoordinator:
                 "stage": self.stage,
                 "optimizer_update": self.updates,
                 "resume_checkpoint_hash": (
-                    self.checkpoint_fingerprint["sha256"] if self.checkpoint_fingerprint else None
+                    stable_hash(self.checkpoint_fingerprint) if self.checkpoint_fingerprint else None
                 ),
                 "pool_version": self.pool.version,
                 "pool_hashes": [entry.expr_hash for entry in self.pool.entries],
@@ -545,7 +551,7 @@ class VerlGRPOStageCoordinator:
             "total_tokens": self.total_tokens,
             "gpu_seconds": self.gpu_seconds,
             "checkpoint": str(self.checkpoint) if self.checkpoint else None,
-            "checkpoint_hash": self.checkpoint_fingerprint["sha256"] if self.checkpoint_fingerprint else None,
+            "checkpoint_hash": stable_hash(self.checkpoint_fingerprint) if self.checkpoint_fingerprint else None,
         }
 
     def save_checkpoint(self) -> None:
@@ -554,6 +560,7 @@ class VerlGRPOStageCoordinator:
             raise RuntimeError("paired Verl actor checkpoint is missing")
         state = {
             "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "window_contract": self._window_contract(),
             "reward_contract": objective_contract(self.pool.objective),
             "prompt_contract_hash": prompt_contract()["hash"],
             "reward_pool_semantics": REWARD_POOL_SEMANTICS,
@@ -589,6 +596,7 @@ class VerlGRPOStageCoordinator:
             self.run_dir / "checkpoint_commit.json",
             {
                 "schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "window_contract": self._window_contract(),
                 "reward_contract": objective_contract(self.pool.objective),
                 "prompt_contract_hash": prompt_contract()["hash"],
                 "reward_pool_semantics": REWARD_POOL_SEMANTICS,
@@ -610,6 +618,8 @@ class VerlGRPOStageCoordinator:
         if file_fingerprint(state_path)["sha256"] != commit["checkpoint"]["sha256"]:
             raise RuntimeError("GRPO checkpoint hash mismatch")
         state = json.loads(state_path.read_text(encoding="utf-8"))
+        if state.get("window_contract") != self._window_contract() or commit.get("window_contract") != self._window_contract():
+            raise RuntimeError("GRPO window or calibration policy changed; start a new experiment ID")
         if state.get("schema_version") != CHECKPOINT_SCHEMA_VERSION or state.get("reward_pool_semantics") != REWARD_POOL_SEMANTICS:
             raise RuntimeError("GRPO state uses incompatible reward/pool semantics")
         if int(state["paired_optimizer_step"]) != int(commit["paired_optimizer_step"]):

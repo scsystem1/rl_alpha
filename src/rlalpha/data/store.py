@@ -111,6 +111,26 @@ class PanelStore:
         requested_end = split.end if end is None else pd.Timestamp(end)
         if requested_start < split.start or requested_end > split.end or requested_start > requested_end:
             raise ValueError(f"requested interval must stay inside split {name}")
+        return self._load_interval(name, requested_start, requested_end, history, recompute_labels=False)
+
+    def load_interval(self, name: str, start: str | pd.Timestamp, end: str | pd.Timestamp, history: int = 252) -> SplitPanel:
+        """Load a chronological window and rebuild labels using only its returns.
+
+        Old stored labels were censored at the fixed 2018/2021 boundaries.
+        A rolling window can cross those boundaries; recomputing in memory
+        restores mature labels without reading any date after this window.
+        """
+        requested_start, requested_end = pd.Timestamp(start), pd.Timestamp(end)
+        if pd.isna(requested_start) or pd.isna(requested_end) or requested_start > requested_end:
+            raise ValueError("interval requires finite, chronological start/end dates")
+        dates = self.dates
+        if dates[0] > requested_start + pd.Timedelta(days=7) or dates[-1] < requested_end - pd.Timedelta(days=7):
+            raise ValueError("panel does not cover the requested interval")
+        return self._load_interval(name, requested_start, requested_end, history, recompute_labels=True)
+
+    def _load_interval(self, name, requested_start, requested_end, history, *, recompute_labels):
+        if history < 0:
+            raise ValueError("history must be nonnegative")
         selected = np.flatnonzero((self.dates >= requested_start) & (self.dates <= requested_end))
         if not len(selected):
             raise ValueError(f"split {name} contains no dates")
@@ -122,13 +142,30 @@ class PanelStore:
         exposure_array = self._array("risk_exposures.zarr/exposures")
         exposure_group = zarr.open_group(str(self.root / "risk_exposures.zarr"), mode="r")
         exposure_names = tuple(exposure_group.attrs.get("columns", [f"exposure_{index}" for index in range(exposure_array.shape[2])]))
+        daily_return = np.asarray(self._array("returns.zarr/daily_total_return")[source])
+        if recompute_labels:
+            label = np.full(daily_return.shape, np.nan, dtype=np.float64)
+            # Signal at t, entry at t+1 close, exit at t+21 close.
+            count = max(0, len(selected) - 21)
+            if count:
+                first = target.start
+                compound = np.ones((count, daily_return.shape[1]), dtype=np.float64)
+                complete = np.ones_like(compound, dtype=bool)
+                for offset in range(2, 22):
+                    values = daily_return[first + offset:first + offset + count].astype(np.float64)
+                    finite = np.isfinite(values)
+                    complete &= finite
+                    compound *= np.where(finite, 1.0 + values, 1.0)
+                label[first:first + count] = np.where(complete, compound - 1.0, np.nan)
+        else:
+            label = np.asarray(self._array("returns.zarr/forward_return_20d")[source])
         return SplitPanel(
             name=name,
             dates=self.dates[source],
             permnos=self.permnos,
             features=features,
-            daily_return=np.asarray(self._array("returns.zarr/daily_total_return")[source]),
-            label=np.asarray(self._array("returns.zarr/forward_return_20d")[source]),
+            daily_return=daily_return,
+            label=label,
             membership=np.asarray(self._array("membership.zarr/membership")[source], dtype=bool),
             eligibility=np.asarray(self._array("eligibility.zarr/trade_eligibility")[source], dtype=bool),
             exposures=np.asarray(exposure_array[source]),
