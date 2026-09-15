@@ -77,7 +77,10 @@ def cell_input_hash(
         "finalization_scope_hash": finalization_scope_hash,
         "support_policy": "fixed-universe-zero-fill-psd-gram-v6",
         "missing_return_policy": "zero-return-stale-value-v1",
-        "fit_policy": "calibration_only" if recent else "train_and_validation",
+        "fit_policy": (
+            f"{evaluation_config.get('ridge_fit_period', 'calibration')}_only"
+            if recent else "train_and_validation"
+        ),
         "liquidation_policy": "last_close" if recent else "none",
     })
 
@@ -320,9 +323,15 @@ def finalize_cell(
     store = PanelStore(processed_root)
     if recent:
         assert data_config is not None
-        validation = store.load_interval("validation", *data_config["validation"])
+        ridge_fit_period = str(evaluation_config.get("ridge_fit_period", "calibration"))
+        if ridge_fit_period == "train":
+            fit_panel = store.load_interval("train", *data_config["train"])
+        elif ridge_fit_period == "calibration":
+            fit_panel = store.load_interval("validation", *data_config["validation"])
+        else:
+            raise ValueError(f"unknown recent-alpha ridge fit period: {ridge_fit_period}")
         test = store.load_interval("test", *data_config["test"])
-        fit_panels = [validation]
+        fit_panels = [fit_panel]
     else:
         train, validation, test = (store.load_split(name) for name in ("train", "validation", "test"))
         fit_panels = [train, validation]
@@ -462,7 +471,7 @@ def finalize_cell(
         "evaluation_schema_version": 12,
         "protocol": protocol,
         "data_intervals": data_config,
-        "fit_period": "calibration" if recent else "train_and_validation",
+        "fit_period": ridge_fit_period if recent else "train_and_validation",
         "annual_liquidation": "last_close" if recent else "none",
         "pool_version": selected.get("pool_version"),
         "pool_size": len(expressions),
@@ -508,12 +517,16 @@ def finalize_cell(
     if recent:
         cal_signal, cal_label, cal_mask, _ = combiner.transform_metric_composite(fit_signals, fit_label, fit_mask, fit_exposures)
         cal_rnic, cal_rank = _daily_correlations(cal_signal, cal_label, cal_mask)
-        metrics["calibration_diagnostic"] = {
+        fit_diagnostic = {
             "semantics": "in_sample_weight_fit; not validation or pool selection",
+            "fit_period": ridge_fit_period,
             "rnic_mean": float(np.nanmean(cal_rnic)) if np.isfinite(cal_rnic).any() else float("nan"),
             "rank_rnic_mean": float(np.nanmean(cal_rank)) if np.isfinite(cal_rank).any() else float("nan"),
             "valid_days": int(np.isfinite(cal_rnic).sum()),
         }
+        metrics["fit_diagnostic"] = fit_diagnostic
+        if ridge_fit_period == "calibration":
+            metrics["calibration_diagnostic"] = fit_diagnostic
     write_json(test_dir / "metrics.json", metrics)
     write_json(marker, {"status": "complete", "input_hash": input_hash, "metrics_hash": stable_hash(metrics)})
     result_path = run_dir / "result.json"

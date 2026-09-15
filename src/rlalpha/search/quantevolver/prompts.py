@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
 from typing import Any
 
 from ..prompts import DSL_GRAMMAR
@@ -67,9 +68,32 @@ REGIME_WINDOWS: tuple[dict[str, str], ...] = (
 )
 
 
-def task_for_round(round_index: int, seed: int) -> dict[str, Any]:
+def regime_windows_for_interval(start: str, end: str) -> tuple[dict[str, str], ...]:
+    """Map QuantEvolver's early/middle/late/full task bank to one search window."""
+    first, last = date.fromisoformat(start), date.fromisoformat(end)
+    if first >= last:
+        raise ValueError("QuantEvolver search interval must contain multiple calendar days")
+    days = (last - first).days + 1
+    boundaries = [first + timedelta(days=(days * index) // 3) for index in range(4)]
+    names = ("train_early", "train_middle", "train_late")
+    parts = tuple(
+        {
+            "name": name,
+            "start": boundaries[index].isoformat(),
+            "end": (boundaries[index + 1] - timedelta(days=1)).isoformat(),
+        }
+        for index, name in enumerate(names)
+    )
+    return (*parts, {"name": "train_full", "start": first.isoformat(), "end": last.isoformat()})
+
+
+def task_for_round(
+    round_index: int,
+    seed: int,
+    regime_windows: tuple[dict[str, str], ...] = REGIME_WINDOWS,
+) -> dict[str, Any]:
     seed_record = SEED_LIBRARY[(int(round_index) + int(seed)) % len(SEED_LIBRARY)]
-    window = REGIME_WINDOWS[(int(round_index) // len(SEED_LIBRARY) + int(seed)) % len(REGIME_WINDOWS)]
+    window = regime_windows[(int(round_index) // len(SEED_LIBRARY) + int(seed)) % len(regime_windows)]
     return {
         "round": int(round_index),
         "task_id": f"{seed_record['id']}__{window['name']}__{round_index:04d}",
@@ -99,14 +123,13 @@ Output only <expr>FORMULA</expr>."""
     return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]
 
 
-def prompt_contract() -> dict[str, Any]:
+def prompt_contract(regime_windows: tuple[dict[str, str], ...] = REGIME_WINDOWS) -> dict[str, Any]:
     payload = {
         "version": PROMPT_VERSION,
         "system": SYSTEM_PROMPT,
         "grammar": DSL_GRAMMAR,
         "seed_library": list(SEED_LIBRARY),
-        "regime_windows": list(REGIME_WINDOWS),
+        "regime_windows": list(regime_windows),
         "sampling_protocol": "one seeded task per optimizer update; eight completions",
     }
     return {**payload, "hash": stable_hash(payload)}
-

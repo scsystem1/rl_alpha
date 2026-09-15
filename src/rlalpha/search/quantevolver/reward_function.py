@@ -122,13 +122,15 @@ def _score_batch_sync(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
     spec = _load_spec(requests)
     extra = requests[0]["extra_info"]
     start, end = str(extra["start_date"]), str(extra["end_date"])
-    # Load the audited train panel once per persistent reward worker.  Regime
-    # tasks differ only in their metric mask; reloading four overlapping Zarr
-    # panels would multiply both startup latency and resident memory.
-    panel_key = (str(spec["processed_root"]), "train", "full")
+    # Load the audited search panel once per persistent reward worker. Regime
+    # tasks differ only in their metric mask; reward math below is unchanged.
+    interval = spec.get("train_interval")
+    interval_key = ":".join(map(str, interval)) if interval else "full"
+    panel_key = (str(spec["processed_root"]), "train", interval_key)
     panel = _PANELS.get(panel_key)
     if panel is None:
-        panel = PanelStore(spec["processed_root"]).load_split("train")
+        store = PanelStore(spec["processed_root"])
+        panel = store.load_interval("train", *interval) if interval else store.load_split("train")
         _PANELS[panel_key] = panel
     dates = panel.target_dates
     regime = (dates >= np.datetime64(start)) & (dates <= np.datetime64(end))

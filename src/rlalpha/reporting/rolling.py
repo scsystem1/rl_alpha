@@ -18,8 +18,14 @@ from ..utils.hashing import stable_hash
 
 IC_COLUMNS = ("raw_ic", "raw_rank_ic", "rnic", "rank_rnic")
 COSTS = (0, 10)
-METHOD_NAMES = {"random": "Random", "gp": "GP", "base_llm": "Base LLM", "grpo_llm": "GRPO"}
-METHOD_COLORS = {"random": "#666666", "gp": "#28659A", "base_llm": "#926400", "grpo_llm": "#B83240"}
+METHOD_NAMES = {
+    "random": "Random", "gp": "GP", "base_llm": "Base LLM", "grpo_llm": "GRPO",
+    "quantevolver": "QuantEvolver", "alphasage": "AlphaSAGE",
+}
+METHOD_COLORS = {
+    "random": "#666666", "gp": "#28659A", "base_llm": "#926400", "grpo_llm": "#B83240",
+    "quantevolver": "#6B4C9A", "alphasage": "#23856D",
+}
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -330,8 +336,15 @@ def build_rolling_report(experiment_id: str, config: str | Path, methods: list[s
         _table(destination, name, frame)
     figures = _annual_figures(cells, destination)
     years = sorted({key[0] for key in cells})
+    ridge_fit_period = str(options.get("ridge_fit_period", "calibration"))
+    window_description = (
+        "Search and ridge fitting use the same two complete calendar training years; "
+        "there is no distinct validation/calibration period, and the next calendar year is test."
+        if ridge_fit_period == "train"
+        else "Search windows use two years, calibration uses the following half-year, and test covers the next calendar year. The terminal pool is frozen before calibration; only ridge weights use calibration labels."
+    )
     text = [f"# {experiment_id}: recent-alpha rolling evaluation",
-            f"Complete: {len(cells)} cells; test years {', '.join(map(str, years))}. Search windows use two years, calibration uses the following half-year, and test covers the next calendar year. The terminal pool is frozen before calibration; only ridge weights use calibration labels.",
+            f"Complete: {len(cells)} cells; test years {', '.join(map(str, years))}. {window_description}",
             "## Estimands and uncertainty",
             "IC is the equal-trading-day mean of daily cross-sectional correlations. Raw IC/raw rank IC are diagnostics; RNIC/rank RNIC use the declared risk-model residuals. Overall estimates concatenate annual daily observations, preserving missing label dates. Method-level IC first averages all declared seeds on the same date; any missing seed makes that date missing. `seed_mean` and `seed_sd` separately summarize the per-seed IC means on each seed's available dates. Seeds are repeated searches, not independent market histories. Inference is conditional on these fixed search seeds and observed historical years.",
             f"RNIC and rank RNIC report a two-sided HAC test of zero mean (lag {options.get('hac_lag', 20)}) and a 95% moving-block bootstrap interval (block {options.get('bootstrap_block_length', 20)}, {options.get('bootstrap_samples', 2000)} draws). All comparisons reuse the same sampled date indices within each period; blocks stay within calendar years. GRPO comparisons subtract the same baseline seed on the same date before averaging seeds. No p-values or t-statistics are averaged. Pairwise p-values are unadjusted planned comparisons; per-factor q-values retain their per-cell testing families.",

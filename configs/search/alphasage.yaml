@@ -3,6 +3,7 @@ search:
   algorithm: trajectory_balance_gflownet
   encoder: rgcn
   hidden_dim: 128
+  learning_rate: 0.0001
   max_expression_tokens: 20
   entropy_coef: 0.01
   entropy_temperature: 1.0

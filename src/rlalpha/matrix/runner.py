@@ -21,6 +21,7 @@ from ..manifest import git_info
 GPU_THRESHOLDS_MIB = {2: 34 * 1024, 3: 28 * 1024, 4: 14 * 1024}
 GPU_MEMORY_UTILIZATION = {2: "0.18", 3: "0.15", 4: "0.18"}
 GRPO_METHODS = {"grpo_llm", "quantevolver"}
+EXPENSIVE_METHODS = {"base_llm", "grpo_llm", "quantevolver", "alphasage"}
 
 
 @lru_cache(maxsize=16)
@@ -130,6 +131,9 @@ def _expected_cell_identity(config: Path, paths: Any, method: str, reward: str, 
         "alphagen": _repository_identity(str(Path(paths.alphagen_root).resolve())),
         "quantevolver": _repository_identity(str(Path(paths.quantevolver_root).resolve())),
     }
+    if method == "alphasage":
+        alphasage_root = Path(os.getenv("RLALPHA_ALPHASAGE_ROOT", Path(paths.code_root).parent / "baseline/AlphaSAGE"))
+        repositories["alphasage"] = _repository_identity(str(alphasage_root.resolve()))
     model_runtime = []
     if method in {"base_llm", "grpo_llm", "quantevolver"}:
         model_config = load_yaml(Path(paths.code_root) / "configs/model/qwen3_5_2b.yaml")["model"]
@@ -209,8 +213,8 @@ def _run_matrix_unlocked(config: str | Path, experiment_id: str, resume: bool = 
         occupied = [str(_cell_dir(root, method, reward, int(seed))) for method, reward, seed in cells if _cell_dir(root, method, reward, int(seed)).exists() and any(_cell_dir(root, method, reward, int(seed)).iterdir())]
         if occupied:
             raise RuntimeError(f"--no-resume refuses existing cell directories: {occupied}; use a new experiment ID")
-    if any(method in {"base_llm", "grpo_llm", "quantevolver"} for method, _, _ in cells) and not bool(experiment.get("auto_start_expensive_jobs", False)):
-        raise RuntimeError("expensive Base-LLM/GRPO cells are disabled by experiment.auto_start_expensive_jobs=false")
+    if any(method in EXPENSIVE_METHODS for method, _, _ in cells) and not bool(experiment.get("auto_start_expensive_jobs", False)):
+        raise RuntimeError("expensive GPU cells are disabled by experiment.auto_start_expensive_jobs=false")
     steps = int(experiment.get("search_steps", 250))
     append_event(root / "experiment.log", "matrix_started", experiment_id=experiment_id, cells=len(cells), search_steps=steps, candidates_per_step=int(experiment.get("proposal_group_size", 8)))
     gpu_thresholds = {

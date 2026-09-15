@@ -13,6 +13,14 @@ from .utils.io import write_json, write_yaml
 
 
 PROTOCOL = "recent_alpha_v1"
+RECENT_METHOD_REWARDS = {
+    "random": {"r1_oof", "r2_paired_oof"},
+    "gp": {"r1_oof", "r2_paired_oof"},
+    "base_llm": {"r1_oof", "r2_paired_oof"},
+    "grpo_llm": {"r1_oof", "r2_paired_oof"},
+    "quantevolver": {"qe_native"},
+    "alphasage": {"r0"},
+}
 POLICIES = {
     "lookback_trading_days": 252,
     "label_horizon": "t+2 through t+21, mature within each segment",
@@ -24,45 +32,84 @@ POLICIES = {
 }
 
 
+def policies_for(raw: dict[str, Any]) -> dict[str, str]:
+    scheme = raw.get("rolling", {}).get(
+        "window_scheme", "two_year_then_half_year_calibration"
+    )
+    if scheme == "two_calendar_years_then_test_year":
+        return {
+            **POLICIES,
+            "calibration": "none; fit ridge weights once on the full two-year search-training interval",
+            "window": "two complete calendar training years followed by one complete calendar test year",
+        }
+    return POLICIES
+
+
 def window_config(raw: dict[str, Any], year: int, code_root: str | Path) -> dict[str, Any]:
     """The only calendar arithmetic used by search, workers and evaluation."""
     cells = expected_cells(raw)
     if not cells or len(cells) != len(set(cells)):
         raise ValueError("recent alpha requires nonempty, unique method/reward/seed cells")
     for method, reward, _ in cells:
-        if method not in {"random", "gp", "base_llm", "grpo_llm"}:
+        allowed = RECENT_METHOD_REWARDS.get(method)
+        if allowed is None:
             raise ValueError(f"recent_alpha_v1 does not support method {method}")
-        if reward not in {"r1_oof", "r2_paired_oof"}:
-            raise ValueError(f"recent_alpha_v1 supports r1_oof and r2_paired_oof, not {reward}")
+        if reward not in allowed:
+            raise ValueError(
+                f"recent_alpha_v1 requires {method} reward in {sorted(allowed)}, not {reward}"
+            )
     child = deepcopy(raw)
     child.pop("rolling", None)
     child["protocol"] = PROTOCOL
     data, evaluation = resolve_data_evaluation(raw, code_root)
-    data.update({
-        "train": [f"{year-3}-07-01", f"{year-1}-06-30"],
-        "validation": [f"{year-1}-07-01", f"{year-1}-12-31"],
-        "test": [f"{year}-01-01", f"{year}-12-31"],
-    })
+    scheme = raw.get("rolling", {}).get(
+        "window_scheme", "two_year_then_half_year_calibration"
+    )
+    if scheme == "two_calendar_years_then_test_year":
+        train_interval = [f"{year-2}-01-01", f"{year-1}-12-31"]
+        data.update({
+            "train": train_interval,
+            # DataConfig retains a structural validation field for compatibility,
+            # but this scheme has no distinct validation/calibration period.
+            "validation": list(train_interval),
+            "test": [f"{year}-01-01", f"{year}-12-31"],
+        })
+        evaluation["ridge_fit_period"] = "train"
+        halves = [
+            [f"{year-2}-01-01", f"{year-2}-06-30"],
+            [f"{year-2}-07-01", f"{year-2}-12-31"],
+            [f"{year-1}-01-01", f"{year-1}-06-30"],
+            [f"{year-1}-07-01", f"{year-1}-12-31"],
+        ]
+    else:
+        data.update({
+            "train": [f"{year-3}-07-01", f"{year-1}-06-30"],
+            "validation": [f"{year-1}-07-01", f"{year-1}-12-31"],
+            "test": [f"{year}-01-01", f"{year}-12-31"],
+        })
+        evaluation["ridge_fit_period"] = "calibration"
+        halves = [
+            [f"{year-3}-07-01", f"{year-3}-12-31"],
+            [f"{year-2}-01-01", f"{year-2}-06-30"],
+            [f"{year-2}-07-01", f"{year-2}-12-31"],
+            [f"{year-1}-01-01", f"{year-1}-06-30"],
+        ]
     if data["horizon_trading_days"] != 20:
         raise ValueError("recent_alpha_v1 requires the existing 20-day, next-close label")
     if (evaluation["rebalance_days"], evaluation["holding_days"], evaluation["sleeves"]) != (5, 20, 4):
         raise ValueError("recent_alpha_v1 requires five-day rebalancing and four twenty-day sleeves")
     if sorted(evaluation["one_way_cost_bps"]) != [0, 10]:
         raise ValueError("recent_alpha_v1 reports exactly 0 and 10 bps costs")
-    halves = [
-        [f"{year-3}-07-01", f"{year-3}-12-31"],
-        [f"{year-2}-01-01", f"{year-2}-06-30"],
-        [f"{year-2}-07-01", f"{year-2}-12-31"],
-        [f"{year-1}-01-01", f"{year-1}-06-30"],
-    ]
-    reward = dict(child.get("reward", {}))
-    reward.update({
-        "name": "r1_oof", "neutralized": True, "hac_lag": 20,
-        "ridge": evaluation["ridge_lambda"], "min_pool_valid_days": 80,
-        "min_pool_valid_day_rate": 0.8, "min_pool_observation_rate": 0.8,
-        "time_folds": [{"fit": halves[i], "score": halves[i+1]} for i in range(3)],
-    })
-    child.update(data=data, evaluation=evaluation, reward=reward)
+    child.update(data=data, evaluation=evaluation)
+    if any(method in {"random", "gp", "base_llm", "grpo_llm"} for method, _, _ in cells):
+        reward = dict(child.get("reward", {}))
+        reward.update({
+            "name": "r1_oof", "neutralized": True, "hac_lag": 20,
+            "ridge": evaluation["ridge_lambda"], "min_pool_valid_days": 80,
+            "min_pool_valid_day_rate": 0.8, "min_pool_observation_rate": 0.8,
+            "time_folds": [{"fit": halves[i], "score": halves[i+1]} for i in range(3)],
+        })
+        child["reward"] = reward
     ProjectConfig.model_validate(child)
     return child
 
@@ -83,7 +130,7 @@ def prepare_rolling_windows(config: str | Path, experiment_id: str) -> list[tupl
     # Freeze effective environment path overrides, not only the YAML defaults.
     for child in children.values():
         child["paths"] = paths.model_dump(mode="json")
-    contract = {"protocol": PROTOCOL, "policies": POLICIES, "windows": children,
+    contract = {"protocol": PROTOCOL, "policies": policies_for(raw), "windows": children,
                 "expected_cells_per_window": expected_cells(raw)}
     digest = stable_hash(contract)
     manifest_path = root / "rolling_manifest.json"
@@ -114,8 +161,8 @@ def run_rolling_matrix(config: str | Path, experiment_id: str, resume: bool = Tr
     raw = load_yaml(config)
     cells = [cell for cell in expected_cells(raw)
              if (not methods or cell[0] in methods) and (not rewards or cell[1] in rewards)]
-    if any(method in {"base_llm", "grpo_llm"} for method, _, _ in cells) and not raw["experiment"].get("auto_start_expensive_jobs", False):
-        raise RuntimeError("expensive Base-LLM/GRPO cells are disabled by experiment.auto_start_expensive_jobs=false; enable before freezing the experiment")
+    if any(method in {"base_llm", "grpo_llm", "quantevolver", "alphasage"} for method, _, _ in cells) and not raw["experiment"].get("auto_start_expensive_jobs", False):
+        raise RuntimeError("expensive GPU cells are disabled by experiment.auto_start_expensive_jobs=false; enable before freezing the experiment")
     windows = {}
     for year, child, child_id in prepare_rolling_windows(config, experiment_id):
         windows[str(year)] = run_matrix(child, child_id, resume, poll_seconds, methods, rewards)

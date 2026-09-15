@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ...config import load_paths, load_yaml
+from ...config import load_paths, load_yaml, resolve_data_evaluation
 from ...data.discovery import discover_data_files
 from ...data.store import PanelStore
 from ...dsl.evaluator import EVALUATOR_SEMANTICS_VERSION
@@ -22,7 +22,7 @@ from ...utils.io import atomic_write_text, write_json, write_yaml
 from ..base_llm import resolve_model_path
 from ..grpo.verl_config import build_verl_grpo_config
 from ..grpo.verl_trainer import run_quant_evolver_verl_trainer
-from .prompts import build_messages, prompt_contract, task_for_round
+from .prompts import build_messages, prompt_contract, regime_windows_for_interval, task_for_round
 
 
 def _latest_checkpoint(root: Path) -> tuple[int, Path | None]:
@@ -76,6 +76,8 @@ def _select_final_pool(
     processed_root: Path,
     capacity: int,
     correlation_threshold: float = 0.70,
+    train_interval: list[str] | tuple[str, str] | None = None,
+    ridge_fit_period: str = "calibration",
 ) -> dict[str, Any]:
     records = [json.loads(line) for line in history_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     best: dict[str, dict[str, Any]] = {}
@@ -91,14 +93,20 @@ def _select_final_pool(
     if not candidates:
         raise RuntimeError("QuantEvolver produced no valid unique candidates")
 
-    validation = PanelStore(processed_root).load_split("validation")
-    mask = validation.target(validation.common_mask)
-    label = validation.target(validation.label)
+    store = PanelStore(processed_root)
+    selection_panel = (
+        store.load_interval("train", *train_interval)
+        if train_interval is not None
+        else store.load_split("validation")
+    )
+    selection_period = "train" if train_interval is not None else "validation"
+    mask = selection_panel.target(selection_panel.common_mask)
+    label = selection_panel.target(selection_panel.label)
     scored: list[tuple[float, float, int, dict[str, Any], np.ndarray]] = []
     for item in candidates:
         try:
             node = parse_expression(str(item["expression"]))
-            signal = np.asarray(validation.evaluate(node), dtype=float)
+            signal = np.asarray(selection_panel.evaluate(node), dtype=float)
             validity = validate_signal(signal, mask, [])
             if not validity.valid:
                 continue
@@ -118,7 +126,7 @@ def _select_final_pool(
         if len(selected) >= int(capacity):
             break
     if not selected:
-        raise RuntimeError("no QuantEvolver candidate passed validation selection")
+        raise RuntimeError(f"no QuantEvolver candidate passed {selection_period} selection")
 
     expressions = [str(item[3]["expression"]) for item in selected]
     factors = []
@@ -133,12 +141,25 @@ def _select_final_pool(
             "search_weight": 1.0 / len(selected),
             "factor_lineage_id": f"qe_lineage_{factor_id[:20]}",
             "lineage_status": "verified",
-            "validation_rank_ic": mean,
-            "validation_rank_ic_ir": icir,
-            "validation_valid_days": valid_days,
+            "selection_period": selection_period,
+            "selection_rank_ic": mean,
+            "selection_rank_ic_ir": icir,
+            "selection_valid_days": valid_days,
         })
-    pool_hash = stable_hash({"expressions": expressions, "selection": "validation-rankic-decorrelation-0.70"})
-    return {
+        if selection_period == "validation":
+            factors[-1].update({
+                "validation_rank_ic": mean,
+                "validation_rank_ic_ir": icir,
+                "validation_valid_days": valid_days,
+            })
+    pool_hash = stable_hash({"expressions": expressions, "selection": f"{selection_period}-rankic-decorrelation-0.70"})
+    selection_score = {
+        "objective": float(np.mean([item[0] for item in selected])),
+        "mean_rank_ic": float(np.mean([item[0] for item in selected])),
+        "weights": [1.0 / len(selected)] * len(selected),
+        "selection_semantics": f"rank by {selection_period} RankIC, greedy abs-correlation<0.70",
+    }
+    result = {
         "snapshot_id": f"snapshot_{pool_hash[:20]}",
         "final_pool_id": f"final_pool_{pool_hash[:20]}",
         "pool_version": len(records) // 8,
@@ -150,19 +171,24 @@ def _select_final_pool(
             "weights": [1.0 / len(selected)] * len(selected),
             "selection_semantics": "QuantEvolver mined-factor database",
         },
-        "validation": {
-            "objective": float(np.mean([item[0] for item in selected])),
-            "mean_rank_ic": float(np.mean([item[0] for item in selected])),
-            "weights": [1.0 / len(selected)] * len(selected),
-            "selection_semantics": "rank by validation RankIC, greedy abs-correlation<0.70",
-        },
+        "validation": selection_score,
         "selected_from": {
             "method": "quantevolver",
-            "selection_rule": "validation RankIC ranking, 0.70 decorrelation, equal-weight paper protocol",
+            "selection_rule": f"{selection_period} RankIC ranking, 0.70 decorrelation, equal-weight paper protocol",
             "mined_candidates": len(mined),
             "valid_unique_candidates": len(best),
         },
     }
+    if train_interval is not None:
+        result["train"] = selection_score
+        result["validation"] = {}
+        result["selection_rule"] = "fixed_budget_terminal_pool"
+        result["calibration_policy"] = (
+            "full-train ridge fit after search; no distinct validation/calibration period"
+            if ridge_fit_period == "train"
+            else "calibration-only ridge fit after search; no search-period calibration access"
+        )
+    return result
 
 
 def run_quantevolver(
@@ -176,11 +202,19 @@ def run_quantevolver(
     if reward != "qe_native":
         raise ValueError(f"QuantEvolver baseline requires reward=qe_native, got {reward}")
     raw_config = load_yaml(config_path)
+    recent = raw_config.get("protocol") == "recent_alpha_v1"
     experiment = raw_config["experiment"]
     group_size = int(experiment.get("proposal_group_size", 8))
     if group_size != 8:
         raise ValueError(f"QuantEvolver fairness protocol requires 8 completions, got {group_size}")
     paths = load_paths(config_path)
+    data_config, evaluation_config = resolve_data_evaluation(raw_config, paths.code_root)
+    train_interval = [str(value) for value in data_config["train"]] if recent else None
+    regime_windows = (
+        regime_windows_for_interval(*train_interval)
+        if train_interval is not None
+        else None
+    )
     run_dir = paths.runs_root / experiment_id / "quantevolver" / reward / f"seed_{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
     history_path = run_dir / "mined_factor_history.jsonl"
@@ -191,9 +225,9 @@ def run_quantevolver(
     model_config["model"]["path"] = str(resolve_model_path(model_config))
     search_config = load_yaml(paths.code_root / "configs/search/quantevolver.yaml")["search"]
     reward_config = load_yaml(paths.code_root / "configs/reward/qe_native.yaml")
-    evaluation_config = load_yaml(paths.code_root / "configs/eval/preliminary.yaml")["evaluation"]
     effective = {
         "paths": paths.model_dump(mode="json"),
+        "data": data_config,
         "experiment": experiment,
         "search": search_config,
         **model_config,
@@ -208,6 +242,8 @@ def run_quantevolver(
             "candidates_per_step": group_size,
         },
     }
+    if recent:
+        effective["protocol"] = "recent_alpha_v1"
     write_yaml(run_dir / "effective_config.yaml", effective)
     session = run_dir / "grpo_session"
     session.mkdir(parents=True, exist_ok=True)
@@ -234,13 +270,15 @@ def run_quantevolver(
         "mined_rank_ic_threshold": 0.01,
         "mined_coverage_threshold": 0.60,
     }
+    if train_interval is not None:
+        spec["train_interval"] = train_interval
     spec["spec_hash"] = stable_hash(spec)
     spec_path = session / "reward_spec.json"
     write_json(spec_path, spec)
 
     rows = []
     for round_index in range(int(steps)):
-        task = task_for_round(round_index, seed)
+        task = task_for_round(round_index, seed, regime_windows) if regime_windows is not None else task_for_round(round_index, seed)
         rows.append({
             "data_source": f"quantevolver/{task['family']}/{task['time_split']}",
             "prompt": build_messages(task),
@@ -291,9 +329,19 @@ def run_quantevolver(
     trainer = run_quant_evolver_verl_trainer(config, expected_global_step=int(steps))
     wall_seconds = time.monotonic() - started
 
-    selected = _select_final_pool(history_path, paths.processed_root, int(experiment.get("pool_capacity", 20)))
-    write_json(run_dir / "final_pool.json", selected)
     records = [json.loads(line) for line in history_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if len(records) != int(steps) * group_size:
+        raise RuntimeError(
+            f"QuantEvolver produced {len(records)} records, expected the fixed budget {int(steps) * group_size}"
+        )
+    selected = _select_final_pool(
+        history_path,
+        paths.processed_root,
+        int(experiment.get("pool_capacity", 20)),
+        train_interval=train_interval,
+        ridge_fit_period=str(evaluation_config.get("ridge_fit_period", "calibration")),
+    )
+    write_json(run_dir / "final_pool.json", selected)
     unique_market = {str(item["expr_hash"]) for item in records if item.get("market_evaluated") and item.get("expr_hash")}
     train_metrics = {
         "search_steps": int(steps),
@@ -310,7 +358,8 @@ def run_quantevolver(
         "checkpoint": trainer["checkpoint"],
     }
     write_json(run_dir / "train_metrics.json", train_metrics)
-    write_json(run_dir / "validation_metrics.json", selected["validation"])
+    if not recent:
+        write_json(run_dir / "validation_metrics.json", selected["validation"])
     write_json(run_dir / "checkpoint.json", {
         "schema_version": 1,
         "reward_semantics": "quantevolver-dico-rankic-v1",
@@ -332,7 +381,7 @@ def run_quantevolver(
         list(discover_data_files(paths.raw_data_root).values()),
         effective_config=effective,
         model_config=model_config["model"],
-        prompt=prompt_contract(),
+        prompt=prompt_contract(regime_windows) if regime_windows is not None else prompt_contract(),
         reward_version="quantevolver-dico-rankic-v1",
         evaluator_version=EVALUATOR_SEMANTICS_VERSION,
     )
@@ -352,6 +401,17 @@ def run_quantevolver(
             "adaptation": "native seeded task bank and DiCo RankIC reward over RLAlpha panel/DSL",
         },
     })
+    if recent:
+        manifest["protocol"] = "recent_alpha_v1"
+        manifest["splits"] = {
+            name: {"start": str(data_config[name][0]), "end": str(data_config[name][1])}
+            for name in ("train", "validation", "test")
+        }
+        manifest["conventions"] = {
+            "pool_selection": "terminal mined-factor database on search data",
+            "ridge_weight_source": f"{evaluation_config.get('ridge_fit_period', 'calibration')}_only",
+            "annual_liquidation": True,
+        }
     manifest.pop("manifest_hash", None)
     manifest["manifest_hash"] = stable_hash(manifest)
     write_yaml(run_dir / "manifest.yaml", manifest)
@@ -366,7 +426,7 @@ def run_quantevolver(
         "search": train_metrics,
         "selected_pool_version": selected["pool_version"],
         "train_objective": selected["train"]["objective"],
-        "validation_objective": selected["validation"]["objective"],
+        "validation_objective": selected["validation"].get("objective"),
         "final_factors": selected["expressions"],
     }
     write_json(run_dir / "result.json", result)
@@ -380,7 +440,7 @@ def run_quantevolver(
         ledger=train_metrics,
         pool_version=int(selected["pool_version"]),
         train_objective=selected["train"]["objective"],
-        validation_objective=selected["validation"]["objective"],
+        validation_objective=selected["validation"].get("objective"),
         expressions=selected["expressions"],
     )
     update_progress(run_dir / "progress.json", status="search_complete", completed_steps=int(steps), search_steps=int(steps), candidates_per_step=group_size, valid_unique_evaluations=len(unique_market), pool_version=int(selected["pool_version"]), pool_size=len(selected["expressions"]))

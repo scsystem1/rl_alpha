@@ -250,10 +250,14 @@ def _select_snapshot(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
     ) if eligible else {"pool_version": 0, "expressions": [], "factors": [], "train": {}, "validation": {}}
 
 
-def _terminal_snapshot(pool, coordinator, searcher):
+def _terminal_snapshot(pool, coordinator, searcher, ridge_fit_period: str = "calibration"):
     snapshot = _snapshot_record(pool, {}, coordinator.ledger.valid_unique_evaluations, searcher)
     snapshot["selection_rule"] = "fixed_budget_terminal_pool"
-    snapshot["calibration_policy"] = "calibration-only ridge fit after search; no search-period calibration access"
+    snapshot["calibration_policy"] = (
+        "full-train ridge fit after search; no distinct validation/calibration period"
+        if ridge_fit_period == "train"
+        else "calibration-only ridge fit after search; no search-period calibration access"
+    )
     snapshot["status"] = "complete" if pool.entries else "empty_pool"
     return snapshot
 
@@ -273,14 +277,19 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, ste
     raw_config = load_yaml(config_path)
     if raw_config.get("rolling"):
         raise ValueError("rolling search requires a resolved window configuration; use matrix run or a frozen window_configs/test_YEAR.yaml")
-    if raw_config.get("protocol") == "recent_alpha_v1" and (
-        method not in {"random", "gp", "base_llm", "grpo_llm"} or reward not in {"r1_oof", "r2_paired_oof"}
-    ):
-        raise ValueError("recent_alpha_v1 requires the four configured methods and an OOF reward")
+    if raw_config.get("protocol") == "recent_alpha_v1":
+        from ..rolling import RECENT_METHOD_REWARDS
+
+        if method not in RECENT_METHOD_REWARDS or reward not in RECENT_METHOD_REWARDS[method]:
+            raise ValueError(f"recent_alpha_v1 does not support cell {(method, reward)}")
     if method == "quantevolver":
         from .quantevolver.run import run_quantevolver
 
         return run_quantevolver(config_path, reward, seed, steps, experiment_id, resume)
+    if method == "alphasage":
+        from .alphasage.run import run_alphasage
+
+        return run_alphasage(config_path, reward, seed, steps, experiment_id, resume)
     recent = raw_config.get("protocol") == "recent_alpha_v1"
     group_size = int(raw_config.get("experiment", {}).get("proposal_group_size", 8))
     if method in {"random", "gp", "base_llm", "grpo_llm"} and group_size != 8:
@@ -315,7 +324,10 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, ste
         effective_config["model"]["path"] = str(resolve_model_path(effective_config))
     identity_inputs = {
         "schema_version": 3,
-        "final_pool_selection_version": "terminal-pool-calibration-only-v1" if recent else "full-train-ridge-oof-mean-validation-v2",
+        "final_pool_selection_version": (
+            f"terminal-pool-{evaluation_config.get('ridge_fit_period', 'calibration')}-fit-v2"
+            if recent else "full-train-ridge-oof-mean-validation-v2"
+        ),
         "prompt_contract": prompt_contract() if method in {"base_llm", "grpo_llm"} else None,
         "effective_config": effective_config,
         "evaluator_version": EVALUATOR_SEMANTICS_VERSION,
@@ -452,7 +464,10 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, ste
             append_snapshot(snapshot)
     coordinator.save_checkpoint()
     if recent:
-        selected = _terminal_snapshot(pool, coordinator, searcher)
+        selected = _terminal_snapshot(
+            pool, coordinator, searcher,
+            str(evaluation_config.get("ridge_fit_period", "calibration")),
+        )
         snapshots.append(selected)
         append_snapshot(selected)
     else:
@@ -481,7 +496,11 @@ def run_search(config_path: str | Path, method: str, reward: str, seed: int, ste
     if recent:
         manifest["splits"] = {name: {"start": str(data_config[name][0]), "end": str(data_config[name][1])} for name in ("train", "validation", "test")}
         manifest["protocol"] = "recent_alpha_v1"
-        manifest["conventions"].update({"pool_selection": "terminal", "ridge_weight_source": "calibration_only", "annual_liquidation": True})
+        manifest["conventions"].update({
+            "pool_selection": "terminal",
+            "ridge_weight_source": f"{evaluation_config.get('ridge_fit_period', 'calibration')}_only",
+            "annual_liquidation": True,
+        })
     manifest.pop("manifest_hash", None)
     manifest["manifest_hash"] = stable_hash(manifest)
     write_yaml(run_dir / "manifest.yaml", manifest)

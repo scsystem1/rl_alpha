@@ -2,6 +2,8 @@
 
 当前改进方案与运行入口：[近期 Alpha 五窗口训练与评估](docs/recent_alpha_rolling.md)。默认测试 2021–2025，搜索两年、校准半年、测试一年；四方法 × 三种子，100 轮 × 8 候选，终态 pool，默认 `r1_oof`，仅 dollar-neutral 组合。下面的历史验收记录及 [Expanding OOF 协议](docs/rolling_oof.md) 对应旧实验，不能作为新协议的真实训练验证。
 
+QuantEvolver 与 AlphaSAGE 的同口径运行入口见 [baseline 五窗口对齐说明](docs/baseline_recent_alpha_rolling.md)：两者保留各自原生 reward，并统一为每窗 100×8=800 因子配额、五个独立训练/校准/测试窗口及总体汇总。
+
 RLAlpha is a leakage-audited S&P 500 factor-search research implementation
 based on `../REMOTE_CODEX_BUILD_GUIDE.md` and the stricter repair contract in
 `../repair.md`. AlphaGen and QuantEvolver are read-only reference checkouts.

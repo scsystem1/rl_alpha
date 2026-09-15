@@ -1,0 +1,25 @@
+paths:
+  code_root: /home/sunyuxiang/rl_alpha/ours
+  raw_data_root: /data/sunyuxiang/rl_alpha
+  processed_root: /data/sunyuxiang/rl_alpha/processed
+  cache_root: /data/sunyuxiang/rl_alpha/cache
+  runs_root: /data/sunyuxiang/rl_alpha/runs
+  model_search_root: /data/shared/huggingface
+  alphagen_root: /home/sunyuxiang/rl_alpha/baseline/alphagen
+  quantevolver_root: /home/sunyuxiang/rl_alpha/baseline/QuantEvolver
+rolling:
+  test_years: [2021, 2022, 2023, 2024, 2025]
+experiment:
+  cells:
+    - [alphasage, r0]
+  seeds: [0, 1, 2]
+  search_steps: 100
+  proposal_group_size: 8
+  pool_capacity: 20
+  max_cpu_jobs: 1
+  cpu_threads_per_job: 8
+  max_total_cpu_threads: 90
+  gpu_devices:
+    alphasage: [0]
+  gpu_min_free_mib: {0: 12000}
+  auto_start_expensive_jobs: true

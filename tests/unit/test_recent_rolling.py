@@ -44,6 +44,34 @@ def test_five_calendars_and_rolling_oof(config):
     assert "time_folds" not in raw.get("reward", {})
 
 
+def test_two_calendar_year_train_fit_scheme(config):
+    raw = load_yaml(config)
+    raw["rolling"]["window_scheme"] = "two_calendar_years_then_test_year"
+    raw["evaluation"]["ridge_fit_period"] = "train"
+    raw["experiment"]["search_steps"] = 200
+    raw["experiment"]["cells"] = [
+        ["random", "r1_oof"],
+        ["gp", "r1_oof"],
+        ["base_llm", "r1_oof"],
+        ["grpo_llm", "r2_paired_oof"],
+    ]
+    raw["experiment"].pop("methods")
+    raw["experiment"].pop("rewards")
+    child = window_config(raw, 2021, ROOT)
+    assert child["data"]["train"] == ["2019-01-01", "2020-12-31"]
+    assert child["data"]["validation"] == child["data"]["train"]
+    assert child["data"]["test"] == ["2021-01-01", "2021-12-31"]
+    assert child["evaluation"]["ridge_fit_period"] == "train"
+    assert child["experiment"]["search_steps"] == 200
+    assert child["reward"]["time_folds"] == [
+        {"fit": ["2019-01-01", "2019-06-30"], "score": ["2019-07-01", "2019-12-31"]},
+        {"fit": ["2019-07-01", "2019-12-31"], "score": ["2020-01-01", "2020-06-30"]},
+        {"fit": ["2020-01-01", "2020-06-30"], "score": ["2020-07-01", "2020-12-31"]},
+    ]
+    assert ("grpo_llm", "r2_paired_oof", 0) in expected_cells(raw)
+    assert merge_reward_config(child, ROOT, "r2_paired_oof")["critical_value"] == 0.5
+
+
 def test_freeze_resume_and_config_change_rejected(config, tmp_path):
     windows = prepare_rolling_windows(config, "demo")
     assert [year for year, _, _ in windows] == list(range(2021, 2026))
@@ -122,12 +150,12 @@ def test_disabled_expensive_matrix_does_not_freeze_failed_configuration(config, 
     assert not (tmp_path / "runs/disabled/window_configs").exists()
 
 
-def test_recent_protocol_rejects_unsupported_methods_and_old_rewards(config, tmp_path):
+def test_recent_protocol_accepts_native_baselines_and_rejects_wrong_pairings(config, tmp_path):
     from rlalpha.search.run import run_search
 
     raw = load_yaml(config)
     raw["experiment"]["methods"] = ["quantevolver"]
-    with pytest.raises(ValueError, match="does not support method"):
+    with pytest.raises(ValueError, match="requires quantevolver reward"):
         window_config(raw, 2021, ROOT)
     raw["experiment"]["methods"] = ["random"]
     raw["experiment"]["rewards"] = ["r2_lcb"]
@@ -136,8 +164,21 @@ def test_recent_protocol_rejects_unsupported_methods_and_old_rewards(config, tmp
     child = window_config(load_yaml(config), 2021, ROOT)
     path = tmp_path / "child.yaml"
     write_yaml(path, child)
-    with pytest.raises(ValueError, match="four configured methods"):
+    with pytest.raises(ValueError, match="does not support cell"):
         run_search(path, "quantevolver", "r1_oof", 0, 100, "wrong_method")
+
+    for filename, expected_cell in (
+        ("recent_alpha_quantevolver_rolling.yaml", ("quantevolver", "qe_native", 0)),
+        ("recent_alpha_alphasage_rolling.yaml", ("alphasage", "r0", 0)),
+    ):
+        baseline = load_yaml(ROOT / "configs/experiment" / filename)
+        assert baseline["experiment"]["search_steps"] == 100
+        assert baseline["experiment"]["proposal_group_size"] == 8
+        assert len(expected_cells(baseline)) == 3
+        assert expected_cells(baseline)[0] == expected_cell
+        resolved = window_config(baseline, 2025, ROOT)
+        assert resolved["protocol"] == "recent_alpha_v1"
+        assert resolved["data"]["train"] == ["2022-07-01", "2024-06-30"]
 
 
 @pytest.mark.parametrize("field,value", [("sleeves", 3), ("holding_days", 10), ("one_way_cost_bps", [0, 5])])

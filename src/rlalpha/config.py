@@ -143,6 +143,7 @@ class SearchConfig(StrictModel):
     algorithm: Literal["trajectory_balance_gflownet"] | None = None
     encoder: Literal["rgcn"] | None = None
     hidden_dim: int | None = Field(default=None, gt=0)
+    learning_rate: float | None = Field(default=None, gt=0)
     max_expression_tokens: int | None = Field(default=None, gt=0)
     entropy_coef: float | None = Field(default=None, ge=0)
     entropy_temperature: float | None = Field(default=None, gt=0)
@@ -213,6 +214,7 @@ class RewardConfig(StrictModel):
 
 
 class EvaluationConfig(StrictModel):
+    ridge_fit_period: Literal["calibration", "train"] = "calibration"
     ridge_lambda: float = Field(default=0.01, gt=0)
     hac_lag: int = Field(default=20, ge=0)
     rebalance_days: int = Field(default=5, gt=0)
@@ -232,6 +234,10 @@ class EvaluationConfig(StrictModel):
 
 class RollingConfig(StrictModel):
     test_years: list[int] = Field(default_factory=lambda: list(range(2021, 2026)))
+    window_scheme: Literal[
+        "two_year_then_half_year_calibration",
+        "two_calendar_years_then_test_year",
+    ] = "two_year_then_half_year_calibration"
 
     @model_validator(mode="after")
     def ordered_years(self):

@@ -91,7 +91,12 @@ def run_quant_evolver_verl_trainer(
             ray_cfg = config.get("ray_kwargs", {}).get("ray_init", {})
             num_cpus = ray_cfg.get("num_cpus") if ray_cfg else config.get("ray_init", {}).get("num_cpus")
             object_store_memory = ray_cfg.get("object_store_memory") if ray_cfg else config.get("ray_init", {}).get("object_store_memory")
-            ray.init(runtime_env={"env_vars": env_vars}, num_cpus=num_cpus, object_store_memory=object_store_memory)
+            ray.init(
+                runtime_env={"env_vars": env_vars},
+                num_cpus=num_cpus,
+                object_store_memory=object_store_memory,
+                include_dashboard=False,
+            )
         local_path = copy_to_local(config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False))
         tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
         processor = hf_processor(local_path, trust_remote_code=True, use_fast=True)

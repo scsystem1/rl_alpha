@@ -1,0 +1,36 @@
+paths:
+  code_root: /home/sunyuxiang/rl_alpha/ours
+  raw_data_root: /data/sunyuxiang/rl_alpha
+  processed_root: /data/sunyuxiang/rl_alpha/processed
+  cache_root: /data/sunyuxiang/rl_alpha/cache
+  runs_root: /data/sunyuxiang/rl_alpha/runs
+  model_search_root: /data/shared/huggingface
+  alphagen_root: /home/sunyuxiang/rl_alpha/alphagen
+  quantevolver_root: /home/sunyuxiang/rl_alpha/QuantEvolver
+
+experiment:
+  cells:
+    - [random, r1_oof]
+    - [gp, r1_oof]
+    - [base_llm, r1_oof]
+    - [grpo_llm, r1_oof]
+  seeds: [0, 1, 2]
+  search_steps: 250
+  proposal_group_size: 8
+  pool_capacity: 20
+  max_cpu_jobs: 6
+  cpu_threads_per_job: 8
+  max_total_cpu_threads: 96
+  grpo_ray_cpus: 8
+  grpo_reward_candidate_workers: 1
+  grpo_object_store_gib: 8
+  # The dedicated launcher uses an explicit colocated topology:
+  # base seeds 0/1/2 -> GPU 0/2/3; GRPO seeds 0/1/2 -> GPU 1/2/3.
+  # These lists remain useful for identity/config auditing and a conventional
+  # matrix-runner resume, but the stock runner intentionally does not colocate.
+  gpu_devices:
+    base_llm: [0, 2, 3]
+    grpo_llm: [1, 2, 3]
+  gpu_min_free_mib: {0: 12000, 1: 20000, 2: 30000, 3: 30000}
+  gpu_memory_utilization: {0: 0.16, 1: 0.12, 2: 0.12, 3: 0.12}
+  auto_start_expensive_jobs: true

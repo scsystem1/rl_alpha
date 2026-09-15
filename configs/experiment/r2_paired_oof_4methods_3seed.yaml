@@ -1,0 +1,38 @@
+paths:
+  code_root: /home/sunyuxiang/rl_alpha/ours
+  raw_data_root: /data/sunyuxiang/rl_alpha
+  processed_root: /data/sunyuxiang/rl_alpha/processed
+  cache_root: /data/sunyuxiang/rl_alpha/cache
+  runs_root: /data/sunyuxiang/rl_alpha/runs
+  model_search_root: /data/shared/huggingface
+  alphagen_root: /home/sunyuxiang/rl_alpha/alphagen
+  quantevolver_root: /home/sunyuxiang/rl_alpha/QuantEvolver
+
+experiment:
+  cells:
+    - [random, r2_paired_oof]
+    - [gp, r2_paired_oof]
+    - [base_llm, r2_paired_oof]
+    - [grpo_llm, r2_paired_oof]
+  seeds: [0, 1, 2]
+  search_steps: 250
+  proposal_group_size: 8
+  pool_capacity: 20
+  max_cpu_jobs: 6
+  cpu_threads_per_job: 8
+  max_total_cpu_threads: 96
+  grpo_ray_cpus: 8
+  grpo_reward_candidate_workers: 1
+  grpo_object_store_gib: 8
+  # Initial safe wave: GPU 0: base seed 0; GPU 4: base seed 1;
+  # GPU 1: base seed 2 + GRPO seed 0; GPU 3: GRPO seed 1.
+  # GRPO seed 2 takes GPU 3 immediately after GRPO seed 1 completes because
+  # resident services leave no KV-cache headroom for two GRPO actors.
+  # The launcher uses this file for identity/audit metadata and applies the
+  # exact seed-to-device assignment explicitly.
+  gpu_devices:
+    base_llm: [0, 1, 3]
+    grpo_llm: [4, 1, 3]
+  gpu_min_free_mib: {0: 12000, 1: 20000, 3: 30000, 4: 12000}
+  gpu_memory_utilization: {0: 0.16, 1: 0.12, 3: 0.12, 4: 0.12}
+  auto_start_expensive_jobs: true
